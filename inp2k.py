@@ -901,8 +901,7 @@ def read_deck(path, parser, log, progress=None):
     """메인 덱과 *INCLUDE를 재귀적으로 읽어 parser에 흘려 넣는다"""
     base_dir = os.path.dirname(os.path.abspath(path))
     cache = {}
-    stats = dict(files=0, missing=[], bytes=0)
-    total = os.path.getsize(path)
+    stats = dict(files=0, missing=[], bytes=0, total=os.path.getsize(path))
 
     def feed(fp, stack, depth):
         stats["files"] += 1
@@ -910,7 +909,7 @@ def read_deck(path, parser, log, progress=None):
             if kind == "data":
                 parser.data(payload)
                 if progress:
-                    progress("read", parser.n_bytes)
+                    progress(parser.n_bytes, stats["total"])
                 continue
             if RE_INCLUDE.match(payload):
                 _kw, p = parse_keyword(payload)
@@ -928,17 +927,16 @@ def read_deck(path, parser, log, progress=None):
                     log.err("*INCLUDE 순환 참조를 끊었습니다: %s" % ref)
                     continue
                 parser.flush()
+                stats["total"] += os.path.getsize(target)
                 log.ok("*INCLUDE 병합: %s (%.1f MB)"
                        % (os.path.basename(target), os.path.getsize(target) / 1048576.0))
                 feed(target, stack | {key}, depth + 1)
                 continue
             parser.keyword(payload)
-            if progress:
-                progress("read", parser.n_bytes)
 
     feed(path, {os.path.normcase(os.path.abspath(path))}, 0)
     parser.finish()
-    stats["bytes"] = total
+    stats["bytes"] = parser.n_bytes
     return stats
 
 
@@ -1016,6 +1014,9 @@ class Converter:
         self.max_elem = 0
         self.counts = dict(node=0, solid=0, shell=0, beam=0, mass=0, disc=0)
 
+        self.total_items = 0
+        self.done_items = 0
+        self._next_tick = 0
         self.inst_maps = {}
         self.inst_part_of = {}
         self.elem_info = {}
@@ -1084,6 +1085,12 @@ class Converter:
                 out.append(v)
         return out
 
+    def _tick(self, n, label):
+        self.done_items += n
+        if self.progress and self.done_items >= self._next_tick:
+            self._next_tick = self.done_items + 100000
+            self.progress(self.done_items, max(self.total_items, 1), label)
+
     # ---------- 실행 ----------
     def run(self):
         m = self.m
@@ -1114,6 +1121,11 @@ class Converter:
                 if c and c["cat"] == "beam" and not c["truss"]:
                     need_coord = True
                     break
+
+        for inst in instances:
+            b = m.parts.get(inst["partName"])
+            if b is not None:
+                self.total_items += b.n_nodes() + b.n_elems()
 
         for inst in instances:
             base = m.parts.get(inst["partName"])
@@ -1164,8 +1176,7 @@ class Converter:
                 xyz = tr(xyz)
             self.write_nodes(fnode, ids, xyz, n_off, need_coord)
             self.counts["node"] += len(ids)
-            if self.progress:
-                self.progress("convert", "절점 %.1fM" % (self.counts["node"] / 1e6))
+            self._tick(len(ids), "절점 %s" % f"{self.counts['node']:,}")
 
         # ----- 단면 -> PART -----
         eid_index = EidIndex(P)
@@ -1227,9 +1238,9 @@ class Converter:
         for bi, blk in enumerate(P.eblocks):
             self.write_block(blk, pid_arrays[bi], sec_of_pid, fallback,
                              n_off, e_off, seg_eids, P)
-            if self.progress:
-                tot = self.counts["solid"] + self.counts["shell"] + self.counts["beam"]
-                self.progress("convert", "요소 %.1fM" % (tot / 1e6))
+            tot = (self.counts["solid"] + self.counts["shell"]
+                   + self.counts["beam"] + self.counts["mass"] + self.counts["disc"])
+            self._tick(len(blk["ids"]), "요소 %s" % f"{tot:,}")
 
     def make_section(self, secid, cls, sec):
         opt = self.opt
@@ -2287,9 +2298,19 @@ DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=True, tet10=False,
 
 
 def convert_file(inp_path, out_path, opt, log, progress=None):
+    """progress(phase, pct, text) — pct 는 0~100 전체 진행률"""
     t0 = time.time()
-    parser = Parser(log, progress)
-    stats = read_deck(inp_path, parser, log, progress)
+
+    def emit(phase, pct, text=""):
+        if progress:
+            progress(phase, pct, text)
+
+    emit("read", 0.0, "")
+    parser = Parser(log)
+    stats = read_deck(inp_path, parser, log,
+                      lambda done, total: emit(
+                          "read", 45.0 * done / max(total, 1),
+                          "%.0f / %.0f MB" % (done / 1048576.0, total / 1048576.0)))
     model = parser.m
     t_read = time.time() - t0
     if stats["files"] > 1:
@@ -2297,18 +2318,19 @@ def convert_file(inp_path, out_path, opt, log, progress=None):
     log.info("파트 %d개, 인스턴스 %d개, 재료 %d개를 읽었습니다."
              % (max(0, len(model.parts) - 1), len(model.instances), len(model.materials)))
 
-    if progress:
-        progress("convert", "")
+    emit("convert", 45.0, "")
     t1 = time.time()
-    cv = Converter(model, opt, log, progress)
+    cv = Converter(model, opt, log,
+                   lambda done, total, label: emit(
+                       "convert", 45.0 + 45.0 * done / max(total, 1), label))
     cv.run()
     t_conv = time.time() - t1
 
-    if progress:
-        progress("write", "")
+    emit("write", 90.0, "")
     t2 = time.time()
     size = write_k(cv, opt, out_path, os.path.basename(inp_path), progress)
     t_write = time.time() - t2
+    emit("done", 100.0, "")
 
     log.ok("변환 완료 · %.1f MB (%.1f초: 읽기 %.1f / 변환 %.1f / 쓰기 %.1f)"
            % (size / 1048576.0, time.time() - t0, t_read, t_conv, t_write))
@@ -2322,10 +2344,223 @@ def convert_file(inp_path, out_path, opt, log, progress=None):
 # ============================================================
 # GUI
 # ============================================================
+PALETTE = dict(
+    bg="#0F1115", card="#171A21", card2="#1D212A", line="#2A3039",
+    text="#E6E9EF", dim="#8A93A3", faint="#5C6675",
+    accent="#4F8CFF", accent_hi="#6BA0FF", accent_dim="#2B4A85",
+    ok="#34D399", warn="#FBBF24", err="#F87171",
+)
+
+
+def _pick_font(cands, default):
+    try:
+        import tkinter.font as tkfont
+        fams = set(f.lower() for f in tkfont.families())
+        for c in cands:
+            if c.lower() in fams:
+                return c
+    except Exception:
+        pass
+    return default
+
+
+def round_rect(cv, x1, y1, x2, y2, r, **kw):
+    r = min(r, (x2 - x1) / 2, (y2 - y1) / 2)
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, splinesteps=18, **kw)
+
+
+class RButton:
+    """모서리가 둥근 평면 버튼"""
+
+    def __init__(self, parent, text, command, kind="primary", w=132, h=38, font=None):
+        P = PALETTE
+        self.kind = kind
+        self.command = command
+        self.enabled = True
+        bgp = parent.cget("bg")
+        self.cv = tk.Canvas(parent, width=w, height=h, bg=bgp,
+                            highlightthickness=0, bd=0, cursor="hand2")
+        self.w, self.h = w, h
+        self.shape = round_rect(self.cv, 1, 1, w - 1, h - 1, 9, fill="", outline="")
+        self.label = self.cv.create_text(w / 2, h / 2, text=text, font=font,
+                                         fill=P["text"])
+        self._paint(False)
+        self.cv.bind("<Enter>", lambda e: self._paint(True))
+        self.cv.bind("<Leave>", lambda e: self._paint(False))
+        self.cv.bind("<Button-1>", self._click)
+
+    def _paint(self, hover):
+        P = PALETTE
+        if not self.enabled:
+            fill, out, fg = P["card2"], P["line"], P["faint"]
+        elif self.kind == "primary":
+            fill = P["accent_hi"] if hover else P["accent"]
+            out, fg = fill, "#0B1220"
+        else:
+            fill = P["card2"] if hover else P["card"]
+            out, fg = P["line"], P["text"]
+        self.cv.itemconfig(self.shape, fill=fill, outline=out)
+        self.cv.itemconfig(self.label, fill=fg)
+
+    def _click(self, _e):
+        if self.enabled and self.command:
+            self.command()
+
+    def config(self, text=None, enabled=None):
+        if text is not None:
+            self.cv.itemconfig(self.label, text=text)
+        if enabled is not None:
+            self.enabled = bool(enabled)
+            self.cv.config(cursor="hand2" if self.enabled else "arrow")
+            self._paint(False)
+
+    def pack(self, **kw):
+        self.cv.pack(**kw)
+        return self
+
+    def grid(self, **kw):
+        self.cv.grid(**kw)
+        return self
+
+
+class Switch:
+    """토글 스위치"""
+
+    def __init__(self, parent, text, value=True, font=None, sub=None, subfont=None):
+        P = PALETTE
+        self.value = bool(value)
+        self.fr = tk.Frame(parent, bg=parent.cget("bg"))
+        self.cv = tk.Canvas(self.fr, width=40, height=22, bg=parent.cget("bg"),
+                            highlightthickness=0, bd=0, cursor="hand2")
+        self.track = round_rect(self.cv, 1, 3, 39, 21, 9, fill="", outline="")
+        self.knob = self.cv.create_oval(0, 0, 0, 0, fill="#FFFFFF", outline="")
+        self.cv.pack(side="left")
+        box = tk.Frame(self.fr, bg=parent.cget("bg"))
+        box.pack(side="left", padx=(10, 0))
+        self.lb = tk.Label(box, text=text, bg=parent.cget("bg"), fg=P["text"],
+                           font=font, anchor="w", cursor="hand2")
+        self.lb.pack(anchor="w")
+        if sub:
+            tk.Label(box, text=sub, bg=parent.cget("bg"), fg=P["faint"],
+                     font=subfont, anchor="w").pack(anchor="w")
+        for wdg in (self.cv, self.lb):
+            wdg.bind("<Button-1>", self.toggle)
+        self._paint()
+
+    def _paint(self):
+        P = PALETTE
+        self.cv.itemconfig(self.track,
+                           fill=P["accent"] if self.value else P["card2"],
+                           outline=P["accent"] if self.value else P["line"])
+        x = 22 if self.value else 3
+        self.cv.coords(self.knob, x, 5, x + 15, 19)
+        self.cv.itemconfig(self.knob, fill="#FFFFFF" if self.value else P["faint"])
+
+    def toggle(self, _e=None):
+        self.value = not self.value
+        self._paint()
+
+    def get(self):
+        return self.value
+
+    def pack(self, **kw):
+        self.fr.pack(**kw)
+        return self
+
+    def grid(self, **kw):
+        self.fr.grid(**kw)
+        return self
+
+
+class Segmented:
+    """선택 세그먼트 (콤보박스 대체)"""
+
+    def __init__(self, parent, options, index=0, font=None, padx=13):
+        P = PALETTE
+        self.options = options
+        self.index = index
+        self.font = font
+        self.fr = tk.Frame(parent, bg=P["card2"], highlightthickness=1,
+                           highlightbackground=P["line"], bd=0)
+        self.cells = []
+        for i, (_val, lab) in enumerate(options):
+            c = tk.Label(self.fr, text=lab, bg=P["card2"], fg=P["dim"],
+                         font=font, padx=padx, pady=5, cursor="hand2")
+            c.pack(side="left")
+            c.bind("<Button-1>", lambda e, k=i: self.select(k))
+            self.cells.append(c)
+        self._paint()
+
+    def _paint(self):
+        P = PALETTE
+        for i, c in enumerate(self.cells):
+            on = (i == self.index)
+            c.config(bg=P["accent"] if on else P["card2"],
+                     fg="#0B1220" if on else P["dim"])
+
+    def select(self, i):
+        self.index = i
+        self._paint()
+
+    def get(self):
+        return self.options[self.index][0]
+
+    def pack(self, **kw):
+        self.fr.pack(**kw)
+        return self
+
+
+class Bar:
+    """둥근 진행 바"""
+
+    def __init__(self, parent, h=8):
+        P = PALETTE
+        self.h = h
+        self.cv = tk.Canvas(parent, height=h, bg=parent.cget("bg"),
+                            highlightthickness=0, bd=0)
+        self.bgid = None
+        self.fgid = None
+        self.pct = 0.0
+        self.cv.bind("<Configure>", lambda e: self._draw())
+
+    def _draw(self):
+        P = PALETTE
+        w = max(self.cv.winfo_width(), 10)
+        self.cv.delete("all")
+        round_rect(self.cv, 0, 0, w, self.h, self.h / 2, fill=P["card2"], outline="")
+        fw = max(self.h, w * min(max(self.pct, 0.0), 100.0) / 100.0)
+        if self.pct > 0:
+            round_rect(self.cv, 0, 0, fw, self.h, self.h / 2,
+                       fill=P["accent"], outline="")
+
+    def set(self, pct):
+        self.pct = pct
+        self._draw()
+
+    def pack(self, **kw):
+        self.cv.pack(**kw)
+        return self
+
+
+def card(parent, title, font_h):
+    P = PALETTE
+    outer = tk.Frame(parent, bg=P["card"], highlightthickness=1,
+                     highlightbackground=P["line"], bd=0)
+    if title:
+        tk.Label(outer, text=title, bg=P["card"], fg=P["dim"], font=font_h,
+                 anchor="w").pack(fill="x", padx=18, pady=(14, 0))
+    inner = tk.Frame(outer, bg=P["card"])
+    inner.pack(fill="both", expand=True, padx=18, pady=(8, 16))
+    return outer, inner
+
+
 def run_gui():
+    global tk
     try:
         import tkinter as tk
-        from tkinter import ttk, filedialog
+        from tkinter import filedialog
     except ImportError:
         print("tkinter를 찾을 수 없어 GUI를 열 수 없습니다.")
         print("  Windows/macOS 공식 파이썬에는 기본 포함되어 있습니다.")
@@ -2333,40 +2568,100 @@ def run_gui():
         print()
         print("CLI로는 그대로 쓸 수 있습니다:")
         print("  python inp2k.py model.inp -o model.k")
-        return
+        return 1
+
+    P = PALETTE
+    ui = _pick_font(["Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR",
+                     "Segoe UI", "Helvetica Neue"], "TkDefaultFont")
+    mn = _pick_font(["Cascadia Mono", "JetBrains Mono", "Consolas", "SF Mono",
+                     "Menlo", "DejaVu Sans Mono"], "TkFixedFont")
+    F_H1 = (ui, 19, "bold")
+    F_LB = (ui, 11)
+    F_SM = (ui, 9)
+    F_HD = (ui, 9, "bold")
+    F_MN = (mn, 9)
+    F_BT = (ui, 11, "bold")
 
     root = tk.Tk()
-    root.title("Abaqus INP → LS-DYNA K 변환기 v" + VERSION)
-    root.geometry("880x680")
+    root.title("INP2K  ·  Abaqus → LS-DYNA")
+    root.geometry("980x800")
+    root.minsize(820, 640)
+    root.configure(bg=P["bg"])
     try:
-        root.tk.call("tk", "scaling", 1.2)
+        root.tk.call("tk", "scaling", 1.3)
     except Exception:
         pass
 
-    INK = "#16212b"
-    BG = "#e4e8ea"
-    root.configure(bg=BG)
-    mono = ("Consolas" if sys.platform.startswith("win") else "Menlo"
-            if sys.platform == "darwin" else "DejaVu Sans Mono", 10)
-
-    state = dict(path=None, out=None, busy=False)
+    state = dict(path=None, out=None, busy=False, t0=0.0)
     q = queue.Queue()
 
-    frm = tk.Frame(root, bg=BG, padx=16, pady=14)
-    frm.pack(fill="both", expand=True)
+    wrap = tk.Frame(root, bg=P["bg"], padx=26, pady=22)
+    wrap.pack(fill="both", expand=True)
 
-    tk.Label(frm, text="Abaqus .inp  →  LS-DYNA .k", bg=BG, fg=INK,
-             font=(mono[0], 17, "bold")).pack(anchor="w")
-    tk.Label(frm, text="*INCLUDE는 덱이 있는 폴더에서 자동으로 찾아 병합합니다."
-                       + ("  ·  numpy 가속 사용 중" if HAVE_NUMPY else "  ·  numpy 없음 (느린 경로)"),
-             bg=BG, fg="#4d5c68").pack(anchor="w", pady=(0, 12))
+    # ---------- 헤더 ----------
+    head = tk.Frame(wrap, bg=P["bg"])
+    head.pack(fill="x")
+    tk.Label(head, text="INP2K", bg=P["bg"], fg=P["text"], font=F_H1).pack(side="left")
+    tk.Label(head, text="Abaqus .inp  →  LS-DYNA .k", bg=P["bg"], fg=P["faint"],
+             font=F_LB).pack(side="left", padx=(12, 0), pady=(6, 0))
 
-    # ---- 파일 ----
-    fbox = tk.LabelFrame(frm, text=" 입력 ", bg=BG, fg=INK, padx=10, pady=8)
-    fbox.pack(fill="x")
-    pathvar = tk.StringVar(value="선택된 파일 없음")
+    engine_ok = HAVE_NUMPY and HAVE_PANDAS
+    badge = tk.Frame(head, bg=P["card2"], highlightthickness=1,
+                     highlightbackground=P["ok"] if engine_ok else P["warn"])
+    badge.pack(side="right", pady=(4, 0))
+    tk.Label(badge, bg=P["card2"], fg=P["ok"] if engine_ok else P["warn"], font=F_SM,
+             padx=10, pady=4,
+             text=("가속 엔진 사용 중  numpy+pandas" if engine_ok
+                   else "느린 경로  " + ("pandas 없음" if HAVE_NUMPY else "numpy 없음"))
+             ).pack()
+
+    # ---------- 가속 안내 ----------
+    if not engine_ok:
+        warnc = tk.Frame(wrap, bg="#2A2115", highlightthickness=1,
+                         highlightbackground=P["warn"])
+        warnc.pack(fill="x", pady=(14, 0))
+        inner = tk.Frame(warnc, bg="#2A2115")
+        inner.pack(fill="x", padx=16, pady=12)
+        tk.Label(inner, bg="#2A2115", fg=P["warn"], font=F_LB, anchor="w",
+                 text="변환이 느린 이유입니다. numpy·pandas 없이 순수 파이썬으로 도는 중입니다."
+                 ).pack(anchor="w")
+        tk.Label(inner, bg="#2A2115", fg=P["dim"], font=F_SM, anchor="w",
+                 text="설치하면 큰 모델에서 10배 이상 빨라집니다. 설치 후 프로그램을 다시 켜 주세요."
+                 ).pack(anchor="w", pady=(2, 8))
+        inst_row = tk.Frame(inner, bg="#2A2115")
+        inst_row.pack(anchor="w")
+        inst_msg = tk.Label(inst_row, text="", bg="#2A2115", fg=P["dim"], font=F_SM)
+
+        def do_install():
+            btn_inst.config(text="설치 중…", enabled=False)
+            inst_msg.config(text="pip 실행 중입니다. 잠시 기다려 주세요.")
+
+            def job():
+                import subprocess
+                try:
+                    r = subprocess.run([sys.executable, "-m", "pip", "install",
+                                        "numpy", "pandas"],
+                                       capture_output=True, text=True)
+                    q.put(("inst", r.returncode, (r.stdout or "")[-400:]
+                           + (r.stderr or "")[-400:]))
+                except Exception as e:
+                    q.put(("inst", 1, str(e)))
+            threading.Thread(target=job, daemon=True).start()
+
+        btn_inst = RButton(inst_row, "numpy · pandas 설치", do_install,
+                           kind="primary", w=180, h=34, font=F_LB)
+        btn_inst.pack(side="left")
+        inst_msg.pack(side="left", padx=(12, 0))
+    else:
+        btn_inst = None
+        inst_msg = None
+
+    # ---------- 파일 ----------
+    c1, f1 = card(wrap, "입력 파일", F_HD)
+    c1.pack(fill="x", pady=(14, 0))
+    pathvar = tk.StringVar(value="선택된 파일이 없습니다")
     outvar = tk.StringVar(value="")
-    tk.Label(fbox, textvariable=pathvar, bg=BG, fg=INK, font=mono,
+    tk.Label(f1, textvariable=pathvar, bg=P["card"], fg=P["text"], font=F_MN,
              anchor="w").pack(fill="x")
 
     def pick():
@@ -2376,10 +2671,11 @@ def run_gui():
         if not p:
             return
         state["path"] = p
-        pathvar.set("%s   (%.1f MB)" % (p, os.path.getsize(p) / 1048576.0))
+        pathvar.set("%s   ·   %.1f MB" % (os.path.basename(p),
+                                          os.path.getsize(p) / 1048576.0))
         state["out"] = os.path.splitext(p)[0] + ".k"
         outvar.set(state["out"])
-        runbtn.config(state="normal")
+        btn_run.config(enabled=True)
 
     def pick_out():
         p = filedialog.asksaveasfilename(defaultextension=".k",
@@ -2388,84 +2684,110 @@ def run_gui():
             state["out"] = p
             outvar.set(p)
 
-    brow = tk.Frame(fbox, bg=BG)
-    brow.pack(fill="x", pady=(6, 0))
-    tk.Button(brow, text="INP 파일 선택…", command=pick).pack(side="left")
-    tk.Label(brow, text="  출력: ", bg=BG, fg=INK).pack(side="left")
-    tk.Entry(brow, textvariable=outvar, font=mono, width=48).pack(side="left", fill="x",
-                                                                 expand=True)
-    tk.Button(brow, text="…", command=pick_out, width=3).pack(side="left", padx=(4, 0))
+    r1 = tk.Frame(f1, bg=P["card"])
+    r1.pack(fill="x", pady=(12, 0))
+    RButton(r1, "파일 선택", pick, kind="ghost", w=104, h=34, font=F_LB).pack(side="left")
+    tk.Label(r1, text="출력", bg=P["card"], fg=P["faint"],
+             font=F_SM).pack(side="left", padx=(16, 6))
+    oe = tk.Entry(r1, textvariable=outvar, font=F_MN, bg=P["card2"], fg=P["text"],
+                  insertbackground=P["text"], relief="flat", bd=0,
+                  highlightthickness=1, highlightbackground=P["line"],
+                  highlightcolor=P["accent"])
+    oe.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
+    RButton(r1, "변경", pick_out, kind="ghost", w=60, h=34, font=F_LB).pack(side="left")
 
-    # ---- 옵션 ----
-    obox = tk.LabelFrame(frm, text=" 옵션 ", bg=BG, fg=INK, padx=10, pady=8)
-    obox.pack(fill="x", pady=(12, 0))
-    vars_ = {}
-    checks = [("sets", "절점·요소 세트 출력"), ("mat", "재료·단면 변환"),
-              ("bc", "경계조건 변환"), ("contact", "접촉·구속 변환"),
-              ("ctrl", "기본 CONTROL 카드"), ("tet10", "2차 사면체 유지 (C3D10)"),
-              ("beamNode", "보 방향절점 자동 생성")]
-    grid = tk.Frame(obox, bg=BG)
+    # ---------- 옵션 ----------
+    c2, f2 = card(wrap, "옵션", F_HD)
+    c2.pack(fill="x", pady=(14, 0))
+    sw = {}
+    items = [("sets", "세트 출력", "SET_NODE_LIST / SET_SOLID"),
+             ("mat", "재료·단면", "MAT / SECTION"),
+             ("bc", "경계조건", "BOUNDARY_SPC_SET"),
+             ("contact", "접촉·구속", "CONTACT / CONSTRAINED"),
+             ("ctrl", "CONTROL 카드", "템플릿 값이니 수정 필요"),
+             ("tet10", "2차 사면체 유지", "C3D10 → TET4TOTET10"),
+             ("beamNode", "보 방향절점", "단면 n1로 자동 생성")]
+    grid = tk.Frame(f2, bg=P["card"])
     grid.pack(fill="x")
-    for i, (k, label) in enumerate(checks):
-        v = tk.BooleanVar(value=DEFAULT_OPT[k])
-        vars_[k] = v
-        tk.Checkbutton(grid, text=label, variable=v, bg=BG, fg=INK,
-                       activebackground=BG, anchor="w").grid(
-            row=i // 3, column=i % 3, sticky="w", padx=(0, 18))
+    for i, (k, lab, sub) in enumerate(items):
+        s_ = Switch(grid, lab, DEFAULT_OPT[k], font=F_LB, sub=sub, subfont=F_SM)
+        s_.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 30), pady=7)
+        sw[k] = s_
+    for cix in range(3):
+        grid.grid_columnconfigure(cix, weight=1)
 
-    row2 = tk.Frame(obox, bg=BG)
-    row2.pack(fill="x", pady=(8, 0))
-    tk.Label(row2, text="쉘 formulation", bg=BG, fg=INK).pack(side="left")
-    shellvar = tk.StringVar(value="auto")
-    ttk.Combobox(row2, textvariable=shellvar, width=22, state="readonly",
-                 values=["auto", "2", "16"]).pack(side="left", padx=(6, 18))
-    tk.Label(row2, text="단위계", bg=BG, fg=INK).pack(side="left")
-    unitvar = tk.StringVar(value="mmts")
-    ttk.Combobox(row2, textvariable=unitvar, width=10, state="readonly",
-                 values=["mmts", "mkgs", "mmkgms"]).pack(side="left", padx=(6, 18))
-    tk.Label(row2, text="기본 마찰계수", bg=BG, fg=INK).pack(side="left")
+    r2 = tk.Frame(f2, bg=P["card"])
+    r2.pack(fill="x", pady=(14, 0))
+    tk.Label(r2, text="쉘 formulation", bg=P["card"], fg=P["faint"],
+             font=F_SM).pack(side="left", padx=(0, 8))
+    seg_shell = Segmented(r2, [("auto", "자동"), ("2", "2 · BT"), ("16", "16 · 완전적분")],
+                          0, font=F_SM)
+    seg_shell.pack(side="left")
+    tk.Label(r2, text="단위계", bg=P["card"], fg=P["faint"],
+             font=F_SM).pack(side="left", padx=(20, 8))
+    seg_unit = Segmented(r2, [("mmts", "mm·ton·s"), ("mkgs", "m·kg·s"),
+                              ("mmkgms", "mm·kg·ms")], 0, font=F_SM)
+    seg_unit.pack(side="left")
+    tk.Label(r2, text="마찰계수", bg=P["card"], fg=P["faint"],
+             font=F_SM).pack(side="left", padx=(20, 8))
     muvar = tk.StringVar(value="0.2")
-    tk.Entry(row2, textvariable=muvar, width=7, font=mono).pack(side="left", padx=(6, 0))
+    tk.Entry(r2, textvariable=muvar, width=6, font=F_MN, bg=P["card2"], fg=P["text"],
+             insertbackground=P["text"], relief="flat", bd=0, justify="center",
+             highlightthickness=1, highlightbackground=P["line"],
+             highlightcolor=P["accent"]).pack(side="left", ipady=5)
 
-    # ---- 실행 ----
-    rrow = tk.Frame(frm, bg=BG)
-    rrow.pack(fill="x", pady=(12, 6))
-    runbtn = tk.Button(rrow, text="변환 실행", state="disabled",
-                       font=(mono[0], 11, "bold"), padx=18, pady=6)
-    runbtn.pack(side="left")
-    openbtn = tk.Button(rrow, text="출력 폴더 열기", state="disabled",
-                        command=lambda: open_folder(state.get("out")))
-    openbtn.pack(side="left", padx=8)
-    statvar = tk.StringVar(value="")
-    tk.Label(rrow, textvariable=statvar, bg=BG, fg="#1b4f8f",
-             font=mono).pack(side="left", padx=10)
+    # ---------- 실행 ----------
+    c3, f3 = card(wrap, "", F_HD)
+    c3.pack(fill="x", pady=(14, 0))
+    r3 = tk.Frame(f3, bg=P["card"])
+    r3.pack(fill="x")
+    btn_run = RButton(r3, "변환 실행", lambda: start(), kind="primary", w=132, h=40,
+                      font=F_BT)
+    btn_run.pack(side="left")
+    btn_run.config(enabled=False)
+    btn_open = RButton(r3, "폴더 열기", lambda: open_folder(state.get("out")),
+                       kind="ghost", w=104, h=40, font=F_LB)
+    btn_open.pack(side="left", padx=(10, 0))
+    btn_open.config(enabled=False)
 
-    prog = ttk.Progressbar(frm, mode="determinate", maximum=100)
-    prog.pack(fill="x")
+    stat_box = tk.Frame(r3, bg=P["card"])
+    stat_box.pack(side="right")
+    pctvar = tk.StringVar(value="")
+    phasevar = tk.StringVar(value="대기 중")
+    tk.Label(stat_box, textvariable=pctvar, bg=P["card"], fg=P["accent"],
+             font=(ui, 15, "bold")).pack(side="right", padx=(10, 0))
+    tk.Label(stat_box, textvariable=phasevar, bg=P["card"], fg=P["dim"],
+             font=F_SM).pack(side="right")
 
-    # ---- 로그 ----
-    lbox = tk.LabelFrame(frm, text=" 로그 ", bg=BG, fg=INK, padx=6, pady=6)
-    lbox.pack(fill="both", expand=True, pady=(12, 0))
-    txt = tk.Text(lbox, font=mono, wrap="word", bg="#ffffff", fg=INK,
-                  relief="flat", height=14)
-    sb = tk.Scrollbar(lbox, command=txt.yview)
+    bar = Bar(f3)
+    bar.pack(fill="x", pady=(14, 0))
+
+    # ---------- 로그 ----------
+    c4, f4 = card(wrap, "로그", F_HD)
+    c4.pack(fill="both", expand=True, pady=(14, 0))
+    txt = tk.Text(f4, font=F_MN, wrap="word", bg=P["card"], fg=P["text"],
+                  relief="flat", bd=0, highlightthickness=0, height=13,
+                  insertbackground=P["text"], spacing1=1, spacing3=1)
+    sb = tk.Scrollbar(f4, command=txt.yview, relief="flat", bd=0,
+                      troughcolor=P["card"], bg=P["card2"],
+                      activebackground=P["faint"], width=10)
     txt.configure(yscrollcommand=sb.set)
     sb.pack(side="right", fill="y")
     txt.pack(fill="both", expand=True)
-    txt.tag_config("warn", foreground="#a4560c")
-    txt.tag_config("err", foreground="#93301f")
-    txt.tag_config("ok", foreground="#1c6b4c")
-    txt.tag_config("info", foreground="#4d5c68")
-    txt.tag_config("head", foreground=INK, font=(mono[0], 10, "bold"))
+    txt.tag_config("warn", foreground=P["warn"])
+    txt.tag_config("err", foreground=P["err"])
+    txt.tag_config("ok", foreground=P["ok"])
+    txt.tag_config("info", foreground=P["dim"])
+    txt.tag_config("head", foreground=P["text"])
 
     def add_line(lv, m):
         txt.insert("end", m + "\n", lv)
         txt.see("end")
 
-    def open_folder(p):
-        if not p:
+    def open_folder(pth):
+        if not pth:
             return
-        d = os.path.dirname(os.path.abspath(p))
+        d = os.path.dirname(os.path.abspath(pth))
         try:
             if sys.platform.startswith("win"):
                 os.startfile(d)
@@ -2480,9 +2802,9 @@ def run_gui():
         log = Log(sink=lambda lv, m: q.put(("log", lv, m)))
         try:
             r = convert_file(path, out, opt, log,
-                             progress=lambda ph, d: q.put(("prog", ph, d)))
+                             progress=lambda ph, pct, t: q.put(("prog", ph, pct, t)))
             q.put(("done", r, None))
-        except Exception as e:                        # pragma: no cover
+        except Exception:
             import traceback
             q.put(("done", None, traceback.format_exc()))
 
@@ -2492,87 +2814,209 @@ def run_gui():
         out = outvar.get().strip() or (os.path.splitext(state["path"])[0] + ".k")
         state["out"] = out
         opt = dict(DEFAULT_OPT)
-        for k, v in vars_.items():
-            opt[k] = bool(v.get())
-        opt["shell"] = shellvar.get()
-        opt["unit"] = unitvar.get()
+        for k, s_ in sw.items():
+            opt[k] = s_.get()
+        opt["shell"] = seg_shell.get()
+        opt["unit"] = seg_unit.get()
         try:
             opt["mu"] = float(muvar.get())
         except ValueError:
             opt["mu"] = 0.2
         txt.delete("1.0", "end")
-        add_line("head", "▶ %s" % os.path.basename(state["path"]))
+        add_line("head", "▶  " + os.path.basename(state["path"]))
         state["busy"] = True
-        runbtn.config(state="disabled", text="변환 중…")
-        openbtn.config(state="disabled")
-        prog.config(mode="indeterminate")
-        prog.start(12)
+        state["t0"] = time.time()
+        btn_run.config(text="변환 중…", enabled=False)
+        btn_open.config(enabled=False)
+        bar.set(0)
+        pctvar.set("0%")
+        phasevar.set("시작하는 중")
         threading.Thread(target=worker, args=(state["path"], out, opt),
                          daemon=True).start()
 
-    runbtn.config(command=start)
-
-    PH = {"read": "읽는 중", "convert": "변환 중", "write": "파일 쓰는 중"}
+    PH = {"read": "읽는 중", "convert": "변환 중", "write": "파일 쓰는 중",
+          "done": "마무리"}
 
     def poll():
         try:
             while True:
-                item = q.get_nowait()
-                if item[0] == "log":
-                    add_line(item[1], item[2])
-                elif item[0] == "prog":
-                    ph, d = item[1], item[2]
-                    if ph == "read":
-                        statvar.set("읽는 중… %.0f MB" % (d / 1048576.0))
-                    else:
-                        statvar.set("%s… %s" % (PH.get(ph, ph), d or ""))
-                elif item[0] == "done":
-                    prog.stop()
-                    prog.config(mode="determinate", value=100)
+                it = q.get_nowait()
+                if it[0] == "log":
+                    add_line(it[1], it[2])
+                elif it[0] == "prog":
+                    _, ph, pct, t = it
+                    bar.set(pct)
+                    pctvar.set("%d%%" % pct)
+                    el = time.time() - state["t0"]
+                    eta = ""
+                    if pct > 4 and el > 1:
+                        eta = "  ·  남은 시간 약 %d초" % max(1, int(el * (100 - pct) / pct))
+                    phasevar.set("%s   %s%s" % (PH.get(ph, ph), t, eta))
+                elif it[0] == "inst":
+                    code, msg = it[1], it[2]
+                    if btn_inst:
+                        btn_inst.config(text="설치 완료" if code == 0 else "설치 실패",
+                                        enabled=code != 0)
+                    if inst_msg:
+                        inst_msg.config(
+                            text=("설치했습니다. 프로그램을 껐다 켜면 가속이 적용됩니다."
+                                  if code == 0 else "설치 실패 — 로그를 확인하세요."))
+                    add_line("ok" if code == 0 else "err", msg.strip()[-600:])
+                elif it[0] == "done":
                     state["busy"] = False
-                    runbtn.config(state="normal", text="변환 실행")
-                    r, errtext = item[1], item[2]
+                    btn_run.config(text="변환 실행", enabled=True)
+                    r, errtext = it[1], it[2]
                     if errtext:
-                        statvar.set("실패")
+                        bar.set(0)
+                        pctvar.set("")
+                        phasevar.set("실패")
                         add_line("err", errtext)
                     else:
-                        statvar.set("완료 · %.1f초" % r["seconds"])
-                        openbtn.config(state="normal")
+                        bar.set(100)
+                        pctvar.set("100%")
+                        phasevar.set("완료  ·  %.1f초" % r["seconds"])
+                        btn_open.config(enabled=True)
                         c = r["counts"]
                         add_line("head", "")
-                        add_line("head", "  절점 %s · 솔리드 %s · 쉘 %s · 보 %s"
+                        add_line("head", "   절점 %s      솔리드 %s      쉘 %s      보 %s"
                                  % (f"{c['node']:,}", f"{c['solid']:,}",
                                     f"{c['shell']:,}", f"{c['beam']:,}"))
-                        add_line("head", "  PART %d · 재료 %d · 세그먼트세트 %d · 접촉 %d · 구속 %d"
+                        add_line("head", "   PART %d   재료 %d   세그먼트 %d   접촉 %d   구속 %d"
                                  % (r["n_part"], r["n_mat"], r["n_seg"],
                                     r["n_contact"], r["n_constr"]))
                         add_line("head", "")
-                        for k, n in sorted(r["type_count"].items(), key=lambda kv: -kv[1]):
+                        for k, n in sorted(r["type_count"].items(),
+                                           key=lambda kv: -kv[1]):
                             src, sub = k.split("|")
                             dst = "변환 안 됨" if sub == "?" else DYNA_KEYWORD.get(sub, sub)
-                            add_line("info", "  %-10s → %-34s %s"
+                            add_line("info", "   %-10s →  %-34s %s"
                                      % (src, dst, f"{n:,}"))
                         if r["imap"]:
                             add_line("head", "")
                             seen = {}
-                            for s, d in r["imap"]:
-                                seen[(s, d)] = seen.get((s, d), 0) + 1
-                            for (s, d), n in seen.items():
-                                add_line("info", "  %-28s → %s" % (s[:28], d))
+                            for a, b in r["imap"]:
+                                seen[(a, b)] = seen.get((a, b), 0) + 1
+                            for (a, b), n in seen.items():
+                                add_line("info", "   %-28s →  %s" % (a[:28], b))
                         add_line("head", "")
-                        add_line("ok", "  저장: " + r["out"])
+                        add_line("ok", "   저장  " + r["out"])
         except queue.Empty:
             pass
-        root.after(120, poll)
+        root.after(100, poll)
 
     poll()
     root.mainloop()
+    return 0
+
+
+# ============================================================
+# 진단 · 자체 시험
+# ============================================================
+MINI_DECK = """*Heading
+selftest
+*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*Element, type=C3D8R, elset=ALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*Nset, nset=BOT
+1, 2, 3, 4
+*Solid Section, elset=ALL, material=STEEL
+*Material, name=STEEL
+*Density
+7.85e-9
+*Elastic
+210000., 0.3
+*Boundary
+BOT, ENCASTRE
+"""
+
+
+def run_check():
+    print("=" * 58)
+    print(" inp2k 진단  v%s" % VERSION)
+    print("=" * 58)
+    print(" 파이썬      : %s" % sys.version.replace("\n", " "))
+    print(" 실행 파일   : %s" % sys.executable)
+    print(" 플랫폼      : %s" % sys.platform)
+    print(" 스크립트    : %s" % os.path.abspath(__file__))
+    print(" 콘솔 인코딩 : %s" % (getattr(sys.stdout, "encoding", "?") or "?"))
+    print("-" * 58)
+
+    ok = True
+    if sys.version_info < (3, 8):
+        print(" [X] 파이썬 3.8 이상이 필요합니다.")
+        ok = False
+    else:
+        print(" [O] 파이썬 버전 OK")
+
+    print(" [%s] numpy  %s" % ("O" if HAVE_NUMPY else "-",
+                               np.__version__ if HAVE_NUMPY else "없음 (없어도 동작, 느림)"))
+    print(" [%s] pandas %s" % ("O" if HAVE_PANDAS else "-",
+                               pd.__version__ if HAVE_PANDAS else "없음 (없어도 동작, 읽기 2배 느림)"))
+    try:
+        import tkinter
+        r = tkinter.Tk()
+        r.destroy()
+        print(" [O] tkinter 사용 가능 (GUI 실행 가능)")
+    except ImportError:
+        print(" [-] tkinter 없음 → GUI 불가, CLI만 사용 가능")
+        print("     Linux: sudo apt install python3-tk")
+    except Exception as e:
+        print(" [-] tkinter는 있으나 창을 열 수 없습니다: %s" % e)
+        print("     (원격 접속·디스플레이 없음 환경) CLI를 쓰세요.")
+
+    print("-" * 58)
+    print(" 자체 시험 변환…")
+    import tempfile as _tf
+    d = _tf.mkdtemp(prefix="inp2k_")
+    ip = os.path.join(d, "selftest.inp")
+    op = os.path.join(d, "selftest.k")
+    try:
+        with open(ip, "w", encoding="utf-8") as f:
+            f.write(MINI_DECK)
+        log = Log()
+        r = convert_file(ip, op, dict(DEFAULT_OPT), log)
+        txt = open(op, encoding="latin-1").read()
+        need = ["*KEYWORD", "*PART", "*SECTION_SOLID", "*MAT_ELASTIC",
+                "*NODE", "*ELEMENT_SOLID", "*BOUNDARY_SPC_SET", "*END"]
+        miss = [k for k in need if k not in txt]
+        if miss or r["counts"]["node"] != 8 or r["counts"]["solid"] != 1:
+            print(" [X] 자체 시험 실패 (누락: %s)" % (", ".join(miss) or "없음"))
+            ok = False
+        else:
+            print(" [O] 자체 시험 통과 — 절점 8, 솔리드 1, %d바이트 생성" % r["bytes"])
+    except BrokenPipeError:
+        raise
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print(" [X] 자체 시험 중 오류")
+        ok = False
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    print("=" * 58)
+    print(" 결과: %s" % ("정상 동작합니다." if ok else "문제가 있습니다. 위 내용을 확인하세요."))
+    print("=" * 58)
+    return 0 if ok else 1
 
 
 # ============================================================
 # CLI
 # ============================================================
 def main():
+    for st in (sys.stdout, sys.stderr):
+        try:
+            st.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     ap = argparse.ArgumentParser(description="Abaqus INP → LS-DYNA keyword 변환기")
     ap.add_argument("input", nargs="?", help="Abaqus .inp 파일")
     ap.add_argument("-o", "--out", help="출력 .k 경로")
@@ -2583,11 +3027,14 @@ def main():
     ap.add_argument("--shell", default="auto", choices=["auto", "2", "16"])
     ap.add_argument("--unit", default="mmts", choices=list(UNIT_DEFAULT))
     ap.add_argument("--mu", type=float, default=0.2, help="기본 마찰계수")
+    ap.add_argument("--check", action="store_true",
+                    help="환경 진단 및 자체 시험 (실행이 안 될 때)")
     args = ap.parse_args()
 
+    if args.check:
+        return run_check()
     if not args.input:
-        run_gui()
-        return 0
+        return run_gui() or 0
 
     opt = dict(DEFAULT_OPT)
     opt.update(sets=not args.no_sets, contact=not args.no_contact,
@@ -2602,17 +3049,16 @@ def main():
     log = Log(sink=sink)
     last = [0.0]
 
-    def prog(ph, d):
+    PHN = {"read": "읽는 중", "convert": "변환 중", "write": "쓰는 중", "done": "완료"}
+
+    def prog(ph, pct, text):
         now = time.time()
-        if now - last[0] < 0.5:
+        if now - last[0] < 0.3 and ph != "done":
             return
         last[0] = now
-        if ph == "read":
-            sys.stderr.write("\r  읽는 중… %.0f MB   " % (d / 1048576.0))
-        else:
-            sys.stderr.write("\r  %s… %s      "
-                             % ({"convert": "변환 중", "write": "쓰는 중"}.get(ph, ph),
-                                d or ""))
+        n = int(pct / 4)
+        bar = "#" * n + "-" * (25 - n)
+        sys.stderr.write("\r  [%s] %3.0f%%  %-9s %-22s" % (bar, pct, PHN.get(ph, ph), text))
         sys.stderr.flush()
 
     r = convert_file(args.input, out, opt, log, prog)
@@ -2623,4 +3069,29 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _code = 0
+    try:
+        _code = main() or 0
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        _code = 1
+    except BrokenPipeError:
+        try:
+            os.close(sys.stdout.fileno())
+        except Exception:
+            pass
+        _code = 0
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print()
+        print("오류가 발생했습니다. 위 내용을 함께 알려주시면 원인을 찾을 수 있습니다.")
+        print("환경 확인:  python inp2k.py --check")
+        _code = 1
+    if _code and sys.platform.startswith("win"):
+        try:
+            input("\n엔터를 누르면 창이 닫힙니다...")
+        except Exception:
+            pass
+    sys.exit(_code)
