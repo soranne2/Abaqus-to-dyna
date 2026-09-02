@@ -331,8 +331,24 @@ function newLog(){
    INP 파서
    ============================================================ */
 function newPart(name){
-  return {name, nodes:new Map(), elements:new Map(), nsets:new Map(),
-          elsets:new Map(), sections:[], massVals:new Map()};
+  return {name,
+    nIds:[], nXYZ:[],                       // 절점: 평면 배열 (메모리 절약)
+    eIds:[], eType:[], eConn:[], eOff:[0],  // 요소: 평면 배열 + 오프셋
+    nsets:new Map(), elsets:new Map(), sections:[], massVals:new Map()};
+}
+const partEmpty=p=>!p.nIds.length&&!p.eIds.length&&!p.nsets.size&&!p.elsets.size&&!p.sections.length;
+function mergeParts(a,b){
+  if(partEmpty(b)) return a;
+  const P=newPart(a.name);
+  P.nIds=a.nIds.concat(b.nIds); P.nXYZ=a.nXYZ.concat(b.nXYZ);
+  P.eIds=a.eIds.concat(b.eIds); P.eType=a.eType.concat(b.eType);
+  P.eConn=a.eConn.concat(b.eConn);
+  P.eOff=a.eOff.concat(b.eOff.slice(1).map(v=>v+a.eConn.length));
+  P.nsets=new Map(a.nsets); for(const [k,v] of b.nsets) P.nsets.set(k,v);
+  P.elsets=new Map(a.elsets); for(const [k,v] of b.elsets) P.elsets.set(k,v);
+  P.sections=a.sections.concat(b.sections);
+  P.massVals=new Map(a.massVals); for(const [k,v] of b.massVals) P.massVals.set(k,v);
+  return P;
 }
 
 function parseKeyword(line){
@@ -349,23 +365,36 @@ function parseKeyword(line){
   return {kw,params};
 }
 
-function logicalLines(text){
-  const raw=text.split(/\r?\n/);
-  const out=[];
-  for(let i=0;i<raw.length;i++){
-    let t=raw[i].trim();
-    if(!t||t.startsWith('**')) continue;
-    while(t.endsWith(',')){
-      let j=i+1;
-      while(j<raw.length && (!raw[j].trim()||raw[j].trim().startsWith('**'))) j++;
-      if(j>=raw.length) break;
-      if(raw[j].trim().startsWith('*')) break;
-      t=t+raw[j].trim();
-      i=j;
-    }
-    out.push(t);
+function* lineIter(text){
+  let i=0; const n=text.length;
+  while(i<n){
+    let j=text.indexOf('\n',i);
+    if(j<0) j=n;
+    let line=text.slice(i,j);
+    if(line.charCodeAt(line.length-1)===13) line=line.slice(0,-1);
+    yield line;
+    i=j+1;
   }
-  return out;
+}
+
+/* 이어쓰기(끝 쉼표)를 합쳐 논리적 한 줄씩 흘려보낸다 */
+function* logicalIter(src){
+  let pending=null;
+  for(const raw of src){
+    const t=raw.trim();
+    if(!t||t.startsWith('**')) continue;
+    if(pending!==null){
+      if(t.startsWith('*')){ yield pending; pending=null; }
+      else{
+        pending+=t;
+        if(!pending.endsWith(',')){ yield pending; pending=null; }
+        continue;
+      }
+    }
+    if(t.endsWith(',')) pending=t;
+    else yield t;
+  }
+  if(pending!==null) yield pending;
 }
 
 /* ---- *INCLUDE 병합 ---- */
@@ -384,41 +413,37 @@ function includeRefs(text){
   return out;
 }
 
-/* files: Map(KEY -> {key,name,text}). 재귀적으로 전개한 라인 배열을 돌려준다. */
-function expandIncludes(text,files,log,stack,stats){
-  stack=stack||[]; stats=stats||{merged:0,missing:new Set(),used:new Set()};
-  const out=[];
-  for(const line of text.split(/\r?\n/)){
-    const t=line.trim();
+/* files: Map(KEY -> {key,name,text}). 원본 줄을 그대로 흘려보내며 include만 끼워 넣는다. */
+function* expandIncludes(text,files,log,stack,stats){
+  stack=stack||[]; stats=stats||{merged:0,missing:new Set(),used:new Set(),lines:0};
+  for(const raw of lineIter(text)){
+    const t=raw.trim();
     if(!t.startsWith('**')&&RE_INCLUDE.test(t)){
       const {params}=parseKeyword(t);
-      const raw=params.INPUT||params.FILE||'';
-      const key=baseKey(raw);
+      const ref=params.INPUT||params.FILE||'';
+      const key=baseKey(ref);
       if(!key){ log.warn('*INCLUDE 경로를 읽지 못했습니다.'); continue; }
-      if(stack.indexOf(key)>=0){ log.err(`*INCLUDE 순환 참조를 끊었습니다: ${raw}`); continue; }
+      if(stack.indexOf(key)>=0){ log.err(`*INCLUDE 순환 참조를 끊었습니다: ${ref}`); continue; }
       const f=files.get(key);
       if(!f){
-        stats.missing.add(raw);
-        log.err(`*INCLUDE 파일이 없습니다: ${raw} — 같이 올려주시면 이어 붙입니다.`);
-        out.push('** [missing include] '+raw);
+        stats.missing.add(ref);
+        log.err(`*INCLUDE 파일이 없습니다: ${ref} — 같이 올려주시면 이어 붙입니다.`);
         continue;
       }
       stats.merged++; stats.used.add(key);
-      out.push('** >>> include '+f.name);
-      out.push(...expandIncludes(f.text,files,log,stack.concat(key),stats).lines);
-      out.push('** <<< end '+f.name);
+      yield* expandIncludes(f.text,files,log,stack.concat(key),stats);
       continue;
     }
-    out.push(line);
+    stats.lines++;
+    yield raw;
   }
-  return {lines:out,stats};
 }
 
 const UNSUPPORTED_QUIET=new Set(['STEP','END STEP','DYNAMIC','STATIC','OUTPUT','NODE OUTPUT',
   'ELEMENT OUTPUT','RESTART','PREPRINT','SYSTEM','END ASSEMBLY','ASSEMBLY','END PART','END INSTANCE',
   'CONTACT OUTPUT','ENERGY OUTPUT','BULK VISCOSITY','END LOAD CASE']);
 
-function parseInp(text,log){
+function parseInp(src,log){
   const model={title:'',parts:new Map(),instances:[],materials:new Map(),
                asmNsets:[],asmElsets:[],boundaries:[],unsupported:new Map(),
                surfaces:[],interactions:new Map(),contactPairs:[],ties:[],
@@ -434,9 +459,9 @@ function parseInp(text,log){
   let headingDone=false;
   const tgt=()=>curInst?curInst.part:curPart;
 
-  const lines=logicalLines(text);
+  model.elTypes=new Set();
 
-  for(const line of lines){
+  for(const line of logicalIter(src)){
     if(line.startsWith('*')){
       const {kw,params}=parseKeyword(line);
       mode=null; setArr=null;
@@ -469,6 +494,7 @@ function parseInp(text,log){
         case 'ELEMENT':{
           mode='ELEMENT';
           elType=(params.TYPE||'').toUpperCase();
+          model.elTypes.add(elType);
           elSetArr=null;
           if(params.ELSET){
             const nm=params.ELSET.toUpperCase();
@@ -561,6 +587,30 @@ function parseInp(text,log){
     }
 
     /* ---- data line ---- */
+    if(mode==='NODE'){                     // 가장 많이 도는 경로라 별도 처리
+      const P=tgt(), a=line.split(',');
+      const id=parseInt(a[0],10);
+      if(!isNaN(id)){
+        P.nIds.push(id);
+        P.nXYZ.push(parseFloat(a[1])||0,parseFloat(a[2])||0,parseFloat(a[3])||0);
+        if(nodeSetArr) nodeSetArr.push(id);
+      }
+      continue;
+    }
+    if(mode==='ELEMENT'){
+      const P=tgt(), a=line.split(',');
+      const id=parseInt(a[0],10);
+      if(!isNaN(id)){
+        P.eIds.push(id); P.eType.push(elType);
+        for(let k=1;k<a.length;k++){
+          const v=parseInt(a[k],10);
+          if(!isNaN(v)) P.eConn.push(v);
+        }
+        P.eOff.push(P.eConn.length);
+        if(elSetArr) elSetArr.push(id);
+      }
+      continue;
+    }
     const F=line.split(',').map(s=>s.trim());
     switch(mode){
       case 'HEADING':
@@ -575,28 +625,6 @@ function parseInp(text,log){
           curInst.rot=nums.slice(0,7);
         }
         curInst.dataN++;
-        break;
-      }
-
-      case 'NODE':{
-        const id=parseInt(F[0],10);
-        if(isNaN(id)) break;
-        tgt().nodes.set(id,[parseFloat(F[1])||0,parseFloat(F[2])||0,parseFloat(F[3])||0]);
-        if(nodeSetArr) nodeSetArr.push(id);
-        break;
-      }
-
-      case 'ELEMENT':{
-        const id=parseInt(F[0],10);
-        if(isNaN(id)) break;
-        const conn=[];
-        for(let k=1;k<F.length;k++){
-          if(F[k]==='') continue;
-          const v=parseInt(F[k],10);
-          if(!isNaN(v)) conn.push(v);
-        }
-        tgt().elements.set(id,{type:elType,conn});
-        if(elSetArr) elSetArr.push(id);
         break;
       }
 
@@ -739,6 +767,18 @@ function makeTransform(inst){
   };
 }
 
+/* 대형 모델용 조각 출력기: 줄을 모았다가 큰 덩어리로 합친다.
+   문자열 하나로 다 합치면 브라우저 한계(약 512MB)에서 터진다. */
+function Writer(){ this.chunks=[]; this.buf=[]; }
+Writer.prototype.add=function(s){
+  this.buf.push(s);
+  if(this.buf.length>=8192){ this.chunks.push(this.buf.join('\n')+'\n'); this.buf.length=0; }
+};
+Writer.prototype.done=function(){
+  if(this.buf.length){ this.chunks.push(this.buf.join('\n')+'\n'); this.buf.length=0; }
+  return this.chunks;
+};
+
 /* ============================================================
    변환 본체
    ============================================================ */
@@ -751,7 +791,9 @@ const UNIT_DEFAULT={
 function convert(model,opt,log){
   const cv={
     title:model.title||'Converted from Abaqus INP',
-    nodes:[], solids:[], tet10s:[], shells:[], beams:[], masses:[], discretes:[],
+    wNode:new Writer(), wSolid:new Writer(), wTet10:new Writer(),
+    wShell:new Writer(), wBeam:new Writer(), wMass:new Writer(), wDisc:new Writer(),
+    nNode:0, nSolid:0, nShell:0, nBeam:0, nMass:0, nDisc:0,
     parts:[], sections:[], mats:[], curves:[], nsets:[], esets:[], spcs:[],
     segsets:[], contacts:[], nrbs:[], interps:[], lineq:[], imap:[],
     counts:{}
@@ -762,7 +804,7 @@ function convert(model,opt,log){
   let instances=model.instances.slice();
   if(instances.length===0){
     const root=model.parts.get('__ROOT__');
-    if(root.nodes.size>0){
+    if(root.nIds.length>0){
       instances=[{name:'',partName:'__ROOT__',t:[0,0,0],rot:null,part:newPart('L'),dataN:0}];
     }else{
       for(const [k,p] of model.parts){
@@ -815,57 +857,59 @@ function convert(model,opt,log){
     const out=[];
     for(const v of arr){
       if(typeof v==='number') out.push(v);
-      else out.push(...resolveSet(map,v,depth+1));
+      else{ const sub=resolveSet(map,v,depth+1); for(let k=0;k<sub.length;k++) out.push(sub[k]); }
     }
     return out;
   }
 
-  const usedNode=new Set(), usedElem=new Set();
   let maxNode=0, maxElem=0;
   let pidSeq=0, secSeq=0;
-  const nodeCoord=new Map();          // 전역 절점 좌표 (보 방향절점 계산용)
   const globalNsets=new Map();        // 전역 nset 이름 → SID
   const typeCount=new Map();
   const instMaps=new Map();           // 인스턴스명 → {elsets,nsets}
   const instPartOf=new Map();         // 인스턴스명 → 파트명
-  const elemInfo=new Map();           // 전역 EID → {cat,sub,c}
+  const elemInfo=new Map();           // 접촉면에 쓰이는 요소만 EID → {cat,sub,c}
   const needElemInfo = opt.contact &&
     (model.surfaces.length>0||model.contactPairs.length>0||model.ties.length>0||
      model.couplings.length>0||model.rigidBodies.length>0);
+  // 보 방향절점을 만들 때만 좌표를 들고 있는다 (대형 모델 메모리 절약)
+  let needCoord=false;
+  if(opt.beamNode) for(const t of (model.elTypes||[])){
+    const c=classify(t); if(c&&c.cat==='beam'&&!c.truss){ needCoord=true; break; }
+  }
+  const nodeCoord=needCoord?new Map():null;
 
   for(const inst of instances){
     const base=model.parts.get(inst.partName);
     if(!base){ log.warn(`인스턴스 "${inst.name}"가 참조한 파트 ${inst.partName}를 찾을 수 없습니다.`); continue; }
+    const P=mergeParts(base,inst.part);
 
-    /* 파트 + 인스턴스 로컬 정의 병합 */
-    const P=newPart(base.name);
-    for(const [k,v] of base.nodes) P.nodes.set(k,v);
-    for(const [k,v] of inst.part.nodes) P.nodes.set(k,v);
-    for(const [k,v] of base.elements) P.elements.set(k,v);
-    for(const [k,v] of inst.part.elements) P.elements.set(k,v);
-    for(const [k,v] of base.nsets) P.nsets.set(k,v);
-    for(const [k,v] of inst.part.nsets) P.nsets.set(k,v);
-    for(const [k,v] of base.elsets) P.elsets.set(k,v);
-    for(const [k,v] of inst.part.elsets) P.elsets.set(k,v);
-    P.sections=base.sections.concat(inst.part.sections);
-    for(const [k,v] of base.massVals) P.massVals.set(k,v);
-
-    /* offset 결정 */
-    let nOff=0, eOff=0;
-    for(const id of P.nodes.keys()){ if(usedNode.has(id)){ nOff=maxNode; break; } }
-    for(const id of P.elements.keys()){ if(usedElem.has(id)){ eOff=maxElem; break; } }
+    /* offset 결정: 최대 ID만 보고 판단해 대형 모델에서도 메모리를 쓰지 않는다 */
+    let minN=Infinity,maxN=0,minE=Infinity,maxE=0;
+    for(let k=0;k<P.nIds.length;k++){ const v=P.nIds[k]; if(v<minN)minN=v; if(v>maxN)maxN=v; }
+    for(let k=0;k<P.eIds.length;k++){ const v=P.eIds[k]; if(v<minE)minE=v; if(v>maxE)maxE=v; }
+    const nOff=(P.nIds.length&&minN<=maxNode)?maxNode:0;
+    const eOff=(P.eIds.length&&minE<=maxElem)?maxElem:0;
     if(nOff||eOff) log.info(`인스턴스 "${inst.name}" ID 충돌 → 절점 +${nOff}, 요소 +${eOff} offset 적용`);
+    if(P.nIds.length) maxNode=Math.max(maxNode,maxN+nOff);
+    if(P.eIds.length) maxElem=Math.max(maxElem,maxE+eOff);
 
     const T=makeTransform(inst);
-
-    for(const [id,p] of P.nodes){
-      const nid=id+nOff;
-      const q=T(p);
-      cv.nodes.push([nid,q[0],q[1],q[2]]);
-      nodeCoord.set(nid,q);
-      usedNode.add(nid);
-      if(nid>maxNode) maxNode=nid;
+    const ident=!inst.rot&&!inst.t[0]&&!inst.t[1]&&!inst.t[2];
+    const pt=[0,0,0];
+    for(let k=0;k<P.nIds.length;k++){
+      const nid=P.nIds[k]+nOff, b=k*3;
+      let x=P.nXYZ[b],y=P.nXYZ[b+1],z=P.nXYZ[b+2];
+      if(!ident){ pt[0]=x;pt[1]=y;pt[2]=z; const q=T(pt); x=q[0];y=q[1];z=q[2]; }
+      cv.wNode.add(i8(nid)+f16(x)+f16(y)+f16(z)+'       0       0');
+      cv.nNode++;
+      if(nodeCoord) nodeCoord.set(nid,[x,y,z]);
     }
+
+    /* 요소 ID → 인덱스 (단면 배정과 접촉면 생성에만 쓰고 바로 버린다) */
+    const eidx=new Map();
+    for(let k=0;k<P.eIds.length;k++) eidx.set(P.eIds[k],k);
+    const connOf=k=>P.eConn.slice(P.eOff[k],P.eOff[k+1]);
 
     /* 단면 → PART */
     const elemPid=new Map();
@@ -873,8 +917,8 @@ function convert(model,opt,log){
     for(const sec of P.sections){
       const eids=resolveSet(P.elsets,sec.elset);
       if(eids.length===0){ log.warn(`단면이 참조한 요소집합 "${sec.elset}"이 비어 있습니다.`); continue; }
-      const sample=P.elements.get(eids[0]);
-      const cls=sample?classify(sample.type):null;
+      const si=eidx.get(eids[0]);
+      const cls=si!==undefined?classify(P.eType[si]):null;
       if(!cls) continue;
       const secid=++secSeq, pid=++pidSeq;
       const mid=opt.mat?getMid(sec.material):getMid('');
@@ -910,7 +954,25 @@ function convert(model,opt,log){
       }
       cv.sections.push(S);
       cv.parts.push({pid,secid,mid,title});
-      for(const e of eids){ elemPid.set(e+eOff,pid); secOfElem.set(e+eOff,S); }
+      for(const e of eids){ elemPid.set(e,pid); secOfElem.set(e,S); }
+    }
+
+    /* 접촉면에 쓰이는 요소만 골라둔다 */
+    let segEids=null;
+    if(needElemInfo){
+      segEids=new Set();
+      const instU=(inst.name||'').toUpperCase();
+      for(const sf of model.surfaces){
+        for(const [ref] of sf.rows){
+          let nm=String(ref).toUpperCase();
+          const d=nm.indexOf('.');
+          if(d>0){ if(nm.slice(0,d)!==instU) continue; nm=nm.slice(d+1); }
+          if(!P.elsets.has(nm)) continue;
+          for(const e of resolveSet(P.elsets,nm)) segEids.add(e);
+        }
+      }
+      for(const rb of model.rigidBodies) if(rb.elset&&P.elsets.has(rb.elset))
+        for(const e of resolveSet(P.elsets,rb.elset)) segEids.add(e);
     }
 
     /* 미지정 요소용 기본 PART */
@@ -930,41 +992,49 @@ function convert(model,opt,log){
     }
 
     /* 요소 변환 */
-    let orientSeq=0;
-    for(const [id,el] of P.elements){
-      const cls=classify(el.type);
+    let orientSeq=0, massWarn=0;
+    const massList=[...P.massVals.keys()].map(en=>({v:P.massVals.get(en),ids:new Set(resolveSet(P.elsets,en))}));
+    for(let k=0;k<P.eIds.length;k++){
+      const id=P.eIds[k], type=P.eType[k];
+      const cls=classify(type);
       const eid=id+eOff;
-      usedElem.add(eid); if(eid>maxElem) maxElem=eid;
-      if(!cls){
-        typeCount.set(el.type+'|?', (typeCount.get(el.type+'|?')||0)+1);
-        continue;
-      }
-      const key=el.type+'|'+(cls.sub||cls.cat);
+      if(!cls){ typeCount.set(type+'|?',(typeCount.get(type+'|?')||0)+1); continue; }
+      const key=type+'|'+(cls.sub||cls.cat);
       typeCount.set(key,(typeCount.get(key)||0)+1);
-      const c=el.conn.map(n=>n+nOff);
-      if(needElemInfo&&(cls.cat==='solid'||cls.cat==='shell'))
+
+      const o=P.eOff[k], e2=P.eOff[k+1], nc=e2-o;
+      const c=new Array(nc);
+      for(let m=0;m<nc;m++) c[m]=P.eConn[o+m]+nOff;
+
+      if(segEids&&segEids.has(id)&&(cls.cat==='solid'||cls.cat==='shell'))
         elemInfo.set(eid,{cat:cls.cat,sub:cls.sub,c});
       const noPid=(cls.cat==='mass'||cls.cat==='inertia');
-      const pid=noPid?0:(elemPid.get(eid)||fallbackPid(cls.cat,cls));
-      const S=secOfElem.get(eid);
+      const pid=noPid?0:(elemPid.get(id)||fallbackPid(cls.cat,cls));
+      const S=secOfElem.get(id);
 
       if(cls.cat==='solid'){
-        if(cls.sub==='hex8'||cls.sub==='hex20'){
-          cv.solids.push([eid,pid,c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7]]);
-        }else if(cls.sub==='wedge6'||cls.sub==='wedge15'){
-          cv.solids.push([eid,pid,c[0],c[1],c[2],c[2],c[3],c[4],c[5],c[5]]);
-        }else if(cls.sub==='tet4'){
-          cv.solids.push([eid,pid,c[0],c[1],c[2],c[2],c[3],c[3],c[3],c[3]]);
-        }else if(cls.sub==='tet10'){
-          if(opt.tet10) cv.tet10s.push([eid,pid].concat(c.slice(0,10)));
-          else cv.solids.push([eid,pid,c[0],c[1],c[2],c[2],c[3],c[3],c[3],c[3]]);
+        let g;
+        if(cls.sub==='hex8'||cls.sub==='hex20') g=[c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7]];
+        else if(cls.sub==='wedge6'||cls.sub==='wedge15') g=[c[0],c[1],c[2],c[2],c[3],c[4],c[5],c[5]];
+        else if(cls.sub==='tet4') g=[c[0],c[1],c[2],c[2],c[3],c[3],c[3],c[3]];
+        else if(cls.sub==='tet10'){
+          if(opt.tet10){
+            cv.wTet10.add(i8(eid)+i8(pid));
+            cv.wTet10.add(c.slice(0,10).map(i8).join(''));
+            cv.nSolid++; continue;
+          }
+          g=[c[0],c[1],c[2],c[2],c[3],c[3],c[3],c[3]];
         }
+        if(!g) continue;
+        cv.wSolid.add(i8(eid)+i8(pid)+g.map(i8).join(''));
+        cv.nSolid++;
       }else if(cls.cat==='shell'){
-        if(cls.sub==='quad4'||cls.sub==='quad8') cv.shells.push([eid,pid,c[0],c[1],c[2],c[3]]);
-        else cv.shells.push([eid,pid,c[0],c[1],c[2],c[2]]);
+        const g=(cls.sub==='quad4'||cls.sub==='quad8')?[c[0],c[1],c[2],c[3]]:[c[0],c[1],c[2],c[2]];
+        cv.wShell.add(i8(eid)+i8(pid)+g.map(i8).join(''));
+        cv.nShell++;
       }else if(cls.cat==='beam'){
         let n3=0;
-        if(!cls.truss && opt.beamNode && S && S.n1){
+        if(!cls.truss && opt.beamNode && S && S.n1 && nodeCoord){
           const p1=nodeCoord.get(c[0]), p2=nodeCoord.get(c[1]);
           if(p1&&p2){
             const len=Math.hypot(p2[0]-p1[0],p2[1]-p1[1],p2[2]-p1[2])||1;
@@ -973,31 +1043,33 @@ function convert(model,opt,log){
                   my=(p1[1]+p2[1])/2+v[1]/vl*len,
                   mz=(p1[2]+p2[2])/2+v[2]/vl*len;
             n3=++maxNode;
-            cv.nodes.push([n3,mx,my,mz]);
+            cv.wNode.add(i8(n3)+f16(mx)+f16(my)+f16(mz)+'       0       0');
+            cv.nNode++;
             nodeCoord.set(n3,[mx,my,mz]);
-            usedNode.add(n3);
             orientSeq++;
           }
         }
-        cv.beams.push([eid,pid,c[0],c[1],n3]);
+        cv.wBeam.add(i8(eid)+i8(pid)+i8(c[0])+i8(c[1])+i8(n3)+'       0       0       0       0       2');
+        cv.nBeam++;
       }else if(cls.cat==='mass'){
         let mv=0;
-        for(const [en,v] of P.massVals){
-          const ids=resolveSet(P.elsets,en);
-          if(ids.indexOf(id)>=0){ mv=v; break; }
-        }
-        cv.masses.push([eid,c[0],mv]);
-        if(!mv) log.warn(`질량 요소 ${eid}의 값을 찾지 못해 0으로 두었습니다.`);
+        for(const m of massList) if(m.ids.has(id)){ mv=m.v; break; }
+        cv.wMass.add(i8(eid)+i8(c[0])+f16(mv)+i8(0));
+        cv.nMass++;
+        if(!mv) massWarn++;
       }else if(cls.cat==='discrete'){
-        cv.discretes.push([eid,pid,c[0],c[1]||0]);
+        cv.wDisc.add(i8(eid)+i8(pid)+i8(c[0])+i8(c[1]||0)+i8(0)+f16(1.0)+i8(0)+f16(0));
+        cv.nDisc++;
       }
     }
+    if(massWarn) log.warn(`질량 요소 ${massWarn}개의 값을 찾지 못해 0으로 두었습니다.`);
     if(orientSeq) log.ok(`보 요소 방향절점 ${orientSeq}개를 생성했습니다.`);
 
     /* 세트 */
     if(opt.sets){
       for(const [nm] of P.nsets){
-        const ids=resolveSet(P.nsets,nm).map(v=>v+nOff);
+        const ids=resolveSet(P.nsets,nm);
+        if(nOff) for(let k=0;k<ids.length;k++) ids[k]+=nOff;
         if(!ids.length) continue;
         const full=(inst.name?inst.name+'_':'')+nm;
         cv.nsets.push({sid:cv.nsets.length+1,name:full,ids});
@@ -1005,10 +1077,11 @@ function convert(model,opt,log){
         if(!globalNsets.has(nm)) globalNsets.set(nm,cv.nsets.length);
       }
       for(const [nm] of P.elsets){
-        const ids=resolveSet(P.elsets,nm).map(v=>v+eOff);
+        const ids=resolveSet(P.elsets,nm);
+        if(eOff) for(let k=0;k<ids.length;k++) ids[k]+=eOff;
         if(!ids.length) continue;
-        const first=P.elements.get(ids[0]-eOff);
-        const cls=first?classify(first.type):null;
+        const fi=eidx.get(ids[0]-eOff);
+        const cls=fi!==undefined?classify(P.eType[fi]):null;
         if(!cls||['solid','shell','beam'].indexOf(cls.cat)<0) continue;
         cv.esets.push({sid:cv.esets.length+1,cat:cls.cat,
                        name:(inst.name?inst.name+'_':'')+nm,ids});
@@ -1109,7 +1182,7 @@ function convert(model,opt,log){
           const ids=[];
           for(const [r] of def.rows){
             const v=lookNset(r,pref);
-            if(v) ids.push(...v);
+            if(v) for(let k=0;k<v.length;k++) ids.push(v[k]);
             else{
               const n=parseInt(r,10);
               if(!isNaN(n)&&instMaps.size===1) ids.push(n+[...instMaps.values()][0].nOff);
@@ -1125,7 +1198,7 @@ function convert(model,opt,log){
               continue;
             }
             const sub=buildSurf(r,depth+1);
-            if(sub&&sub.type==='seg') segs.push(...sub.segs);
+            if(sub&&sub.type==='seg') for(let k=0;k<sub.segs.length;k++) segs.push(sub.segs[k]);
             else log.warn(`표면 "${def.name}"이 참조한 "${r}"을 찾지 못했습니다.`);
           }
           res={type:'seg',segs,name:R};
@@ -1236,7 +1309,7 @@ function convert(model,opt,log){
     }
 
     function addNRB(title,ids,pnode){
-      const uniq=[...new Set(ids)].filter(v=>usedNode.has(v));
+      const uniq=[...new Set(ids)].filter(v=>v>0&&v<=maxNode);
       if(uniq.length<2) return false;
       const nsid=nodeSetId('NRB_'+title,uniq);
       cv.nrbs.push({pid:++pidSeq,nsid,pnode:pnode||0,title});
@@ -1259,7 +1332,7 @@ function convert(model,opt,log){
         const mi=nodeRef(g.master);
         if(!mi){ log.warn(`*MPC 기준절점 "${g.master}"을 찾지 못했습니다.`); continue; }
         const ids=[...mi];
-        for(const s of g.slaves){ const v=nodeRef(s); if(v) ids.push(...v); }
+        for(const s of g.slaves){ const v=nodeRef(s); if(v) for(let k=0;k<v.length;k++) ids.push(v[k]); }
         if(addNRB('MPC_'+g.type+'_'+(++n),ids,mi[0])) {
           if(g.type==='PIN'||g.type==='LINK')
             log.warn(`*MPC ${g.type}는 병진만 구속하지만 강체 구속으로 바뀌어 회전까지 묶입니다.`);
@@ -1288,11 +1361,11 @@ function convert(model,opt,log){
       const ids=[];
       if(rb.elset){
         const es=lookElset(rb.elset);
-        if(es) for(const e of es){ const info=elemInfo.get(e); if(info) ids.push(...info.c); }
+        if(es) for(const e of es){ const info=elemInfo.get(e); if(info) for(let k=0;k<info.c.length;k++) ids.push(info.c[k]); }
       }
-      for(const k of ['pin','tie']) if(rb[k]){ const v=lookNset(rb[k]); if(v) ids.push(...v); }
+      for(const k of ['pin','tie']) if(rb[k]){ const v=lookNset(rb[k]); if(v) for(let m=0;m<v.length;m++) ids.push(v[m]); }
       const rn=rb.ref?nodeRef(rb.ref):null;
-      if(rn) ids.push(...rn);
+      if(rn) for(let m=0;m<rn.length;m++) ids.push(rn[m]);
       if(addNRB('RIGID_'+(rb.elset||rb.pin||rb.tie||'BODY'),ids,rn?rn[0]:0)){
         cv.imap.push(['*RIGID BODY '+(rb.elset||''),'*CONSTRAINED_NODAL_RIGID_BODY']);
         log.info('*RIGID BODY를 절점 강체로 바꿨습니다. 파트 전체가 강체라면 *MAT_RIGID가 더 낫습니다.');
@@ -1358,8 +1431,8 @@ function convert(model,opt,log){
 
   cv.typeCount=typeCount;
   cv.counts={
-    node:cv.nodes.length, solid:cv.solids.length+cv.tet10s.length,
-    shell:cv.shells.length, beam:cv.beams.length, mass:cv.masses.length,
+    node:cv.nNode, solid:cv.nSolid,
+    shell:cv.nShell, beam:cv.nBeam, mass:cv.nMass,
     part:cv.parts.length, mat:cv.mats.length,
     nset:cv.nsets.length, eset:cv.esets.length,
     segset:cv.segsets.length, contact:cv.contacts.length,
@@ -1374,7 +1447,7 @@ function convert(model,opt,log){
    ============================================================ */
 function buildK(cv,opt,srcName){
   const UD=UNIT_DEFAULT[opt.unit];
-  const O=[];
+  let O=[];
   O.push('*KEYWORD');
   O.push('*TITLE');
   O.push('$#                                                                         title');
@@ -1474,49 +1547,28 @@ function buildK(cv,opt,srcName){
     for(const [x,y] of c.pts) O.push(f20(x)+f20(y));
   }
 
-  /* NODE */
-  if(cv.nodes.length){
-    O.push('*NODE');
-    O.push('$#   nid               x               y               z      tc      rc');
-    for(const n of cv.nodes) O.push(i8(n[0])+f16(n[1])+f16(n[2])+f16(n[3])+pad(0,8)+pad(0,8));
-  }
+  const head=O.join('\n')+'\n';
+  O=[];
 
-  /* ELEMENT_SOLID */
-  if(cv.solids.length){
-    O.push('*ELEMENT_SOLID');
-    O.push('$#   eid     pid      n1      n2      n3      n4      n5      n6      n7      n8');
-    for(const e of cv.solids) O.push(e.map(i8).join(''));
-  }
-  if(cv.tet10s.length){
-    O.push('*ELEMENT_SOLID_TET4TOTET10');
-    O.push('$#   eid     pid');
-    for(const e of cv.tet10s){
-      O.push(i8(e[0])+i8(e[1]));
-      O.push(e.slice(2).map(i8).join(''));
-    }
-  }
-  if(cv.shells.length){
-    O.push('*ELEMENT_SHELL');
-    O.push('$#   eid     pid      n1      n2      n3      n4');
-    for(const e of cv.shells) O.push(e.map(i8).join(''));
-  }
-  if(cv.beams.length){
-    O.push('*ELEMENT_BEAM');
-    O.push('$#   eid     pid      n1      n2      n3     rt1     rr1     rt2     rr2   local');
-    for(const e of cv.beams)
-      O.push(i8(e[0])+i8(e[1])+i8(e[2])+i8(e[3])+i8(e[4])+i8(0)+i8(0)+i8(0)+i8(0)+i8(2));
-  }
-  if(cv.masses.length){
-    O.push('*ELEMENT_MASS');
-    O.push('$#   eid     nid            mass     pid');
-    for(const e of cv.masses) O.push(i8(e[0])+i8(e[1])+f16(e[2])+i8(0));
-  }
-  if(cv.discretes.length){
-    O.push('*ELEMENT_DISCRETE');
-    O.push('$#   eid     pid      n1      n2     vid           s       pf      offset');
-    for(const e of cv.discretes)
-      O.push(i8(e[0])+i8(e[1])+i8(e[2])+i8(e[3])+i8(0)+f16(1.0)+i8(0)+f16(0));
-  }
+  /* 요소/절점 블록은 조각 단위로 이어 붙인다 */
+  const body=[];
+  const section=(w,n,hdr)=>{
+    if(!n) return;
+    body.push(hdr.join('\n')+'\n');
+    for(const ch of w.done()) body.push(ch);
+  };
+  section(cv.wNode,cv.nNode,['*NODE',
+    '$#   nid               x               y               z      tc      rc']);
+  section(cv.wSolid,cv.wSolid.buf.length||cv.wSolid.chunks.length,['*ELEMENT_SOLID',
+    '$#   eid     pid      n1      n2      n3      n4      n5      n6      n7      n8']);
+  section(cv.wTet10,cv.wTet10.buf.length||cv.wTet10.chunks.length,['*ELEMENT_SOLID_TET4TOTET10','$#   eid     pid']);
+  section(cv.wShell,cv.nShell,['*ELEMENT_SHELL',
+    '$#   eid     pid      n1      n2      n3      n4']);
+  section(cv.wBeam,cv.nBeam,['*ELEMENT_BEAM',
+    '$#   eid     pid      n1      n2      n3     rt1     rr1     rt2     rr2   local']);
+  section(cv.wMass,cv.nMass,['*ELEMENT_MASS','$#   eid     nid            mass     pid']);
+  section(cv.wDisc,cv.nDisc,['*ELEMENT_DISCRETE',
+    '$#   eid     pid      n1      n2     vid           s       pf      offset']);
 
   /* SET */
   const chunkOut=(ids,W)=>{
@@ -1595,7 +1647,7 @@ function buildK(cv,opt,srcName){
   }
 
   O.push('*END');
-  return O.join('\n')+'\n';
+  return [head].concat(body,[O.join('\n')+'\n']);
 }
 
 /* ============================================================
@@ -1603,7 +1655,7 @@ function buildK(cv,opt,srcName){
    ============================================================ */
 const $=id=>document.getElementById(id);
 const FILES=new Map();          // KEY -> {key,name,text}
-let mainKey=null, userPicked=false, outText=null;
+let mainKey=null, userPicked=false, outParts=null, outBytes=0;
 
 function readText(f){
   return new Promise(res=>{
@@ -1657,7 +1709,10 @@ async function addFiles(list){
   const failed=[], empty=[];
   let added=0;
   for(const f of arr){
-    if(f.size>200*1024*1024){ failed.push(f.name+' (너무 큼)'); continue; }
+    if(f.size>480*1024*1024){
+      failed.push(f.name+' ('+(f.size/1048576).toFixed(0)+'MB, 브라우저 문자열 한계 초과)');
+      continue;
+    }
     const text=await readText(f);
     if(text===null){ failed.push(f.name+' (읽기 거부)'); continue; }
     if(!text.trim()){ empty.push(f.name); continue; }
@@ -1754,7 +1809,7 @@ $('padd').addEventListener('click',()=>{
   renderFiles();
 });
 $('clear').addEventListener('click',()=>{
-  FILES.clear(); mainKey=null; userPicked=false; outText=null;
+  FILES.clear(); mainKey=null; userPicked=false; outParts=null; outBytes=0;
   renderFiles(); dropMsg(null);
   $('dl').disabled=true;
   $('copy').disabled=true;
@@ -1766,13 +1821,8 @@ $('run').addEventListener('click',()=>{
   if(!main) return;
   const t0=performance.now();
   const log=newLog();
-  const ex=expandIncludes(main.text,FILES,log,[],null);
-  const fileText=ex.lines.join('\n');
   const fileName=main.name;
-  if(ex.stats.merged)
-    log.ok(`*INCLUDE ${ex.stats.merged}개 파일을 병합했습니다 (총 ${ex.lines.length.toLocaleString()}줄).`);
-  const unused=[...FILES.keys()].filter(k=>k!==mainKey&&!ex.stats.used.has(k));
-  if(unused.length) log.info('병합에 쓰이지 않은 파일: '+unused.map(k=>FILES.get(k).name).join(', '));
+  const stats={merged:0,missing:new Set(),used:new Set(),lines:0};
   const opt={
     sets:$('optSets').checked, mat:$('optMat').checked, bc:$('optBC').checked,
     ctrl:$('optCtrl').checked, tet10:$('optTet10').checked,
@@ -1782,16 +1832,24 @@ $('run').addEventListener('click',()=>{
   };
   let cv;
   try{
-    const model=parseInp(fileText,log);
+    const model=parseInp(expandIncludes(main.text,FILES,log,[],stats),log);
+    if(stats.merged)
+      log.ok(`*INCLUDE ${stats.merged}개 파일을 병합했습니다 (총 ${stats.lines.toLocaleString()}줄).`);
+    const unused=[...FILES.keys()].filter(k=>k!==mainKey&&!stats.used.has(k));
+    if(unused.length) log.info('병합에 쓰이지 않은 파일: '+unused.map(k=>FILES.get(k).name).join(', '));
     log.info(`파트 ${Math.max(0,model.parts.size-1)}개, 인스턴스 ${model.instances.length}개, 재료 ${model.materials.size}개를 읽었습니다.`);
     cv=convert(model,opt,log);
-    outText=buildK(cv,opt,fileName);
-    log.ok(`변환 완료 · ${outText.split('\n').length.toLocaleString()}줄`);
+    outParts=buildK(cv,opt,fileName);
+    let bytes=0; for(const c of outParts) bytes+=c.length;
+    outBytes=bytes;
+    log.ok(`변환 완료 · ${(bytes/1048576).toFixed(1)} MB`);
   }catch(err){
     log.err('변환 중 오류: '+err.message);
+    if(/allocation|memory|Invalid string length/i.test(err.message||''))
+      log.err('메모리가 부족합니다. 브라우저 탭을 새로 열거나 데스크톱 브라우저에서 시도해 보세요.');
     console.error(err);
     cv=cv||{counts:{},typeCount:new Map()};
-    outText=null;
+    outParts=null;
   }
   render(cv,log,performance.now()-t0);
 });
@@ -1835,11 +1893,13 @@ function render(cv,log,ms){
   const nw=log.items.filter(i=>i.lv==='warn').length, ne=log.items.filter(i=>i.lv==='err').length;
   $('logCount').textContent=`경고 ${nw} · 오류 ${ne}`;
 
-  if(outText){
-    const lines=outText.split('\n');
-    $('prev').textContent=lines.slice(0,400).join('\n')+(lines.length>400?'\n\n... 이하 '+(lines.length-400).toLocaleString()+'줄 생략':'');
+  if(outParts){
+    let head='';
+    for(let i=0;i<outParts.length&&head.length<60000;i++) head+=outParts[i];
+    const lines=head.split('\n');
+    $('prev').textContent=lines.slice(0,400).join('\n')+'\n\n... 이하 생략 (전체 '+(outBytes/1048576).toFixed(1)+' MB)';
     $('dl').disabled=false;
-    $('copy').disabled=false;
+    $('copy').disabled=outBytes>20*1048576;
   }else{
     $('prev').textContent='(출력 없음)';
     $('dl').disabled=true;
@@ -1851,7 +1911,9 @@ function render(cv,log,ms){
 function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
 $('copy').addEventListener('click',async()=>{
-  if(!outText) return;
+  if(!outParts) return;
+  if(outBytes>20*1048576){ $('copymsg').textContent='너무 커서 복사할 수 없습니다. 파일로 저장하세요.'; return; }
+  const outText=outParts.join('');
   const done=()=>{ $('copymsg').textContent='복사했습니다'; setTimeout(()=>$('copymsg').textContent='',2500); };
   try{
     await navigator.clipboard.writeText(outText);
@@ -1868,10 +1930,10 @@ $('copy').addEventListener('click',async()=>{
 });
 
 $('dl').addEventListener('click',()=>{
-  if(!outText) return;
+  if(!outParts) return;
   const src=FILES.get(mainKey);
   const base=((src&&src.name)||'model').replace(/\.[^.]+$/,'');
-  const blob=new Blob([outText],{type:'text/plain'});
+  const blob=new Blob(outParts,{type:'text/plain'});
   const a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
   a.download=base+'.k';
