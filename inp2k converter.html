@@ -275,6 +275,8 @@ pre.prev{
       <li>general contact은 전체 파트 단일 표면 접촉 하나로만 대체하며, 제외(exclusion) 조건은 옮기지 않습니다.</li>
       <li>하중과 스텝 정의는 변환하지 않습니다. 로그에 미변환 키워드로 남습니다.</li>
       <li>C3D6는 축약 6면체로, C3D4는 축약 사면체로 씁니다. C3D20 등 2차 육면체는 코너 절점만 남기므로 결과가 달라집니다.</li>
+      <li>큰 덱은 브라우저 메모리를 많이 씁니다. 80MB 덱(86만 요소) 기준 변환에 10초 안팎, 메모리 700MB 정도가 필요합니다. 모바일보다 데스크톱 브라우저가 안정적이고, 세트 출력을 끄면 메모리가 크게 줄어듭니다.</li>
+      <li>32MB가 넘는 파일은 통째로 읽지 않고 8MB씩 잘라 읽습니다(목록에 "스트리밍" 표시). 파일 크기 자체에는 제한이 없지만, 읽어들인 모델이 메모리에 올라가므로 500MB급 덱은 64비트 데스크톱 브라우저에서 여유 메모리를 확보하고 쓰세요.</li>
       <li>변환 후 LS-PrePost에서 형상·PID·재료를 눈으로 확인하고, <code>*CONTROL_TERMINATION</code> 값을 실제 해석 조건으로 바꿔 쓰세요.</li>
     </ul>
   </div>
@@ -377,33 +379,14 @@ function* lineIter(text){
   }
 }
 
-/* 이어쓰기(끝 쉼표)를 합쳐 논리적 한 줄씩 흘려보낸다 */
-function* logicalIter(src){
-  let pending=null;
-  for(const raw of src){
-    const t=raw.trim();
-    if(!t||t.startsWith('**')) continue;
-    if(pending!==null){
-      if(t.startsWith('*')){ yield pending; pending=null; }
-      else{
-        pending+=t;
-        if(!pending.endsWith(',')){ yield pending; pending=null; }
-        continue;
-      }
-    }
-    if(t.endsWith(',')) pending=t;
-    else yield t;
-  }
-  if(pending!==null) yield pending;
-}
-
 /* ---- *INCLUDE 병합 ---- */
 const baseKey=p=>String(p||'').replace(/["']/g,'').trim().split(/[\\/]/).pop().toUpperCase();
 const RE_INCLUDE=/^\*\s*INCLUDE\b/i;
 
-function includeRefs(text){
+const peekText=f=>(typeof f==='string'?f:(f.text!=null?f.text:(f.head||'')));
+function includeRefs(src){
   const out=[];
-  for(const line of text.split(/\r?\n/)){
+  for(const line of peekText(src).split(/\r?\n/)){
     const t=line.trim();
     if(t.startsWith('**')||!RE_INCLUDE.test(t)) continue;
     const {params}=parseKeyword(t);
@@ -413,37 +396,11 @@ function includeRefs(text){
   return out;
 }
 
-/* files: Map(KEY -> {key,name,text}). 원본 줄을 그대로 흘려보내며 include만 끼워 넣는다. */
-function* expandIncludes(text,files,log,stack,stats){
-  stack=stack||[]; stats=stats||{merged:0,missing:new Set(),used:new Set(),lines:0};
-  for(const raw of lineIter(text)){
-    const t=raw.trim();
-    if(!t.startsWith('**')&&RE_INCLUDE.test(t)){
-      const {params}=parseKeyword(t);
-      const ref=params.INPUT||params.FILE||'';
-      const key=baseKey(ref);
-      if(!key){ log.warn('*INCLUDE 경로를 읽지 못했습니다.'); continue; }
-      if(stack.indexOf(key)>=0){ log.err(`*INCLUDE 순환 참조를 끊었습니다: ${ref}`); continue; }
-      const f=files.get(key);
-      if(!f){
-        stats.missing.add(ref);
-        log.err(`*INCLUDE 파일이 없습니다: ${ref} — 같이 올려주시면 이어 붙입니다.`);
-        continue;
-      }
-      stats.merged++; stats.used.add(key);
-      yield* expandIncludes(f.text,files,log,stack.concat(key),stats);
-      continue;
-    }
-    stats.lines++;
-    yield raw;
-  }
-}
-
 const UNSUPPORTED_QUIET=new Set(['STEP','END STEP','DYNAMIC','STATIC','OUTPUT','NODE OUTPUT',
   'ELEMENT OUTPUT','RESTART','PREPRINT','SYSTEM','END ASSEMBLY','ASSEMBLY','END PART','END INSTANCE',
   'CONTACT OUTPUT','ENERGY OUTPUT','BULK VISCOSITY','END LOAD CASE']);
 
-function parseInp(src,log){
+function makeParser(log){
   const model={title:'',parts:new Map(),instances:[],materials:new Map(),
                asmNsets:[],asmElsets:[],boundaries:[],unsupported:new Map(),
                surfaces:[],interactions:new Map(),contactPairs:[],ties:[],
@@ -461,7 +418,7 @@ function parseInp(src,log){
 
   model.elTypes=new Set();
 
-  for(const line of logicalIter(src)){
+  function feed(line){
     if(line.startsWith('*')){
       const {kw,params}=parseKeyword(line);
       mode=null; setArr=null;
@@ -583,7 +540,7 @@ function parseInp(src,log){
           if(!UNSUPPORTED_QUIET.has(kw))
             model.unsupported.set(kw,(model.unsupported.get(kw)||0)+1);
       }
-      continue;
+      return;
     }
 
     /* ---- data line ---- */
@@ -595,7 +552,7 @@ function parseInp(src,log){
         P.nXYZ.push(parseFloat(a[1])||0,parseFloat(a[2])||0,parseFloat(a[3])||0);
         if(nodeSetArr) nodeSetArr.push(id);
       }
-      continue;
+      return;
     }
     if(mode==='ELEMENT'){
       const P=tgt(), a=line.split(',');
@@ -609,7 +566,7 @@ function parseInp(src,log){
         P.eOff.push(P.eConn.length);
         if(elSetArr) elSetArr.push(id);
       }
-      continue;
+      return;
     }
     const F=line.split(',').map(s=>s.trim());
     switch(mode){
@@ -689,7 +646,116 @@ function parseInp(src,log){
       }
     }
   }
-  return model;
+  return {model,feed};
+}
+
+/* 이어쓰기(끝 쉼표)를 합쳐 논리적 한 줄로 만들어 넘긴다 */
+function makeJoiner(emit){
+  let pending=null;
+  return {
+    feed(t){
+      if(pending!==null){
+        if(t.charCodeAt(0)===42){ emit(pending); pending=null; }
+        else{
+          pending+=t;
+          if(pending.charCodeAt(pending.length-1)!==44){ emit(pending); pending=null; }
+          return;
+        }
+      }
+      if(t.charCodeAt(t.length-1)===44) pending=t; else emit(t);
+    },
+    finish(){ if(pending!==null){ emit(pending); pending=null; } }
+  };
+}
+
+/* ---- 대용량 스트리밍 판독 ----
+   494MB 같은 덱은 문자열 하나로 못 읽는다(브라우저 한계 약 512MB).
+   파일을 8MB씩 잘라 읽고 줄 단위로 흘려보낸다. */
+function readSliceBuf(blob){
+  if(blob.arrayBuffer) return blob.arrayBuffer();
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onload=()=>res(r.result);
+    r.onerror=()=>rej(new Error('read fail'));
+    r.readAsArrayBuffer(blob);
+  });
+}
+async function* fileBatches(file){
+  const CH=8*1024*1024;
+  const dec=new TextDecoder('utf-8');
+  let rest='';
+  for(let pos=0;pos<file.size;pos+=CH){
+    const buf=await readSliceBuf(file.slice(pos,Math.min(pos+CH,file.size)));
+    const chunk=rest+dec.decode(new Uint8Array(buf),{stream:true});
+    const arr=chunk.split('\n');
+    rest=arr.pop();
+    yield arr;
+  }
+  const tail=rest+dec.decode();
+  if(tail.length) yield tail.split('\n');
+}
+function* textBatches(text){
+  const N=4*1024*1024;
+  if(text.length<=N){ yield text.split('\n'); return; }
+  let i=0;
+  while(i<text.length){
+    let j=Math.min(i+N,text.length);
+    if(j<text.length){ const k=text.lastIndexOf('\n',j); if(k>i) j=k+1; }
+    yield text.slice(i,j).split('\n');
+    i=j;
+  }
+}
+const srcBatches=f=>(f.text!=null?textBatches(f.text):fileBatches(f.file));
+
+async function streamInto(f,files,log,stats,J,stack,onProgress){
+  for await(const batch of srcBatches(f)){
+    for(let i=0;i<batch.length;i++){
+      const t=batch[i].trim();
+      if(!t) continue;
+      if(t.charCodeAt(0)===42){
+        if(t.charCodeAt(1)===42) continue;
+        if(RE_INCLUDE.test(t)){
+          const {params}=parseKeyword(t);
+          const ref=params.INPUT||params.FILE||'';
+          const key=baseKey(ref);
+          if(!key){ log.warn('*INCLUDE 경로를 읽지 못했습니다.'); continue; }
+          if(stack.indexOf(key)>=0){ log.err(`*INCLUDE 순환 참조를 끊었습니다: ${ref}`); continue; }
+          const g=files.get(key);
+          if(!g){
+            stats.missing.add(ref);
+            log.err(`*INCLUDE 파일이 없습니다: ${ref} — 같이 올려주시면 이어 붙입니다.`);
+            continue;
+          }
+          stats.merged++; stats.used.add(key);
+          await streamInto(g,files,log,stats,J,stack.concat(key),onProgress);
+          continue;
+        }
+      }
+      stats.lines++;
+      J.feed(t);
+    }
+    if(onProgress) await onProgress(stats);
+  }
+}
+
+async function parseDeck(mainFile,files,log,stats,onProgress){
+  const P=makeParser(log), J=makeJoiner(P.feed);
+  await streamInto(mainFile,files,log,stats,J,[],onProgress);
+  J.finish();
+  return P.model;
+}
+
+/* 문자열 입력용 (붙여넣기·소형 파일) */
+function parseInp(src,log){
+  const P=makeParser(log), J=makeJoiner(P.feed);
+  const it=(typeof src==='string')?lineIter(src):src;
+  for(const raw of it){
+    const t=raw.trim();
+    if(!t||(t.charCodeAt(0)===42&&t.charCodeAt(1)===42)) continue;
+    J.feed(t);
+  }
+  J.finish();
+  return P.model;
 }
 
 /* ============================================================
@@ -788,7 +854,7 @@ const UNIT_DEFAULT={
   mmkgms:{rho:7.85e-6,e:210,nu:.3,end:20,label:'mm-kg-ms-kN'}
 };
 
-function convert(model,opt,log){
+async function convert(model,opt,log,onTick){
   const cv={
     title:model.title||'Converted from Abaqus INP',
     wNode:new Writer(), wSolid:new Writer(), wTet10:new Writer(),
@@ -898,6 +964,7 @@ function convert(model,opt,log){
     const ident=!inst.rot&&!inst.t[0]&&!inst.t[1]&&!inst.t[2];
     const pt=[0,0,0];
     for(let k=0;k<P.nIds.length;k++){
+      if(onTick&&k&&!(k&262143)) await onTick('절점 '+((cv.nNode/1e6).toFixed(1))+'M');
       const nid=P.nIds[k]+nOff, b=k*3;
       let x=P.nXYZ[b],y=P.nXYZ[b+1],z=P.nXYZ[b+2];
       if(!ident){ pt[0]=x;pt[1]=y;pt[2]=z; const q=T(pt); x=q[0];y=q[1];z=q[2]; }
@@ -911,9 +978,9 @@ function convert(model,opt,log){
     for(let k=0;k<P.eIds.length;k++) eidx.set(P.eIds[k],k);
     const connOf=k=>P.eConn.slice(P.eOff[k],P.eOff[k+1]);
 
-    /* 단면 → PART */
-    const elemPid=new Map();
-    const secOfElem=new Map();
+    /* 단면 → PART (요소 수만큼의 Map 대신 typed array를 쓴다) */
+    const pidArr=new Int32Array(P.eIds.length);
+    const secOfPid=new Map();
     for(const sec of P.sections){
       const eids=resolveSet(P.elsets,sec.elset);
       if(eids.length===0){ log.warn(`단면이 참조한 요소집합 "${sec.elset}"이 비어 있습니다.`); continue; }
@@ -954,7 +1021,8 @@ function convert(model,opt,log){
       }
       cv.sections.push(S);
       cv.parts.push({pid,secid,mid,title});
-      for(const e of eids){ elemPid.set(e,pid); secOfElem.set(e,S); }
+      secOfPid.set(pid,S);
+      for(let m=0;m<eids.length;m++){ const ix=eidx.get(eids[m]); if(ix!==undefined) pidArr[ix]=pid; }
     }
 
     /* 접촉면에 쓰이는 요소만 골라둔다 */
@@ -975,6 +1043,29 @@ function convert(model,opt,log){
         for(const e of resolveSet(P.elsets,rb.elset)) segEids.add(e);
     }
 
+    /* 세트 */
+    if(opt.sets){
+      for(const [nm] of P.nsets){
+        const ids=resolveSet(P.nsets,nm);
+        if(nOff) for(let k=0;k<ids.length;k++) ids[k]+=nOff;
+        if(!ids.length) continue;
+        const full=(inst.name?inst.name+'_':'')+nm;
+        cv.nsets.push({sid:cv.nsets.length+1,name:full,ids});
+        globalNsets.set(full.toUpperCase(),cv.nsets.length);
+        if(!globalNsets.has(nm)) globalNsets.set(nm,cv.nsets.length);
+      }
+      for(const [nm] of P.elsets){
+        const ids=resolveSet(P.elsets,nm);
+        if(eOff) for(let k=0;k<ids.length;k++) ids[k]+=eOff;
+        if(!ids.length) continue;
+        const fi=eidx.get(ids[0]-eOff);
+        const cls=fi!==undefined?classify(P.eType[fi]):null;
+        if(!cls||['solid','shell','beam'].indexOf(cls.cat)<0) continue;
+        cv.esets.push({sid:cv.esets.length+1,cat:cls.cat,
+                       name:(inst.name?inst.name+'_':'')+nm,ids});
+      }
+    }
+
     /* 미지정 요소용 기본 PART */
     const fallback={};
     function fallbackPid(cat,cls){
@@ -986,15 +1077,18 @@ function convert(model,opt,log){
       else if(cat==='beam'){S.kind='beam';S.elform=1;S.a=1;S.d1=1;S.d2=1;S.n1=null;}
       else if(cat==='discrete'){S.kind='discrete';}
       cv.sections.push(S);
+      secOfPid.set(pid,S);
       cv.parts.push({pid,secid,mid,title:'UNASSIGNED_'+cat.toUpperCase()});
       log.warn(`단면이 지정되지 않은 ${cat} 요소가 있어 임시 PART ${pid}에 모았습니다.`);
       return (fallback[cat]=pid);
     }
 
-    /* 요소 변환 */
-    let orientSeq=0, massWarn=0;
+    /* 요소 변환 (여기부터는 eidx가 필요 없으므로 메모리를 돌려준다) */
     const massList=[...P.massVals.keys()].map(en=>({v:P.massVals.get(en),ids:new Set(resolveSet(P.elsets,en))}));
+    eidx.clear();
+    let orientSeq=0, massWarn=0;
     for(let k=0;k<P.eIds.length;k++){
+      if(onTick&&k&&!(k&262143)) await onTick('요소 '+(((cv.nSolid+cv.nShell+cv.nBeam)/1e6).toFixed(1))+'M');
       const id=P.eIds[k], type=P.eType[k];
       const cls=classify(type);
       const eid=id+eOff;
@@ -1009,8 +1103,8 @@ function convert(model,opt,log){
       if(segEids&&segEids.has(id)&&(cls.cat==='solid'||cls.cat==='shell'))
         elemInfo.set(eid,{cat:cls.cat,sub:cls.sub,c});
       const noPid=(cls.cat==='mass'||cls.cat==='inertia');
-      const pid=noPid?0:(elemPid.get(id)||fallbackPid(cls.cat,cls));
-      const S=secOfElem.get(id);
+      const pid=noPid?0:(pidArr[k]||fallbackPid(cls.cat,cls));
+      const S=secOfPid.get(pid);
 
       if(cls.cat==='solid'){
         let g;
@@ -1064,29 +1158,6 @@ function convert(model,opt,log){
     }
     if(massWarn) log.warn(`질량 요소 ${massWarn}개의 값을 찾지 못해 0으로 두었습니다.`);
     if(orientSeq) log.ok(`보 요소 방향절점 ${orientSeq}개를 생성했습니다.`);
-
-    /* 세트 */
-    if(opt.sets){
-      for(const [nm] of P.nsets){
-        const ids=resolveSet(P.nsets,nm);
-        if(nOff) for(let k=0;k<ids.length;k++) ids[k]+=nOff;
-        if(!ids.length) continue;
-        const full=(inst.name?inst.name+'_':'')+nm;
-        cv.nsets.push({sid:cv.nsets.length+1,name:full,ids});
-        globalNsets.set(full.toUpperCase(),cv.nsets.length);
-        if(!globalNsets.has(nm)) globalNsets.set(nm,cv.nsets.length);
-      }
-      for(const [nm] of P.elsets){
-        const ids=resolveSet(P.elsets,nm);
-        if(eOff) for(let k=0;k<ids.length;k++) ids[k]+=eOff;
-        if(!ids.length) continue;
-        const fi=eidx.get(ids[0]-eOff);
-        const cls=fi!==undefined?classify(P.eType[fi]):null;
-        if(!cls||['solid','shell','beam'].indexOf(cls.cat)<0) continue;
-        cv.esets.push({sid:cv.esets.length+1,cat:cls.cat,
-                       name:(inst.name?inst.name+'_':'')+nm,ids});
-      }
-    }
 
     /* 어셈블리 레벨 세트 */
     const instKey=(inst.name||'').toUpperCase();
@@ -1674,8 +1745,16 @@ function dropMsg(m){
 
 function addText(name,text){
   if(!name||!text) return false;
-  FILES.set(name.toUpperCase(),{key:name.toUpperCase(),name,text,size:text.length});
+  FILES.set(name.toUpperCase(),{key:name.toUpperCase(),name,text,head:null,file:null,size:text.length});
   return true;
+}
+/* 큰 파일은 통째로 읽지 않고 앞부분만 미리 본 뒤 변환 때 조각으로 읽는다 */
+const INLINE_MAX=32*1024*1024;
+async function readHead(f,n){
+  try{
+    const buf=await readSliceBuf(f.slice(0,Math.min(n,f.size)));
+    return new TextDecoder('utf-8').decode(new Uint8Array(buf));
+  }catch(e){ return null; }
 }
 
 function walkEntry(entry,out){
@@ -1709,14 +1788,20 @@ async function addFiles(list){
   const failed=[], empty=[];
   let added=0;
   for(const f of arr){
-    if(f.size>480*1024*1024){
-      failed.push(f.name+' ('+(f.size/1048576).toFixed(0)+'MB, 브라우저 문자열 한계 초과)');
+    if(f.size>INLINE_MAX){
+      const head=await readHead(f,1024*1024);
+      if(head===null){ failed.push(f.name+' (읽기 거부)'); continue; }
+      FILES.set(f.name.toUpperCase(),
+        {key:f.name.toUpperCase(),name:f.name,text:null,head,file:f,size:f.size});
+      added++;
       continue;
     }
     const text=await readText(f);
     if(text===null){ failed.push(f.name+' (읽기 거부)'); continue; }
     if(!text.trim()){ empty.push(f.name); continue; }
-    addText(f.name,text); added++;
+    addText(f.name,text);
+    FILES.get(f.name.toUpperCase()).size=f.size;
+    added++;
   }
   if(!added&&!failed.length&&!empty.length) dropMsg('파일을 읽지 못했습니다. 아래 붙여넣기 방식을 써보세요.');
   else if(failed.length||empty.length)
@@ -1727,17 +1812,19 @@ async function addFiles(list){
 }
 
 function scoreMain(f){
+  const t=peekText(f);
   let s=0;
-  if(/^\*heading/im.test(f.text)) s+=100;
-  if(/^\*(assembly|instance)\b/im.test(f.text)) s+=40;
-  if(/^\*(step|material)\b/im.test(f.text)) s+=25;
-  if(/^\*include\b/im.test(f.text)) s+=30;
+  if(/^\*heading/im.test(t)) s+=100;
+  if(/^\*(assembly|instance)\b/im.test(t)) s+=40;
+  if(/^\*(step|material)\b/im.test(t)) s+=25;
+  if(/^\*include\b/im.test(t)) s+=30;
   if(/\.inp$/i.test(f.name)) s+=50;
+  if(f.text===null) s-=20;      // 거대한 메쉬 파일은 보통 include 대상
   return s;
 }
 function detectMain(){
   const refd=new Set();
-  for(const f of FILES.values()) for(const r of includeRefs(f.text)) refd.add(r.key);
+  for(const f of FILES.values()) for(const r of includeRefs(f)) refd.add(r.key);
   let cands=[...FILES.values()].filter(f=>!refd.has(f.key));
   if(!cands.length) cands=[...FILES.values()];
   cands.sort((a,b)=>scoreMain(b)-scoreMain(a)||b.size-a.size);
@@ -1751,7 +1838,7 @@ function renderFiles(){
     $('run').disabled=true; return;
   }
   const refd=new Set(), missing=new Set();
-  for(const f of FILES.values()) for(const r of includeRefs(f.text)){
+  for(const f of FILES.values()) for(const r of includeRefs(f)){
     refd.add(r.key);
     if(!FILES.has(r.key)) missing.add(r.raw);
   }
@@ -1762,7 +1849,8 @@ function renderFiles(){
       :(refd.has(f.key)?'<span class="role">include</span>':'<span class="role un">미참조</span>');
     html+=`<label class="fr"><input type="radio" name="mainpick" value="${escapeHtml(f.key)}" ${isMain?'checked':''}>`
         + `<span class="nm">${escapeHtml(f.name)}</span>`
-        + `<span class="sz">${(f.size/1024).toFixed(0)} KB</span>${role}</label>`;
+        + `<span class="sz">${f.size>1048576?(f.size/1048576).toFixed(1)+' MB':(f.size/1024).toFixed(0)+' KB'}</span>`
+        + (f.text===null?'<span class="role">스트리밍</span>':'')+`${role}</label>`;
   }
   for(const m of missing)
     html+=`<div class="fr"><span style="width:13px"></span><span class="nm">${escapeHtml(m)}</span><span class="role miss">없음</span></div>`;
@@ -1816,11 +1904,20 @@ $('clear').addEventListener('click',()=>{
   $('resSec').classList.add('hidden');
 });
 
-$('run').addEventListener('click',()=>{
+async function doConvert(){
   const main=FILES.get(mainKey);
   if(!main) return;
   const t0=performance.now();
   const log=newLog();
+  const btn=$('run');
+  let lastTick=0;
+  const onProgress=async st=>{
+    const now=performance.now();
+    if(now-lastTick<250) return;
+    lastTick=now;
+    btn.textContent='읽는 중… '+(st.lines/1e6).toFixed(1)+'M줄';
+    await new Promise(r=>setTimeout(r,0));   // 화면 갱신 기회
+  };
   const fileName=main.name;
   const stats={merged:0,missing:new Set(),used:new Set(),lines:0};
   const opt={
@@ -1832,13 +1929,23 @@ $('run').addEventListener('click',()=>{
   };
   let cv;
   try{
-    const model=parseInp(expandIncludes(main.text,FILES,log,[],stats),log);
+    const model=await parseDeck(main,FILES,log,stats,onProgress);
+    btn.textContent='변환 중…';
+    await new Promise(r=>setTimeout(r,0));
     if(stats.merged)
       log.ok(`*INCLUDE ${stats.merged}개 파일을 병합했습니다 (총 ${stats.lines.toLocaleString()}줄).`);
     const unused=[...FILES.keys()].filter(k=>k!==mainKey&&!stats.used.has(k));
     if(unused.length) log.info('병합에 쓰이지 않은 파일: '+unused.map(k=>FILES.get(k).name).join(', '));
     log.info(`파트 ${Math.max(0,model.parts.size-1)}개, 인스턴스 ${model.instances.length}개, 재료 ${model.materials.size}개를 읽었습니다.`);
-    cv=convert(model,opt,log);
+    cv=await convert(model,opt,log,async what=>{
+      const now=performance.now();
+      if(now-lastTick<250) return;
+      lastTick=now;
+      btn.textContent='변환 중… '+what;
+      await new Promise(r=>setTimeout(r,0));
+    });
+    btn.textContent='파일 만드는 중…';
+    await new Promise(r=>setTimeout(r,0));
     outParts=buildK(cv,opt,fileName);
     let bytes=0; for(const c of outParts) bytes+=c.length;
     outBytes=bytes;
@@ -1852,6 +1959,18 @@ $('run').addEventListener('click',()=>{
     outParts=null;
   }
   render(cv,log,performance.now()-t0);
+}
+
+$('run').addEventListener('click',()=>{
+  const btn=$('run');
+  btn.disabled=true; btn.textContent='변환 중…';
+  // 큰 모델은 수십 초 걸리므로 화면이 먼저 갱신되도록 한 틱 넘긴다
+  setTimeout(()=>{
+    doConvert().catch(err=>{
+      console.error(err);
+      alert('변환 중 오류가 발생했습니다: '+(err&&err.message||err));
+    }).then(()=>{ btn.textContent='변환 실행'; btn.disabled=false; });
+  },40);
 });
 
 function render(cv,log,ms){
