@@ -65,6 +65,29 @@ header p{margin:0;max-width:62ch;color:var(--ink-2);font-size:14.5px}
 .drop .big{font-family:var(--mono);font-size:17px;font-weight:500}
 .drop .sub{color:var(--ink-2);font-size:13.5px;margin-top:6px}
 .drop .sub code{font-family:var(--mono);font-size:12.5px;background:#eef1f2;padding:1px 4px}
+.vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.drop{display:block}
+#file:focus-visible + .dropmsg,.drop:focus-within{outline:2px solid var(--blue);outline-offset:2px}
+.dropmsg{
+  font-family:var(--mono);font-size:12.5px;margin-top:10px;padding:9px 13px;
+  background:#fdf7f0;border:1px solid var(--amber);color:var(--amber);
+}
+.paste{margin-top:14px;border:1px solid var(--rule-soft);background:#fff;padding:0}
+.paste summary{
+  cursor:pointer;padding:10px 14px;font-size:13.5px;color:var(--ink-2);
+  list-style:none;
+}
+.paste summary::-webkit-details-marker{display:none}
+.paste summary::before{content:'+ ';font-family:var(--mono);color:var(--blue)}
+.paste[open] summary::before{content:'\2212 '}
+.paste[open] summary{border-bottom:1px solid var(--rule-soft);color:var(--ink)}
+.paste p{margin:12px 14px 10px;font-size:13px;color:var(--ink-2);max-width:66ch}
+.paste input,.paste textarea{
+  display:block;width:calc(100% - 28px);margin:0 14px 10px;padding:8px 10px;
+  font-family:var(--mono);font-size:13px;border:1px solid var(--rule);
+  background:var(--sheet);color:var(--ink);resize:vertical;
+}
+.paste button{margin:0 14px 14px}
 .filelist{margin-top:12px;border:1px solid var(--rule-soft);background:#fff}
 .filelist .fhead{
   font-family:var(--mono);font-size:11.5px;color:var(--ink-2);
@@ -165,12 +188,22 @@ pre.prev{
 
 <section class="sec">
   <div class="head"><b>$# 1. 입력 파일</b><span>.inp · .blk · .inc</span></div>
-  <div class="drop" id="drop" tabindex="0" role="button" aria-label="파일 선택">
+  <label class="drop" id="drop" for="file">
     <div class="big">파일을 여기에 놓거나 눌러서 선택</div>
     <div class="sub">메인 덱과 <code>*INCLUDE</code>가 부르는 .blk / .inc 파일을 함께 올리면 자동으로 이어 붙입니다. 폴더째 끌어다 놓아도 됩니다.</div>
-    <input type="file" id="file" accept=".inp,.blk,.inc,.dat,.txt,.key,.INP,.BLK,.INC" multiple class="hidden">
-  </div>
+  </label>
+  <input type="file" id="file" multiple class="vh">
+  <div id="dropmsg" class="dropmsg hidden"></div>
   <div id="filelist" class="filelist hidden"></div>
+
+  <details class="paste">
+    <summary>파일이 회색으로 뜨거나 선택이 안 될 때</summary>
+    <p>기기가 .inp / .blk 확장자를 모르면 선택창에서 막히는 경우가 있습니다. 덱 내용을 붙여넣어도 똑같이 변환됩니다. include 파일은 이름을 맞춰 하나씩 추가하세요.</p>
+    <input type="text" id="pname" placeholder="파일 이름 (예: model.inp)">
+    <textarea id="ptext" rows="5" placeholder="*Heading&#10;*Node&#10;1, 0., 0., 0. ..."></textarea>
+    <button class="ghost" id="padd" style="padding:7px 14px;font-size:13px">텍스트로 추가</button>
+  </details>
+
   <div class="btnrow">
     <button class="ghost" id="sample" style="padding:7px 14px;font-size:13px">예제 모델 불러오기</button>
     <button class="ghost" id="clear" style="padding:7px 14px;font-size:13px">모두 지우기</button>
@@ -208,6 +241,8 @@ pre.prev{
   <div class="btnrow">
     <button id="run" disabled>변환 실행</button>
     <button class="ghost" id="dl" disabled>.k 파일 저장</button>
+    <button class="ghost" id="copy" disabled>전체 내용 복사</button>
+    <span id="copymsg" style="font-family:var(--mono);font-size:12.5px;color:var(--green)"></span>
   </div>
 </section>
 
@@ -1573,9 +1608,22 @@ let mainKey=null, userPicked=false, outText=null;
 function readText(f){
   return new Promise(res=>{
     const r=new FileReader();
-    r.onload=()=>res(r.result); r.onerror=()=>res('');
-    r.readAsText(f);
+    r.onload=()=>res(r.result);
+    r.onerror=()=>res(null);
+    try{ r.readAsText(f); }catch(e){ res(null); }
   });
+}
+
+function dropMsg(m){
+  const el=$('dropmsg');
+  if(!m){ el.classList.add('hidden'); el.textContent=''; return; }
+  el.textContent=m; el.classList.remove('hidden');
+}
+
+function addText(name,text){
+  if(!name||!text) return false;
+  FILES.set(name.toUpperCase(),{key:name.toUpperCase(),name,text,size:text.length});
+  return true;
 }
 
 function walkEntry(entry,out){
@@ -1604,12 +1652,21 @@ async function collect(dt){
 }
 
 async function addFiles(list){
-  for(const f of list){
-    if(f.size>200*1024*1024) continue;
+  const arr=[...(list||[])];
+  if(!arr.length){ dropMsg('선택된 파일이 없습니다. 아래 붙여넣기 방식도 쓸 수 있습니다.'); return; }
+  const failed=[], empty=[];
+  let added=0;
+  for(const f of arr){
+    if(f.size>200*1024*1024){ failed.push(f.name+' (너무 큼)'); continue; }
     const text=await readText(f);
-    if(!text) continue;
-    FILES.set(f.name.toUpperCase(),{key:f.name.toUpperCase(),name:f.name,text,size:f.size});
+    if(text===null){ failed.push(f.name+' (읽기 거부)'); continue; }
+    if(!text.trim()){ empty.push(f.name); continue; }
+    addText(f.name,text); added++;
   }
+  if(!added&&!failed.length&&!empty.length) dropMsg('파일을 읽지 못했습니다. 아래 붙여넣기 방식을 써보세요.');
+  else if(failed.length||empty.length)
+    dropMsg('불러오지 못한 파일: '+failed.concat(empty.map(n=>n+' (내용 없음)')).join(', '));
+  else dropMsg(null);
   if(!userPicked||!FILES.has(mainKey)) mainKey=detectMain();
   renderFiles();
 }
@@ -1661,23 +1718,46 @@ function renderFiles(){
   });
   $('run').disabled=!mainKey;
   $('dl').disabled=true;
+  $('copy').disabled=true;
   $('resSec').classList.add('hidden');
 }
 
-$('drop').addEventListener('click',()=>$('file').click());
-$('drop').addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();$('file').click();} });
-$('file').addEventListener('change',e=>{ addFiles([...e.target.files]); $('file').value=''; });
+$('file').addEventListener('change',e=>{
+  const fl=[...e.target.files];
+  addFiles(fl);
+  e.target.value='';
+});
 ['dragenter','dragover'].forEach(ev=>$('drop').addEventListener(ev,e=>{e.preventDefault();$('drop').classList.add('hot');}));
 ['dragleave','drop'].forEach(ev=>$('drop').addEventListener(ev,e=>{e.preventDefault();$('drop').classList.remove('hot');}));
 $('drop').addEventListener('drop',async e=>{
   e.preventDefault();
   const files=await collect(e.dataTransfer);
+  if(!files.length){
+    const txt=e.dataTransfer.getData('text');
+    if(txt&&txt.trim().length>20){
+      addText('pasted.inp',txt);
+      if(!userPicked||!FILES.has(mainKey)) mainKey=detectMain();
+      renderFiles(); dropMsg(null); return;
+    }
+  }
   addFiles(files);
+});
+$('padd').addEventListener('click',()=>{
+  const txt=$('ptext').value;
+  if(!txt.trim()){ dropMsg('붙여넣은 내용이 비어 있습니다.'); return; }
+  let nm=$('pname').value.trim();
+  if(!nm) nm=/^\s*\*/m.test(txt)&&/\*heading|\*step|\*assembly/i.test(txt)?'pasted_main.inp':('pasted_'+(FILES.size+1)+'.blk');
+  addText(nm,txt);
+  $('ptext').value=''; $('pname').value='';
+  if(!userPicked||!FILES.has(mainKey)) mainKey=detectMain();
+  dropMsg(null);
+  renderFiles();
 });
 $('clear').addEventListener('click',()=>{
   FILES.clear(); mainKey=null; userPicked=false; outText=null;
-  renderFiles();
+  renderFiles(); dropMsg(null);
   $('dl').disabled=true;
+  $('copy').disabled=true;
   $('resSec').classList.add('hidden');
 });
 
@@ -1759,14 +1839,33 @@ function render(cv,log,ms){
     const lines=outText.split('\n');
     $('prev').textContent=lines.slice(0,400).join('\n')+(lines.length>400?'\n\n... 이하 '+(lines.length-400).toLocaleString()+'줄 생략':'');
     $('dl').disabled=false;
+    $('copy').disabled=false;
   }else{
     $('prev').textContent='(출력 없음)';
     $('dl').disabled=true;
+    $('copy').disabled=true;
   }
   $('resSec').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
 function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+$('copy').addEventListener('click',async()=>{
+  if(!outText) return;
+  const done=()=>{ $('copymsg').textContent='복사했습니다'; setTimeout(()=>$('copymsg').textContent='',2500); };
+  try{
+    await navigator.clipboard.writeText(outText);
+    done();
+  }catch(e){
+    const ta=document.createElement('textarea');
+    ta.value=outText;
+    ta.style.cssText='position:fixed;top:0;left:0;opacity:0';
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); done(); }
+    catch(e2){ $('copymsg').textContent='복사가 막혔습니다. 미리보기에서 직접 선택하세요.'; }
+    ta.remove();
+  }
+});
 
 $('dl').addEventListener('click',()=>{
   if(!outText) return;
@@ -1895,6 +1994,7 @@ $('sample').addEventListener('click',()=>{
   put('materials.inc',SAMPLE_MAT);
   userPicked=false;
   mainKey=detectMain();
+  dropMsg(null);
   renderFiles();
 });
 </script>
