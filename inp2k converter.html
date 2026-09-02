@@ -284,14 +284,16 @@ pre.prev{
 
 </div>
 
-<script>
+<script id="engine" type="text/plain">
+
 "use strict";
 
 /* ============================================================
    포맷 유틸
    ============================================================ */
 const pad = (v,w)=>String(v).padStart(w);
-const i8  = v=>pad(v|0,8);
+const SP8='        ';
+const i8  = v=>{ const s=''+v; return s.length>=8?s:SP8.slice(s.length)+s; };
 const i10 = v=>pad(v|0,10);
 
 function fnum(v,w){
@@ -313,7 +315,54 @@ function fnum(v,w){
   if(s.length>w) s=s.slice(0,w);
   return s.padStart(w);
 }
-const f10=v=>fnum(v,10), f16=v=>fnum(v,16), f20=v=>fnum(v,20);
+const f10=v=>fnum(v,10), f20=v=>fnum(v,20);
+const SP16='                ';
+/* 절점 좌표는 수백만 번 찍히므로 기본 표기를 먼저 시도한다 */
+function f16(v){
+  if(v===0) return '             0.0';
+  let s=''+v;
+  if(s.length<15&&s.indexOf('.')<0&&s.indexOf('e')<0) s+='.0';
+  else if(s.indexOf('e')>=0) s=s.replace('e','E');
+  return s.length<=16?SP16.slice(s.length)+s:fnum(v,16);
+}
+
+/* 콤마 구분 숫자 스캐너: split/substring 없이 읽어 대형 덱에서 2배 가까이 빠르다 */
+const P10=[1,1e1,1e2,1e3,1e4,1e5,1e6,1e7,1e8,1e9,1e10,1e11,1e12,1e13,1e14,1e15,1e16,1e17,1e18];
+function scanNums(s,out,max){
+  const n=s.length; let i=0,k=0;
+  while(i<n&&k<max){
+    let c=s.charCodeAt(i);
+    while(i<n&&(c===32||c===9)){ i++; c=s.charCodeAt(i); }
+    let sign=1;
+    if(c===45){ sign=-1; i++; c=s.charCodeAt(i); }
+    else if(c===43){ i++; c=s.charCodeAt(i); }
+    let mant=0,dec=0,any=false;
+    while(c>=48&&c<=57){ if(mant<1e15) mant=mant*10+(c-48); else dec--; any=true; i++; c=s.charCodeAt(i); }
+    if(c===46){
+      i++; c=s.charCodeAt(i);
+      while(c>=48&&c<=57){ if(mant<1e15){ mant=mant*10+(c-48); dec++; } any=true; i++; c=s.charCodeAt(i); }
+    }
+    if(any){
+      let ex=0;
+      if(c===69||c===101||c===68||c===100){
+        i++; c=s.charCodeAt(i);
+        let es=1;
+        if(c===45){ es=-1; i++; c=s.charCodeAt(i); } else if(c===43){ i++; c=s.charCodeAt(i); }
+        while(c>=48&&c<=57){ ex=ex*10+(c-48); i++; c=s.charCodeAt(i); }
+        ex*=es;
+      }
+      let v=mant, pw=ex-dec;
+      if(pw>0) v=pw<19?v*P10[pw]:v*Math.pow(10,pw);
+      else if(pw<0) v=(-pw)<19?v/P10[-pw]:v*Math.pow(10,pw);
+      out[k++]=sign*v;
+    }
+    while(i<n&&s.charCodeAt(i)!==44) i++;
+    i++;
+    if(i>n) break;
+  }
+  return k;
+}
+const NBUF=[0,0,0,0], EBUF=new Array(32);
 
 /* ============================================================
    로그
@@ -545,26 +594,23 @@ function makeParser(log){
 
     /* ---- data line ---- */
     if(mode==='NODE'){                     // 가장 많이 도는 경로라 별도 처리
-      const P=tgt(), a=line.split(',');
-      const id=parseInt(a[0],10);
-      if(!isNaN(id)){
-        P.nIds.push(id);
-        P.nXYZ.push(parseFloat(a[1])||0,parseFloat(a[2])||0,parseFloat(a[3])||0);
-        if(nodeSetArr) nodeSetArr.push(id);
+      NBUF[1]=NBUF[2]=NBUF[3]=0;
+      if(scanNums(line,NBUF,4)>=1){
+        const P=tgt();
+        P.nIds.push(NBUF[0]);
+        P.nXYZ.push(NBUF[1],NBUF[2],NBUF[3]);
+        if(nodeSetArr) nodeSetArr.push(NBUF[0]);
       }
       return;
     }
     if(mode==='ELEMENT'){
-      const P=tgt(), a=line.split(',');
-      const id=parseInt(a[0],10);
-      if(!isNaN(id)){
-        P.eIds.push(id); P.eType.push(elType);
-        for(let k=1;k<a.length;k++){
-          const v=parseInt(a[k],10);
-          if(!isNaN(v)) P.eConn.push(v);
-        }
+      const k=scanNums(line,EBUF,32);
+      if(k>=2){
+        const P=tgt();
+        P.eIds.push(EBUF[0]); P.eType.push(elType);
+        for(let m=1;m<k;m++) P.eConn.push(EBUF[m]);
         P.eOff.push(P.eConn.length);
-        if(elSetArr) elSetArr.push(id);
+        if(elSetArr) elSetArr.push(EBUF[0]);
       }
       return;
     }
@@ -800,6 +846,17 @@ const FACE={
   tet4:{S1:[0,1,2],S2:[0,3,1],S3:[1,3,2],S4:[2,3,0]}
 };
 FACE.hex20=FACE.hex8; FACE.tet10=FACE.tet4; FACE.wedge15=FACE.wedge6;
+
+const CLS_CACHE=new Map();
+function classifyC(t){
+  let e=CLS_CACHE.get(t);
+  if(e===undefined){
+    const c=classify(t);
+    e={c,key:t+'|'+(c?(c.sub||c.cat):'?')};
+    CLS_CACHE.set(t,e);
+  }
+  return e;
+}
 
 const DYNA_KEYWORD={
   hex8:'*ELEMENT_SOLID (8절점)', wedge6:'*ELEMENT_SOLID (축약 6면체)',
@@ -1087,44 +1144,46 @@ async function convert(model,opt,log,onTick){
     const massList=[...P.massVals.keys()].map(en=>({v:P.massVals.get(en),ids:new Set(resolveSet(P.elsets,en))}));
     eidx.clear();
     let orientSeq=0, massWarn=0;
+    const CBUF=new Array(32);
     for(let k=0;k<P.eIds.length;k++){
       if(onTick&&k&&!(k&262143)) await onTick('요소 '+(((cv.nSolid+cv.nShell+cv.nBeam)/1e6).toFixed(1))+'M');
       const id=P.eIds[k], type=P.eType[k];
-      const cls=classify(type);
+      const ce=classifyC(type), cls=ce.c;
       const eid=id+eOff;
-      if(!cls){ typeCount.set(type+'|?',(typeCount.get(type+'|?')||0)+1); continue; }
-      const key=type+'|'+(cls.sub||cls.cat);
-      typeCount.set(key,(typeCount.get(key)||0)+1);
+      typeCount.set(ce.key,(typeCount.get(ce.key)||0)+1);
+      if(!cls) continue;
 
-      const o=P.eOff[k], e2=P.eOff[k+1], nc=e2-o;
-      const c=new Array(nc);
+      const o=P.eOff[k], nc=P.eOff[k+1]-o;
+      const c=CBUF;
       for(let m=0;m<nc;m++) c[m]=P.eConn[o+m]+nOff;
 
       if(segEids&&segEids.has(id)&&(cls.cat==='solid'||cls.cat==='shell'))
-        elemInfo.set(eid,{cat:cls.cat,sub:cls.sub,c});
+        elemInfo.set(eid,{cat:cls.cat,sub:cls.sub,c:c.slice(0,nc)});
       const noPid=(cls.cat==='mass'||cls.cat==='inertia');
       const pid=noPid?0:(pidArr[k]||fallbackPid(cls.cat,cls));
       const S=secOfPid.get(pid);
 
       if(cls.cat==='solid'){
-        let g;
-        if(cls.sub==='hex8'||cls.sub==='hex20') g=[c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7]];
-        else if(cls.sub==='wedge6'||cls.sub==='wedge15') g=[c[0],c[1],c[2],c[2],c[3],c[4],c[5],c[5]];
-        else if(cls.sub==='tet4') g=[c[0],c[1],c[2],c[2],c[3],c[3],c[3],c[3]];
-        else if(cls.sub==='tet10'){
+        const sub=cls.sub;
+        if(sub==='hex8'||sub==='hex20')
+          cv.wSolid.add(i8(eid)+i8(pid)+i8(c[0])+i8(c[1])+i8(c[2])+i8(c[3])+i8(c[4])+i8(c[5])+i8(c[6])+i8(c[7]));
+        else if(sub==='wedge6'||sub==='wedge15')
+          cv.wSolid.add(i8(eid)+i8(pid)+i8(c[0])+i8(c[1])+i8(c[2])+i8(c[2])+i8(c[3])+i8(c[4])+i8(c[5])+i8(c[5]));
+        else if(sub==='tet4')
+          cv.wSolid.add(i8(eid)+i8(pid)+i8(c[0])+i8(c[1])+i8(c[2])+i8(c[2])+i8(c[3])+i8(c[3])+i8(c[3])+i8(c[3]));
+        else if(sub==='tet10'){
           if(opt.tet10){
             cv.wTet10.add(i8(eid)+i8(pid));
-            cv.wTet10.add(c.slice(0,10).map(i8).join(''));
-            cv.nSolid++; continue;
-          }
-          g=[c[0],c[1],c[2],c[2],c[3],c[3],c[3],c[3]];
-        }
-        if(!g) continue;
-        cv.wSolid.add(i8(eid)+i8(pid)+g.map(i8).join(''));
+            cv.wTet10.add(i8(c[0])+i8(c[1])+i8(c[2])+i8(c[3])+i8(c[4])+i8(c[5])+i8(c[6])+i8(c[7])+i8(c[8])+i8(c[9]));
+          }else
+            cv.wSolid.add(i8(eid)+i8(pid)+i8(c[0])+i8(c[1])+i8(c[2])+i8(c[2])+i8(c[3])+i8(c[3])+i8(c[3])+i8(c[3]));
+        }else continue;
         cv.nSolid++;
       }else if(cls.cat==='shell'){
-        const g=(cls.sub==='quad4'||cls.sub==='quad8')?[c[0],c[1],c[2],c[3]]:[c[0],c[1],c[2],c[2]];
-        cv.wShell.add(i8(eid)+i8(pid)+g.map(i8).join(''));
+        if(cls.sub==='quad4'||cls.sub==='quad8')
+          cv.wShell.add(i8(eid)+i8(pid)+i8(c[0])+i8(c[1])+i8(c[2])+i8(c[3]));
+        else
+          cv.wShell.add(i8(eid)+i8(pid)+i8(c[0])+i8(c[1])+i8(c[2])+i8(c[2]));
         cv.nShell++;
       }else if(cls.cat==='beam'){
         let n3=0;
@@ -1721,67 +1780,126 @@ function buildK(cv,opt,srcName){
   return [head].concat(body,[O.join('\n')+'\n']);
 }
 
+
 /* ============================================================
-   UI
+   실행 진입점 — 워커 안에서도, 메인 스레드 대체 경로에서도 같은 코드를 쓴다
+   ============================================================ */
+async function runConversion(files,mainKey,opt,emit,yieldNow){
+  const log=newLog();
+  const stats={merged:0,missing:new Set(),used:new Set(),lines:0};
+  const main=files.get(mainKey);
+  if(!main) throw new Error('메인 덱을 찾을 수 없습니다.');
+  const T0=Date.now();
+  let last=0;
+  const tick=async(phase,detail)=>{
+    const now=Date.now();
+    if(now-last<200) return;
+    last=now;
+    if(emit) emit({t:'progress',phase,detail});
+    if(yieldNow) await yieldNow();
+  };
+
+  const model=await parseDeck(main,files,log,stats,st=>tick('read',st.lines));
+  if(stats.merged)
+    log.ok(`*INCLUDE ${stats.merged}개 파일을 병합했습니다 (총 ${stats.lines.toLocaleString()}줄).`);
+  const unused=[...files.keys()].filter(k=>k!==mainKey&&!stats.used.has(k));
+  if(unused.length) log.info('병합에 쓰이지 않은 파일: '+unused.map(k=>files.get(k).name).join(', '));
+  log.info(`파트 ${Math.max(0,model.parts.size-1)}개, 인스턴스 ${model.instances.length}개, 재료 ${model.materials.size}개를 읽었습니다.`);
+
+  if(emit) emit({t:'progress',phase:'convert',detail:''});
+  const cv=await convert(model,opt,log,what=>tick('convert',what));
+
+  if(emit) emit({t:'progress',phase:'build',detail:''});
+  if(yieldNow) await yieldNow();
+  const parts=buildK(cv,opt,main.name);
+  let bytes=0;
+  for(let i=0;i<parts.length;i++) bytes+=parts[i].length;
+  let preview='';
+  for(let i=0;i<parts.length&&preview.length<60000;i++) preview+=parts[i];
+  log.ok(`변환 완료 · ${(bytes/1048576).toFixed(1)} MB`);
+
+  const blob=new Blob(parts,{type:'text/plain'});
+  return {t:'done', counts:cv.counts, typeCount:[...cv.typeCount],
+          imap:cv.imap, log:log.items, preview, bytes, blob, ms:Date.now()-T0};
+}
+
+/* 워커로 실행될 때 */
+if(typeof importScripts==='function'&&typeof self!=='undefined'){
+  self.onmessage=async ev=>{
+    const d=ev.data||{};
+    try{
+      const M=new Map();
+      for(const f of d.files) M.set(f.key,f);
+      const r=await runConversion(M,d.mainKey,d.opt,m=>self.postMessage(m),null);
+      self.postMessage(r);
+    }catch(e){
+      self.postMessage({t:'error',message:String((e&&e.message)||e)});
+    }
+  };
+}
+
+</script>
+<script>
+"use strict";
+/* ============================================================
+   UI — 무거운 작업은 전부 워커에서 돌린다
    ============================================================ */
 const $=id=>document.getElementById(id);
-const FILES=new Map();          // KEY -> {key,name,text}
-let mainKey=null, userPicked=false, outParts=null, outBytes=0;
+const FILES=new Map();
+let mainKey=null, userPicked=false, result=null;
 
+/* 파일 목록 표시에 필요한 최소 유틸 (엔진과 동일 로직) */
+const baseKey=p=>String(p||'').replace(/["']/g,'').trim().split(/[\\/]/).pop().toUpperCase();
+const RE_INCLUDE=/^\*\s*INCLUDE\b/i;
+const peekText=f=>(f.text!=null?f.text:(f.head||''));
+function includeRefs(f){
+  const out=[];
+  for(const line of peekText(f).split(/\r?\n/)){
+    const t=line.trim();
+    if(t.startsWith('**')||!RE_INCLUDE.test(t)) continue;
+    const m=/(?:INPUT|FILE)\s*=\s*([^,]+)/i.exec(t);
+    if(!m) continue;
+    const raw=m[1].trim().replace(/^["']|["']$/g,'');
+    const k=baseKey(raw);
+    if(k) out.push({key:k,raw});
+  }
+  return out;
+}
+
+/* ---------- 파일 읽기 ---------- */
+function readSliceBufUI(blob){
+  if(blob.arrayBuffer) return blob.arrayBuffer();
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onload=()=>res(r.result); r.onerror=()=>rej(new Error('read fail'));
+    r.readAsArrayBuffer(blob);
+  });
+}
 function readText(f){
   return new Promise(res=>{
     const r=new FileReader();
-    r.onload=()=>res(r.result);
-    r.onerror=()=>res(null);
+    r.onload=()=>res(r.result); r.onerror=()=>res(null);
     try{ r.readAsText(f); }catch(e){ res(null); }
   });
 }
-
+async function readHead(f,n){
+  try{
+    const buf=await readSliceBufUI(f.slice(0,Math.min(n,f.size)));
+    return new TextDecoder('utf-8').decode(new Uint8Array(buf));
+  }catch(e){ return null; }
+}
 function dropMsg(m){
   const el=$('dropmsg');
   if(!m){ el.classList.add('hidden'); el.textContent=''; return; }
   el.textContent=m; el.classList.remove('hidden');
 }
-
 function addText(name,text){
   if(!name||!text) return false;
   FILES.set(name.toUpperCase(),{key:name.toUpperCase(),name,text,head:null,file:null,size:text.length});
   return true;
 }
-/* 큰 파일은 통째로 읽지 않고 앞부분만 미리 본 뒤 변환 때 조각으로 읽는다 */
+
 const INLINE_MAX=32*1024*1024;
-async function readHead(f,n){
-  try{
-    const buf=await readSliceBuf(f.slice(0,Math.min(n,f.size)));
-    return new TextDecoder('utf-8').decode(new Uint8Array(buf));
-  }catch(e){ return null; }
-}
-
-function walkEntry(entry,out){
-  return new Promise(res=>{
-    if(entry.isFile){ entry.file(f=>{out.push(f);res();},()=>res()); return; }
-    if(entry.isDirectory){
-      const rd=entry.createReader(), all=[];
-      const step=()=>rd.readEntries(async es=>{
-        if(!es.length){ for(const e of all) await walkEntry(e,out); res(); return; }
-        all.push(...es); step();
-      },()=>res());
-      step(); return;
-    }
-    res();
-  });
-}
-
-async function collect(dt){
-  const out=[];
-  if(dt.items&&dt.items.length&&dt.items[0].webkitGetAsEntry){
-    const entries=[];
-    for(const it of dt.items){ const e=it.webkitGetAsEntry(); if(e) entries.push(e); }
-    if(entries.length){ for(const e of entries) await walkEntry(e,out); return out; }
-  }
-  return [...dt.files];
-}
-
 async function addFiles(list){
   const arr=[...(list||[])];
   if(!arr.length){ dropMsg('선택된 파일이 없습니다. 아래 붙여넣기 방식도 쓸 수 있습니다.'); return; }
@@ -1793,8 +1911,7 @@ async function addFiles(list){
       if(head===null){ failed.push(f.name+' (읽기 거부)'); continue; }
       FILES.set(f.name.toUpperCase(),
         {key:f.name.toUpperCase(),name:f.name,text:null,head,file:f,size:f.size});
-      added++;
-      continue;
+      added++; continue;
     }
     const text=await readText(f);
     if(text===null){ failed.push(f.name+' (읽기 거부)'); continue; }
@@ -1811,6 +1928,32 @@ async function addFiles(list){
   renderFiles();
 }
 
+function walkEntry(entry,out){
+  return new Promise(res=>{
+    if(entry.isFile){ entry.file(f=>{out.push(f);res();},()=>res()); return; }
+    if(entry.isDirectory){
+      const rd=entry.createReader(), all=[];
+      const step=()=>rd.readEntries(async es=>{
+        if(!es.length){ for(const e of all) await walkEntry(e,out); res(); return; }
+        for(const e of es) all.push(e);
+        step();
+      },()=>res());
+      step(); return;
+    }
+    res();
+  });
+}
+async function collect(dt){
+  const out=[];
+  if(dt.items&&dt.items.length&&dt.items[0].webkitGetAsEntry){
+    const entries=[];
+    for(const it of dt.items){ const e=it.webkitGetAsEntry(); if(e) entries.push(e); }
+    if(entries.length){ for(const e of entries) await walkEntry(e,out); return out; }
+  }
+  return [...dt.files];
+}
+
+/* ---------- 메인 덱 판단 ---------- */
 function scoreMain(f){
   const t=peekText(f);
   let s=0;
@@ -1819,7 +1962,7 @@ function scoreMain(f){
   if(/^\*(step|material)\b/im.test(t)) s+=25;
   if(/^\*include\b/im.test(t)) s+=30;
   if(/\.inp$/i.test(f.name)) s+=50;
-  if(f.text===null) s-=20;      // 거대한 메쉬 파일은 보통 include 대상
+  if(f.text===null) s-=20;
   return s;
 }
 function detectMain(){
@@ -1830,6 +1973,9 @@ function detectMain(){
   cands.sort((a,b)=>scoreMain(b)-scoreMain(a)||b.size-a.size);
   return cands.length?cands[0].key:null;
 }
+
+function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+const fmtSize=n=>n>1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(0)+' KB';
 
 function renderFiles(){
   const box=$('filelist');
@@ -1849,8 +1995,8 @@ function renderFiles(){
       :(refd.has(f.key)?'<span class="role">include</span>':'<span class="role un">미참조</span>');
     html+=`<label class="fr"><input type="radio" name="mainpick" value="${escapeHtml(f.key)}" ${isMain?'checked':''}>`
         + `<span class="nm">${escapeHtml(f.name)}</span>`
-        + `<span class="sz">${f.size>1048576?(f.size/1048576).toFixed(1)+' MB':(f.size/1024).toFixed(0)+' KB'}</span>`
-        + (f.text===null?'<span class="role">스트리밍</span>':'')+`${role}</label>`;
+        + `<span class="sz">${fmtSize(f.size)}</span>`
+        + (f.text===null?'<span class="role">스트리밍</span>':'')+role+`</label>`;
   }
   for(const m of missing)
     html+=`<div class="fr"><span style="width:13px"></span><span class="nm">${escapeHtml(m)}</span><span class="role miss">없음</span></div>`;
@@ -1865,11 +2011,8 @@ function renderFiles(){
   $('resSec').classList.add('hidden');
 }
 
-$('file').addEventListener('change',e=>{
-  const fl=[...e.target.files];
-  addFiles(fl);
-  e.target.value='';
-});
+/* ---------- 입력 이벤트 ---------- */
+$('file').addEventListener('change',e=>{ addFiles([...e.target.files]); e.target.value=''; });
 ['dragenter','dragover'].forEach(ev=>$('drop').addEventListener(ev,e=>{e.preventDefault();$('drop').classList.add('hot');}));
 ['dragleave','drop'].forEach(ev=>$('drop').addEventListener(ev,e=>{e.preventDefault();$('drop').classList.remove('hot');}));
 $('drop').addEventListener('drop',async e=>{
@@ -1889,37 +2032,64 @@ $('padd').addEventListener('click',()=>{
   const txt=$('ptext').value;
   if(!txt.trim()){ dropMsg('붙여넣은 내용이 비어 있습니다.'); return; }
   let nm=$('pname').value.trim();
-  if(!nm) nm=/^\s*\*/m.test(txt)&&/\*heading|\*step|\*assembly/i.test(txt)?'pasted_main.inp':('pasted_'+(FILES.size+1)+'.blk');
+  if(!nm) nm=/\*heading|\*step|\*assembly/i.test(txt)?'pasted_main.inp':('pasted_'+(FILES.size+1)+'.blk');
   addText(nm,txt);
   $('ptext').value=''; $('pname').value='';
   if(!userPicked||!FILES.has(mainKey)) mainKey=detectMain();
-  dropMsg(null);
-  renderFiles();
+  dropMsg(null); renderFiles();
 });
 $('clear').addEventListener('click',()=>{
-  FILES.clear(); mainKey=null; userPicked=false; outParts=null; outBytes=0;
+  FILES.clear(); mainKey=null; userPicked=false; result=null;
   renderFiles(); dropMsg(null);
-  $('dl').disabled=true;
-  $('copy').disabled=true;
+  $('dl').disabled=true; $('copy').disabled=true;
   $('resSec').classList.add('hidden');
 });
+
+/* ---------- 실행 ---------- */
+let workerURL=null, engineInline=false;
+function engineSource(){ return $('engine').textContent; }
+
+function runInWorker(payload,onMsg){
+  return new Promise((resolve,reject)=>{
+    let w;
+    try{
+      if(!workerURL)
+        workerURL=URL.createObjectURL(new Blob([engineSource()],{type:'text/javascript'}));
+      w=new Worker(workerURL);
+    }catch(e){ reject({workerFailed:true}); return; }
+    let started=false;
+    w.onerror=()=>{
+      try{ w.terminate(); }catch(e){}
+      if(!started) reject({workerFailed:true});
+      else reject(new Error('워커에서 오류가 발생했습니다.'));
+    };
+    w.onmessage=ev=>{
+      const d=ev.data;
+      started=true;
+      if(d.t==='progress'){ onMsg(d); return; }
+      try{ w.terminate(); }catch(e){}
+      if(d.t==='error') reject(new Error(d.message));
+      else resolve(d);
+    };
+    w.postMessage(payload);
+  });
+}
+async function runInline(payload,onMsg){
+  if(!engineInline){
+    // strict 모드 eval은 선언을 전역에 남기지 않으므로 명시적으로 내보낸다
+    (0,eval)(engineSource()+'\n;globalThis.runConversion=runConversion;');
+    engineInline=true;
+  }
+  const M=new Map();
+  for(const f of payload.files) M.set(f.key,f);
+  return await window.runConversion(M,payload.mainKey,payload.opt,onMsg,
+    ()=>new Promise(r=>setTimeout(r,0)));
+}
 
 async function doConvert(){
   const main=FILES.get(mainKey);
   if(!main) return;
-  const t0=performance.now();
-  const log=newLog();
   const btn=$('run');
-  let lastTick=0;
-  const onProgress=async st=>{
-    const now=performance.now();
-    if(now-lastTick<250) return;
-    lastTick=now;
-    btn.textContent='읽는 중… '+(st.lines/1e6).toFixed(1)+'M줄';
-    await new Promise(r=>setTimeout(r,0));   // 화면 갱신 기회
-  };
-  const fileName=main.name;
-  const stats={merged:0,missing:new Set(),used:new Set(),lines:0};
   const opt={
     sets:$('optSets').checked, mat:$('optMat').checked, bc:$('optBC').checked,
     ctrl:$('optCtrl').checked, tet10:$('optTet10').checked,
@@ -1927,57 +2097,47 @@ async function doConvert(){
     mu:parseFloat($('inpMu').value)||0,
     shell:$('selShell').value, unit:$('selUnit').value
   };
-  let cv;
+  const payload={
+    mainKey,
+    opt,
+    files:[...FILES.values()].map(f=>({key:f.key,name:f.name,text:f.text,file:f.file,size:f.size}))
+  };
+  const onMsg=d=>{
+    if(d.phase==='read') btn.textContent='읽는 중… '+((d.detail||0)/1e6).toFixed(1)+'M줄';
+    else if(d.phase==='convert') btn.textContent='변환 중… '+(d.detail||'');
+    else if(d.phase==='build') btn.textContent='파일 만드는 중…';
+  };
+
+  let r=null, viaWorker=true;
   try{
-    const model=await parseDeck(main,FILES,log,stats,onProgress);
-    btn.textContent='변환 중…';
-    await new Promise(r=>setTimeout(r,0));
-    if(stats.merged)
-      log.ok(`*INCLUDE ${stats.merged}개 파일을 병합했습니다 (총 ${stats.lines.toLocaleString()}줄).`);
-    const unused=[...FILES.keys()].filter(k=>k!==mainKey&&!stats.used.has(k));
-    if(unused.length) log.info('병합에 쓰이지 않은 파일: '+unused.map(k=>FILES.get(k).name).join(', '));
-    log.info(`파트 ${Math.max(0,model.parts.size-1)}개, 인스턴스 ${model.instances.length}개, 재료 ${model.materials.size}개를 읽었습니다.`);
-    cv=await convert(model,opt,log,async what=>{
-      const now=performance.now();
-      if(now-lastTick<250) return;
-      lastTick=now;
-      btn.textContent='변환 중… '+what;
-      await new Promise(r=>setTimeout(r,0));
-    });
-    btn.textContent='파일 만드는 중…';
-    await new Promise(r=>setTimeout(r,0));
-    outParts=buildK(cv,opt,fileName);
-    let bytes=0; for(const c of outParts) bytes+=c.length;
-    outBytes=bytes;
-    log.ok(`변환 완료 · ${(bytes/1048576).toFixed(1)} MB`);
-  }catch(err){
-    log.err('변환 중 오류: '+err.message);
-    if(/allocation|memory|Invalid string length/i.test(err.message||''))
-      log.err('메모리가 부족합니다. 브라우저 탭을 새로 열거나 데스크톱 브라우저에서 시도해 보세요.');
-    console.error(err);
-    cv=cv||{counts:{},typeCount:new Map()};
-    outParts=null;
+    r=await runInWorker(payload,onMsg);
+  }catch(e){
+    if(e&&e.workerFailed){
+      viaWorker=false;
+      btn.textContent='변환 중… (단일 스레드)';
+      r=await runInline(payload,onMsg);
+    }else throw e;
   }
-  render(cv,log,performance.now()-t0);
+  result=r;
+  render(r,viaWorker);
 }
 
 $('run').addEventListener('click',()=>{
   const btn=$('run');
-  btn.disabled=true; btn.textContent='변환 중…';
-  // 큰 모델은 수십 초 걸리므로 화면이 먼저 갱신되도록 한 틱 넘긴다
-  setTimeout(()=>{
-    doConvert().catch(err=>{
-      console.error(err);
-      alert('변환 중 오류가 발생했습니다: '+(err&&err.message||err));
-    }).then(()=>{ btn.textContent='변환 실행'; btn.disabled=false; });
-  },40);
+  btn.disabled=true; btn.textContent='시작하는 중…';
+  doConvert().catch(err=>{
+    console.error(err);
+    const msg=String((err&&err.message)||err);
+    dropMsg('변환 실패: '+msg+(/memory|allocation/i.test(msg)?' — 메모리가 부족합니다. 다른 탭을 닫고 다시 시도해 보세요.':''));
+  }).then(()=>{ btn.textContent='변환 실행'; btn.disabled=false; });
 });
 
-function render(cv,log,ms){
+/* ---------- 결과 표시 ---------- */
+function render(r,viaWorker){
   $('resSec').classList.remove('hidden');
-  $('elapsed').textContent=ms.toFixed(0)+' ms';
+  $('elapsed').textContent=(r.ms/1000).toFixed(1)+' s'+(viaWorker?' · 백그라운드 처리':' · 단일 스레드');
 
-  const C=cv.counts||{};
+  const C=r.counts||{};
   const cards=[['절점',C.node],['솔리드',C.solid],['쉘',C.shell],['보',C.beam],
                ['PART',C.part],['재료',C.mat],['세그먼트세트',C.segset],
                ['접촉',C.contact],['구속',C.constr]];
@@ -1985,15 +2145,14 @@ function render(cv,log,ms){
     `<div class="stat"><div class="v">${(v||0).toLocaleString()}</div><div class="k">${k}</div></div>`).join('');
 
   const rows=[];
-  const tc=cv.typeCount||new Map();
-  [...tc.entries()].sort((a,b)=>b[1]-a[1]).forEach(([k,n])=>{
-    const [src,sub]=k.split('|');
-    const dst = sub==='?' ? '<span style="color:var(--red)">변환 안 됨</span>' : (DYNA_KEYWORD[sub]||sub);
-    rows.push(`<tr><td class="src">${src}</td><td class="gut">&rarr;</td><td class="dst">${dst}</td><td class="cnt">${n.toLocaleString()}</td></tr>`);
+  (r.typeCount||[]).sort((a,b)=>b[1]-a[1]).forEach(([k,n])=>{
+    const p=k.split('|'), src=p[0], sub=p[1];
+    const dst= sub==='?' ? '<span style="color:var(--red)">변환 안 됨</span>' : (DYNA_KEYWORD_UI[sub]||sub);
+    rows.push(`<tr><td class="src">${escapeHtml(src)}</td><td class="gut">&rarr;</td><td class="dst">${dst}</td><td class="cnt">${n.toLocaleString()}</td></tr>`);
   });
   $('mapBody').innerHTML=rows.length?rows.join(''):'<tr><td colspan="4">인식된 요소가 없습니다.</td></tr>';
 
-  const im=(cv.imap||[]);
+  const im=r.imap||[];
   if(im.length){
     const seen=new Map();
     for(const [s,d] of im){ const k=s+'||'+d; seen.set(k,(seen.get(k)||0)+1); }
@@ -2007,57 +2166,52 @@ function render(cv,log,ms){
   }
 
   const tags={info:'note',ok:'ok',warn:'warn',err:'error'};
-  $('log').innerHTML=log.items.map(it=>
+  $('log').innerHTML=(r.log||[]).map(it=>
     `<div class="${it.lv}"><span class="tag">${tags[it.lv]}</span><span>${escapeHtml(it.m)}</span></div>`).join('');
-  const nw=log.items.filter(i=>i.lv==='warn').length, ne=log.items.filter(i=>i.lv==='err').length;
+  const nw=(r.log||[]).filter(i=>i.lv==='warn').length, ne=(r.log||[]).filter(i=>i.lv==='err').length;
   $('logCount').textContent=`경고 ${nw} · 오류 ${ne}`;
 
-  if(outParts){
-    let head='';
-    for(let i=0;i<outParts.length&&head.length<60000;i++) head+=outParts[i];
-    const lines=head.split('\n');
-    $('prev').textContent=lines.slice(0,400).join('\n')+'\n\n... 이하 생략 (전체 '+(outBytes/1048576).toFixed(1)+' MB)';
-    $('dl').disabled=false;
-    $('copy').disabled=outBytes>20*1048576;
-  }else{
-    $('prev').textContent='(출력 없음)';
-    $('dl').disabled=true;
-    $('copy').disabled=true;
-  }
+  const lines=(r.preview||'').split('\n');
+  $('prev').textContent=lines.slice(0,400).join('\n')+
+    '\n\n... 이하 생략 (전체 '+(r.bytes/1048576).toFixed(1)+' MB)';
+  $('dl').disabled=!r.blob;
+  $('copy').disabled=!r.blob||r.bytes>20*1048576;
   $('resSec').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
-function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
-
-$('copy').addEventListener('click',async()=>{
-  if(!outParts) return;
-  if(outBytes>20*1048576){ $('copymsg').textContent='너무 커서 복사할 수 없습니다. 파일로 저장하세요.'; return; }
-  const outText=outParts.join('');
-  const done=()=>{ $('copymsg').textContent='복사했습니다'; setTimeout(()=>$('copymsg').textContent='',2500); };
-  try{
-    await navigator.clipboard.writeText(outText);
-    done();
-  }catch(e){
-    const ta=document.createElement('textarea');
-    ta.value=outText;
-    ta.style.cssText='position:fixed;top:0;left:0;opacity:0';
-    document.body.appendChild(ta); ta.select();
-    try{ document.execCommand('copy'); done(); }
-    catch(e2){ $('copymsg').textContent='복사가 막혔습니다. 미리보기에서 직접 선택하세요.'; }
-    ta.remove();
-  }
-});
+const DYNA_KEYWORD_UI={
+  hex8:'*ELEMENT_SOLID (8절점)', wedge6:'*ELEMENT_SOLID (축약 6면체)',
+  tet4:'*ELEMENT_SOLID (축약 4면체)', tet10:'*ELEMENT_SOLID_TET4TOTET10',
+  hex20:'*ELEMENT_SOLID (코너 8절점만)', wedge15:'*ELEMENT_SOLID (코너 6절점만)',
+  quad4:'*ELEMENT_SHELL', tri3:'*ELEMENT_SHELL (축약 삼각형)',
+  quad8:'*ELEMENT_SHELL (코너 4절점만)', tri6:'*ELEMENT_SHELL (코너 3절점만)',
+  beam2:'*ELEMENT_BEAM', beam3:'*ELEMENT_BEAM (2절점 축약)',
+  truss2:'*ELEMENT_BEAM (ELFORM 3)', truss3:'*ELEMENT_BEAM (ELFORM 3)',
+  mass:'*ELEMENT_MASS', discrete:'*ELEMENT_DISCRETE'
+};
 
 $('dl').addEventListener('click',()=>{
-  if(!outParts) return;
+  if(!result||!result.blob) return;
   const src=FILES.get(mainKey);
   const base=((src&&src.name)||'model').replace(/\.[^.]+$/,'');
-  const blob=new Blob(outParts,{type:'text/plain'});
   const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob);
+  a.href=URL.createObjectURL(result.blob);
   a.download=base+'.k';
   document.body.appendChild(a); a.click();
-  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},500);
+  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1000);
+});
+
+$('copy').addEventListener('click',async()=>{
+  if(!result||!result.blob) return;
+  const msg=$('copymsg');
+  try{
+    const text=await result.blob.text();
+    await navigator.clipboard.writeText(text);
+    msg.textContent='복사했습니다';
+  }catch(e){
+    msg.textContent='복사가 막혔습니다. 파일로 저장하세요.';
+  }
+  setTimeout(()=>{msg.textContent='';},2500);
 });
 
 /* 예제 모델 — 메인 덱 + include 블록 */
@@ -2170,6 +2324,18 @@ const SAMPLE_MAT=`*Material, name=CELL_JELLYROLL
 $('sample').addEventListener('click',()=>{
   FILES.clear();
   const put=(n,t)=>FILES.set(n.toUpperCase(),{key:n.toUpperCase(),name:n,text:t,size:t.length});
+  put('battery_module_demo.inp',SAMPLE_MAIN);
+  put('cell_mesh.blk',SAMPLE_MESH);
+  put('materials.inc',SAMPLE_MAT);
+  userPicked=false;
+  mainKey=detectMain();
+  dropMsg(null);
+  renderFiles();
+});
+
+$('sample').addEventListener('click',()=>{
+  FILES.clear();
+  const put=(n,t)=>FILES.set(n.toUpperCase(),{key:n.toUpperCase(),name:n,text:t,head:null,file:null,size:t.length});
   put('battery_module_demo.inp',SAMPLE_MAIN);
   put('cell_mesh.blk',SAMPLE_MESH);
   put('materials.inc',SAMPLE_MAT);
