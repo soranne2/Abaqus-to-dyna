@@ -1,0 +1,1902 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>INP → K 변환기</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ground:#e4e8ea;
+  --sheet:#f7f8f8;
+  --ink:#16212b;
+  --ink-2:#4d5c68;
+  --rule:#b6c0c7;
+  --rule-soft:#d5dcdf;
+  --blue:#1b4f8f;
+  --amber:#a4560c;
+  --green:#1c6b4c;
+  --red:#93301f;
+  --mono:'IBM Plex Mono', ui-monospace, Menlo, Consolas, monospace;
+  --sans:'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--ground);
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:15px;
+  line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:960px;margin:0 auto;padding:32px 20px 96px}
+
+/* ---- header ---- */
+header{border-bottom:2px solid var(--ink);padding-bottom:18px;margin-bottom:28px}
+h1{
+  font-family:var(--mono);font-weight:600;font-size:clamp(26px,5.2vw,40px);
+  letter-spacing:-.03em;margin:0 0 6px;line-height:1.1;
+}
+h1 .arrow{color:var(--blue)}
+header p{margin:0;max-width:62ch;color:var(--ink-2);font-size:14.5px}
+
+/* ---- section heading in dyna comment style ---- */
+.sec{margin-top:38px}
+.sec > .head{
+  font-family:var(--mono);font-size:13px;color:var(--ink-2);
+  border-bottom:1px solid var(--rule);padding-bottom:5px;margin-bottom:16px;
+  display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+}
+.sec > .head b{font-weight:600;color:var(--ink)}
+.sec > .head span{font-size:12px}
+
+/* ---- drop zone ---- */
+.drop{
+  background:var(--sheet);
+  border:1.5px dashed var(--rule);
+  padding:34px 24px;text-align:center;cursor:pointer;
+  transition:border-color .15s, background .15s;
+}
+.drop:hover,.drop.hot{border-color:var(--blue);background:#fff}
+.drop.hot{border-style:solid}
+.drop .big{font-family:var(--mono);font-size:17px;font-weight:500}
+.drop .sub{color:var(--ink-2);font-size:13.5px;margin-top:6px}
+.drop .sub code{font-family:var(--mono);font-size:12.5px;background:#eef1f2;padding:1px 4px}
+.filelist{margin-top:12px;border:1px solid var(--rule-soft);background:#fff}
+.filelist .fhead{
+  font-family:var(--mono);font-size:11.5px;color:var(--ink-2);
+  padding:7px 13px;border-bottom:1px solid var(--rule);background:#fafbfb;
+}
+.filelist .fr{
+  display:flex;gap:10px;align-items:center;padding:9px 13px;
+  border-bottom:1px solid #eef1f2;font-family:var(--mono);font-size:13px;cursor:pointer;
+}
+.filelist .fr:last-child{border-bottom:none}
+.filelist .fr:hover{background:#fafbfb}
+.filelist .fr input{accent-color:var(--blue);flex:none;margin:0}
+.filelist .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.filelist .sz{color:var(--ink-2);font-size:12px;flex:none}
+.filelist .role{flex:none;font-size:11px;padding:1px 7px;border:1px solid var(--rule);color:var(--ink-2)}
+.filelist .role.main{background:var(--blue);color:#fff;border-color:var(--blue)}
+.filelist .role.un{color:var(--amber);border-color:var(--amber)}
+.filelist .role.miss{color:#fff;background:var(--red);border-color:var(--red)}
+
+/* ---- options ---- */
+.opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px 26px}
+label.opt{display:flex;gap:9px;align-items:flex-start;font-size:14px;cursor:pointer}
+label.opt input{margin:3px 0 0;accent-color:var(--blue);flex:none}
+label.opt .t{display:block}
+label.opt .d{display:block;color:var(--ink-2);font-size:12.5px;line-height:1.4}
+.selrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:14px;margin-top:14px}
+select{
+  font-family:var(--mono);font-size:13px;padding:5px 8px;
+  border:1px solid var(--rule);background:#fff;color:var(--ink);
+}
+
+/* ---- buttons ---- */
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px;align-items:center}
+button{
+  font-family:var(--mono);font-size:14px;font-weight:500;
+  padding:11px 20px;border:1.5px solid var(--ink);background:var(--ink);color:#fff;
+  cursor:pointer;transition:background .12s,color .12s;
+}
+button:hover:not(:disabled){background:var(--blue);border-color:var(--blue)}
+button.ghost{background:transparent;color:var(--ink)}
+button.ghost:hover:not(:disabled){background:var(--ink);color:#fff}
+button:disabled{opacity:.35;cursor:not-allowed}
+button:focus-visible,.drop:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+
+/* ---- mapping ledger ---- */
+.ledger{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px}
+.ledger td,.ledger th{padding:7px 10px;border-bottom:1px solid var(--rule-soft);text-align:left;vertical-align:top}
+.ledger th{font-weight:600;font-size:12px;color:var(--ink-2);border-bottom:1px solid var(--rule)}
+.ledger td.src{width:34%;color:var(--ink)}
+.ledger td.gut{width:26px;color:var(--blue);text-align:center}
+.ledger td.dst{color:var(--blue);font-weight:500}
+.ledger td.cnt{width:78px;text-align:right;color:var(--ink-2)}
+.ledger tr:last-child td{border-bottom:none}
+
+/* ---- stats ---- */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;background:var(--rule-soft);border:1px solid var(--rule-soft)}
+.stat{background:#fff;padding:12px 14px}
+.stat .v{font-family:var(--mono);font-size:22px;font-weight:600;letter-spacing:-.02em}
+.stat .k{font-size:12px;color:var(--ink-2)}
+
+/* ---- log ---- */
+.log{font-family:var(--mono);font-size:12.5px;background:#fff;border:1px solid var(--rule-soft);max-height:300px;overflow:auto}
+.log div{padding:5px 12px;border-bottom:1px solid #eef1f2;display:flex;gap:10px}
+.log div:last-child{border-bottom:none}
+.log .tag{flex:none;width:52px;font-weight:600}
+.log .info .tag{color:var(--ink-2)}
+.log .ok .tag{color:var(--green)}
+.log .warn .tag{color:var(--amber)}
+.log .err .tag{color:var(--red)}
+.log .warn{background:#fdf7f0}
+.log .err{background:#fdf1ef}
+
+/* ---- preview ---- */
+pre.prev{
+  font-family:var(--mono);font-size:12px;line-height:1.5;background:#fff;
+  border:1px solid var(--rule-soft);padding:14px;overflow:auto;max-height:420px;margin:0;
+  white-space:pre;
+}
+.notes{font-size:13.5px;color:var(--ink-2);max-width:74ch}
+.notes ul{padding-left:18px;margin:8px 0}
+.notes li{margin-bottom:5px}
+.notes code{font-family:var(--mono);font-size:12.5px;background:#fff;padding:1px 4px;border:1px solid var(--rule-soft)}
+.hidden{display:none}
+@media (max-width:560px){
+  .ledger td.src{width:42%}
+  .ledger td.cnt{display:none}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Abaqus .inp <span class="arrow">&rarr;</span> LS-DYNA .k</h1>
+  <p>브라우저 안에서만 동작하는 키워드 변환기입니다. 파일이 서버로 올라가지 않으니 사내 해석 모델도 그대로 넣어보실 수 있습니다.</p>
+</header>
+
+<section class="sec">
+  <div class="head"><b>$# 1. 입력 파일</b><span>.inp · .blk · .inc</span></div>
+  <div class="drop" id="drop" tabindex="0" role="button" aria-label="파일 선택">
+    <div class="big">파일을 여기에 놓거나 눌러서 선택</div>
+    <div class="sub">메인 덱과 <code>*INCLUDE</code>가 부르는 .blk / .inc 파일을 함께 올리면 자동으로 이어 붙입니다. 폴더째 끌어다 놓아도 됩니다.</div>
+    <input type="file" id="file" accept=".inp,.blk,.inc,.dat,.txt,.key,.INP,.BLK,.INC" multiple class="hidden">
+  </div>
+  <div id="filelist" class="filelist hidden"></div>
+  <div class="btnrow">
+    <button class="ghost" id="sample" style="padding:7px 14px;font-size:13px">예제 모델 불러오기</button>
+    <button class="ghost" id="clear" style="padding:7px 14px;font-size:13px">모두 지우기</button>
+  </div>
+</section>
+
+<section class="sec">
+  <div class="head"><b>$# 2. 변환 옵션</b></div>
+  <div class="opts">
+    <label class="opt"><input type="checkbox" id="optSets" checked><span class="t">절점·요소 세트 출력<span class="d">*SET_NODE_LIST, *SET_SOLID, *SET_SHELL</span></span></label>
+    <label class="opt"><input type="checkbox" id="optMat" checked><span class="t">재료·단면 변환<span class="d">*MAT_ELASTIC, *MAT_024, *SECTION_*</span></span></label>
+    <label class="opt"><input type="checkbox" id="optBC" checked><span class="t">경계조건 변환<span class="d">*BOUNDARY → *BOUNDARY_SPC_SET</span></span></label>
+    <label class="opt"><input type="checkbox" id="optContact" checked><span class="t">접촉·구속 변환<span class="d">*SURFACE, *CONTACT PAIR, *TIE, *MPC, *COUPLING, *EQUATION</span></span></label>
+    <label class="opt"><input type="checkbox" id="optCtrl" checked><span class="t">기본 CONTROL 카드 추가<span class="d">해석 시간 등은 템플릿 값이니 수정 필요</span></span></label>
+    <label class="opt"><input type="checkbox" id="optTet10"><span class="t">2차 사면체 유지<span class="d">C3D10 → TET4TOTET10 (해제 시 1차로 축약)</span></span></label>
+    <label class="opt"><input type="checkbox" id="optBeamNode" checked><span class="t">보 요소 방향절점 생성<span class="d">단면 n1 벡터로 3번째 절점을 자동 생성</span></span></label>
+  </div>
+  <div class="selrow">
+    <span>쉘 요소 formulation</span>
+    <select id="selShell">
+      <option value="auto">자동 (S4R→2, S4→16)</option>
+      <option value="2">2 · Belytschko-Tsay</option>
+      <option value="16">16 · 완전적분</option>
+    </select>
+    <span style="margin-left:12px">단위계</span>
+    <select id="selUnit">
+      <option value="mmts">mm · ton · s · N</option>
+      <option value="mkgs">m · kg · s · N</option>
+      <option value="mmkgms">mm · kg · ms · kN</option>
+    </select>
+    <span style="margin-left:12px">기본 마찰계수</span>
+    <input type="number" id="inpMu" value="0.2" min="0" max="2" step="0.05"
+           style="font-family:var(--mono);font-size:13px;width:74px;padding:5px 8px;border:1px solid var(--rule);background:#fff;color:var(--ink)">
+  </div>
+  <div class="btnrow">
+    <button id="run" disabled>변환 실행</button>
+    <button class="ghost" id="dl" disabled>.k 파일 저장</button>
+  </div>
+</section>
+
+<section class="sec hidden" id="resSec">
+  <div class="head"><b>$# 3. 변환 결과</b><span id="elapsed"></span></div>
+  <div class="stats" id="stats"></div>
+
+  <div class="head" style="margin-top:26px"><b>$# 요소 타입 매핑</b><span>Abaqus → LS-DYNA</span></div>
+  <table class="ledger"><tbody id="mapBody"></tbody></table>
+
+  <div class="head hidden" id="imapHead" style="margin-top:26px"><b>$# 접촉 · 구속 매핑</b><span>Abaqus → LS-DYNA</span></div>
+  <table class="ledger"><tbody id="imapBody"></tbody></table>
+
+  <div class="head" style="margin-top:26px"><b>$# 변환 로그</b><span id="logCount"></span></div>
+  <div class="log" id="log"></div>
+
+  <div class="head" style="margin-top:26px"><b>$# 미리보기</b><span>앞부분 400줄</span></div>
+  <pre class="prev" id="prev"></pre>
+</section>
+
+<section class="sec">
+  <div class="head"><b>$# 알아두실 점</b></div>
+  <div class="notes">
+    <ul>
+      <li>Abaqus는 단위를 파일에 담지 않습니다. 변환 후 <code>*MAT</code>의 밀도·탄성계수가 선택한 단위계와 맞는지 반드시 확인하세요.</li>
+      <li>어셈블리 인스턴스는 평탄화(flatten)됩니다. 병진·회전 변환을 좌표에 직접 적용하고, ID가 겹치면 자동으로 offset을 줍니다.</li>
+      <li>면 기반 표면은 Abaqus 면 번호(S1~S6)를 읽어 <code>*SET_SEGMENT</code>로 펼칩니다. 법선 방향은 LS-PrePost에서 한 번 확인해 보세요.</li>
+      <li>접촉 카드의 마찰 외 파라미터(SOFT, 관통 검사, 접촉 두께 등)는 기본값입니다. 해석 성격에 맞게 조정해야 합니다.</li>
+      <li><code>*MPC PIN</code>이나 kinematic coupling은 절점 강체로 바뀌면서 회전 자유도까지 묶입니다. 원래 구속보다 강해질 수 있습니다.</li>
+      <li>general contact은 전체 파트 단일 표면 접촉 하나로만 대체하며, 제외(exclusion) 조건은 옮기지 않습니다.</li>
+      <li>하중과 스텝 정의는 변환하지 않습니다. 로그에 미변환 키워드로 남습니다.</li>
+      <li>C3D6는 축약 6면체로, C3D4는 축약 사면체로 씁니다. C3D20 등 2차 육면체는 코너 절점만 남기므로 결과가 달라집니다.</li>
+      <li>변환 후 LS-PrePost에서 형상·PID·재료를 눈으로 확인하고, <code>*CONTROL_TERMINATION</code> 값을 실제 해석 조건으로 바꿔 쓰세요.</li>
+    </ul>
+  </div>
+</section>
+
+</div>
+
+<script>
+"use strict";
+
+/* ============================================================
+   포맷 유틸
+   ============================================================ */
+const pad = (v,w)=>String(v).padStart(w);
+const i8  = v=>pad(v|0,8);
+const i10 = v=>pad(v|0,10);
+
+function fnum(v,w){
+  if(v===undefined||v===null||v===''||isNaN(v)) v=0;
+  v=Number(v);
+  let s;
+  if(v===0){ s='0.0'; }
+  else{
+    const a=Math.abs(v);
+    if(a>=1e-3 && a<1e6){
+      s=String(Number(v.toPrecision(Math.max(3,w-3))));
+      if(!/[.eE]/.test(s)) s+='.0';
+    }else{
+      s=v.toExponential(Math.max(2,w-9)).toUpperCase();
+    }
+  }
+  if(s.length>w) s=Number(v).toExponential(4).toUpperCase();
+  if(s.length>w) s=Number(v).toExponential(2).toUpperCase();
+  if(s.length>w) s=s.slice(0,w);
+  return s.padStart(w);
+}
+const f10=v=>fnum(v,10), f16=v=>fnum(v,16), f20=v=>fnum(v,20);
+
+/* ============================================================
+   로그
+   ============================================================ */
+function newLog(){
+  const items=[];
+  return {
+    items,
+    info:m=>items.push({lv:'info',m}),
+    ok:m=>items.push({lv:'ok',m}),
+    warn:m=>items.push({lv:'warn',m}),
+    err:m=>items.push({lv:'err',m})
+  };
+}
+
+/* ============================================================
+   INP 파서
+   ============================================================ */
+function newPart(name){
+  return {name, nodes:new Map(), elements:new Map(), nsets:new Map(),
+          elsets:new Map(), sections:[], massVals:new Map()};
+}
+
+function parseKeyword(line){
+  const parts=line.split(',');
+  const kw=parts[0].substring(1).trim().toUpperCase().replace(/\s+/g,' ');
+  const params={};
+  for(let i=1;i<parts.length;i++){
+    const p=parts[i];
+    if(!p.trim()) continue;
+    const eq=p.indexOf('=');
+    if(eq>=0) params[p.substring(0,eq).trim().toUpperCase().replace(/\s+/g,' ')]=p.substring(eq+1).trim().replace(/^["']|["']$/g,'');
+    else params[p.trim().toUpperCase().replace(/\s+/g,' ')]=true;
+  }
+  return {kw,params};
+}
+
+function logicalLines(text){
+  const raw=text.split(/\r?\n/);
+  const out=[];
+  for(let i=0;i<raw.length;i++){
+    let t=raw[i].trim();
+    if(!t||t.startsWith('**')) continue;
+    while(t.endsWith(',')){
+      let j=i+1;
+      while(j<raw.length && (!raw[j].trim()||raw[j].trim().startsWith('**'))) j++;
+      if(j>=raw.length) break;
+      if(raw[j].trim().startsWith('*')) break;
+      t=t+raw[j].trim();
+      i=j;
+    }
+    out.push(t);
+  }
+  return out;
+}
+
+/* ---- *INCLUDE 병합 ---- */
+const baseKey=p=>String(p||'').replace(/["']/g,'').trim().split(/[\\/]/).pop().toUpperCase();
+const RE_INCLUDE=/^\*\s*INCLUDE\b/i;
+
+function includeRefs(text){
+  const out=[];
+  for(const line of text.split(/\r?\n/)){
+    const t=line.trim();
+    if(t.startsWith('**')||!RE_INCLUDE.test(t)) continue;
+    const {params}=parseKeyword(t);
+    const k=baseKey(params.INPUT||params.FILE||'');
+    if(k) out.push({key:k,raw:(params.INPUT||params.FILE||'')});
+  }
+  return out;
+}
+
+/* files: Map(KEY -> {key,name,text}). 재귀적으로 전개한 라인 배열을 돌려준다. */
+function expandIncludes(text,files,log,stack,stats){
+  stack=stack||[]; stats=stats||{merged:0,missing:new Set(),used:new Set()};
+  const out=[];
+  for(const line of text.split(/\r?\n/)){
+    const t=line.trim();
+    if(!t.startsWith('**')&&RE_INCLUDE.test(t)){
+      const {params}=parseKeyword(t);
+      const raw=params.INPUT||params.FILE||'';
+      const key=baseKey(raw);
+      if(!key){ log.warn('*INCLUDE 경로를 읽지 못했습니다.'); continue; }
+      if(stack.indexOf(key)>=0){ log.err(`*INCLUDE 순환 참조를 끊었습니다: ${raw}`); continue; }
+      const f=files.get(key);
+      if(!f){
+        stats.missing.add(raw);
+        log.err(`*INCLUDE 파일이 없습니다: ${raw} — 같이 올려주시면 이어 붙입니다.`);
+        out.push('** [missing include] '+raw);
+        continue;
+      }
+      stats.merged++; stats.used.add(key);
+      out.push('** >>> include '+f.name);
+      out.push(...expandIncludes(f.text,files,log,stack.concat(key),stats).lines);
+      out.push('** <<< end '+f.name);
+      continue;
+    }
+    out.push(line);
+  }
+  return {lines:out,stats};
+}
+
+const UNSUPPORTED_QUIET=new Set(['STEP','END STEP','DYNAMIC','STATIC','OUTPUT','NODE OUTPUT',
+  'ELEMENT OUTPUT','RESTART','PREPRINT','SYSTEM','END ASSEMBLY','ASSEMBLY','END PART','END INSTANCE',
+  'CONTACT OUTPUT','ENERGY OUTPUT','BULK VISCOSITY','END LOAD CASE']);
+
+function parseInp(text,log){
+  const model={title:'',parts:new Map(),instances:[],materials:new Map(),
+               asmNsets:[],asmElsets:[],boundaries:[],unsupported:new Map(),
+               surfaces:[],interactions:new Map(),contactPairs:[],ties:[],
+               mpcs:[],couplings:[],equations:[],rigidBodies:[],generalContact:false};
+  const root=newPart('__ROOT__');
+  model.parts.set('__ROOT__',root);
+
+  let mode=null, curPart=root, curInst=null, curMat=null;
+  let elType='', elSetArr=null, nodeSetArr=null;
+  let setArr=null, setGen=false;
+  let curSection=null, bcType=null, massElset=null;
+  let curSurf=null, curInter=null, curCP=null, curTie=null, curCoup=null, curEq=null, eqNeed=0;
+  let headingDone=false;
+  const tgt=()=>curInst?curInst.part:curPart;
+
+  const lines=logicalLines(text);
+
+  for(const line of lines){
+    if(line.startsWith('*')){
+      const {kw,params}=parseKeyword(line);
+      mode=null; setArr=null;
+      switch(kw){
+        case 'HEADING': mode='HEADING'; break;
+
+        case 'PART':{
+          const nm=(params.NAME||('PART'+model.parts.size)).toUpperCase();
+          curPart=newPart(nm); model.parts.set(nm,curPart); break;
+        }
+        case 'END PART': curPart=root; break;
+
+        case 'INSTANCE':{
+          const inst={name:params.NAME||('INST'+model.instances.length),
+                      partName:(params.PART||'').toUpperCase(),
+                      t:[0,0,0], rot:null, part:newPart('LOCAL'), dataN:0};
+          model.instances.push(inst); curInst=inst; mode='INSTANCE'; break;
+        }
+        case 'END INSTANCE': curInst=null; break;
+
+        case 'NODE': case 'NODE INPUT':{
+          mode='NODE';
+          nodeSetArr=null;
+          if(params.NSET){
+            const nm=params.NSET.toUpperCase();
+            nodeSetArr=[]; tgt().nsets.set(nm,nodeSetArr);
+          }
+          break;
+        }
+        case 'ELEMENT':{
+          mode='ELEMENT';
+          elType=(params.TYPE||'').toUpperCase();
+          elSetArr=null;
+          if(params.ELSET){
+            const nm=params.ELSET.toUpperCase();
+            elSetArr=[]; tgt().elsets.set(nm,elSetArr);
+          }
+          break;
+        }
+        case 'NSET': case 'ELSET':{
+          const isNode=(kw==='NSET');
+          const nm=((isNode?params.NSET:params.ELSET)||'UNNAMED').toUpperCase();
+          setGen=!!params.GENERATE;
+          setArr=[];
+          if(params.INSTANCE){
+            (isNode?model.asmNsets:model.asmElsets).push(
+              {name:nm,instance:params.INSTANCE.toUpperCase(),ids:setArr});
+          }else{
+            const map=isNode?tgt().nsets:tgt().elsets;
+            if(map.has(nm)) setArr=map.get(nm); else map.set(nm,setArr);
+          }
+          mode='SET';
+          break;
+        }
+        case 'MATERIAL':{
+          const nm=(params.NAME||'MAT'+model.materials.size).toUpperCase();
+          curMat={name:params.NAME||nm,density:null,e:null,nu:null,plastic:[]};
+          model.materials.set(nm,curMat); break;
+        }
+        case 'DENSITY': mode='DENSITY'; break;
+        case 'ELASTIC': mode='ELASTIC'; break;
+        case 'PLASTIC': mode='PLASTIC'; break;
+
+        case 'SOLID SECTION': case 'SHELL SECTION': case 'MEMBRANE SECTION':
+        case 'BEAM SECTION': case 'BEAM GENERAL SECTION': case 'COHESIVE SECTION':
+        case 'SHELL GENERAL SECTION': case 'TRUSS SECTION':{
+          curSection={type:kw, elset:(params.ELSET||'').toUpperCase(),
+                      material:(params.MATERIAL||'').toUpperCase(),
+                      shape:(params.SECTION||'').toUpperCase(), data:[]};
+          tgt().sections.push(curSection); mode='SECTION'; break;
+        }
+        case 'MASS': massElset=(params.ELSET||'').toUpperCase(); mode='MASSVAL'; break;
+        case 'BOUNDARY': bcType=(params.TYPE||'').toUpperCase(); mode='BOUNDARY'; break;
+
+        /* ---- 표면 / 접촉 / 구속 ---- */
+        case 'SURFACE':{
+          curSurf={name:(params.NAME||('SURF'+model.surfaces.length)).toUpperCase(),
+                   stype:(params.TYPE||'ELEMENT').toUpperCase(),
+                   owner:(curInst?curInst.partName:(curPart!==root?curPart.name:'__ASM__')),
+                   rows:[]};
+          model.surfaces.push(curSurf); mode='SURFACE'; break;
+        }
+        case 'SURFACE INTERACTION':
+          curInter={name:(params.NAME||'').toUpperCase(),fs:null};
+          model.interactions.set(curInter.name,curInter); break;
+        case 'FRICTION': mode='FRICTION'; break;
+        case 'CONTACT PAIR':
+          curCP={interaction:(params.INTERACTION||'').toUpperCase(),
+                 ctype:(params.TYPE||'').toUpperCase(),
+                 tied:!!params.TIED, rows:[]};
+          model.contactPairs.push(curCP); mode='CONTACTPAIR'; break;
+        case 'TIE':
+          curTie={name:params.NAME||('Tie-'+(model.ties.length+1)),rows:[]};
+          model.ties.push(curTie); mode='TIE'; break;
+        case 'MPC': mode='MPC'; break;
+        case 'COUPLING':
+          curCoup={name:params['CONSTRAINT NAME']||('Coupling-'+(model.couplings.length+1)),
+                   ref:params['REF NODE']||'', surf:params.SURFACE||'', kind:'KINEMATIC'};
+          model.couplings.push(curCoup); break;
+        case 'KINEMATIC': if(curCoup) curCoup.kind='KINEMATIC'; break;
+        case 'DISTRIBUTING': case 'DISTRIBUTING COUPLING':
+          if(curCoup) curCoup.kind='DISTRIBUTING'; break;
+        case 'EQUATION': curEq=null; eqNeed=0; mode='EQUATION'; break;
+        case 'RIGID BODY':
+          model.rigidBodies.push({ref:params['REF NODE']||'',
+            elset:(params.ELSET||'').toUpperCase(),
+            pin:(params['PIN NSET']||'').toUpperCase(),
+            tie:(params['TIE NSET']||'').toUpperCase()});
+          break;
+        case 'CONTACT': model.generalContact=true; break;
+        case 'CONTACT INCLUSIONS': case 'CONTACT EXCLUSIONS':
+        case 'CONTACT PROPERTY ASSIGNMENT': case 'CONTACT CONTROLS':
+        case 'SURFACE BEHAVIOR': case 'CLEARANCE': break;
+        case 'INCLUDE':
+          log.err('해결되지 않은 *INCLUDE: '+(params.INPUT||params.FILE||''));
+          break;
+        default:
+          if(!UNSUPPORTED_QUIET.has(kw))
+            model.unsupported.set(kw,(model.unsupported.get(kw)||0)+1);
+      }
+      continue;
+    }
+
+    /* ---- data line ---- */
+    const F=line.split(',').map(s=>s.trim());
+    switch(mode){
+      case 'HEADING':
+        if(!headingDone){ model.title=line.trim().slice(0,80); headingDone=true; }
+        break;
+
+      case 'INSTANCE':{
+        const nums=F.map(Number);
+        if(curInst.dataN===0 && nums.length>=3 && nums.every(n=>!isNaN(n))){
+          curInst.t=[nums[0]||0,nums[1]||0,nums[2]||0];
+        }else if(curInst.dataN===1 && nums.length>=7){
+          curInst.rot=nums.slice(0,7);
+        }
+        curInst.dataN++;
+        break;
+      }
+
+      case 'NODE':{
+        const id=parseInt(F[0],10);
+        if(isNaN(id)) break;
+        tgt().nodes.set(id,[parseFloat(F[1])||0,parseFloat(F[2])||0,parseFloat(F[3])||0]);
+        if(nodeSetArr) nodeSetArr.push(id);
+        break;
+      }
+
+      case 'ELEMENT':{
+        const id=parseInt(F[0],10);
+        if(isNaN(id)) break;
+        const conn=[];
+        for(let k=1;k<F.length;k++){
+          if(F[k]==='') continue;
+          const v=parseInt(F[k],10);
+          if(!isNaN(v)) conn.push(v);
+        }
+        tgt().elements.set(id,{type:elType,conn});
+        if(elSetArr) elSetArr.push(id);
+        break;
+      }
+
+      case 'SET':{
+        if(!setArr) break;
+        if(setGen){
+          const a=parseInt(F[0],10),b=parseInt(F[1],10),c=parseInt(F[2],10)||1;
+          if(!isNaN(a)&&!isNaN(b)) for(let v=a;v<=b;v+=c) setArr.push(v);
+        }else{
+          for(const f of F){
+            if(!f) continue;
+            const v=parseInt(f,10);
+            setArr.push((!isNaN(v)&&/^\s*-?\d+\s*$/.test(f))?v:f.toUpperCase());
+          }
+        }
+        break;
+      }
+
+      case 'DENSITY': if(curMat) curMat.density=parseFloat(F[0]); break;
+      case 'ELASTIC': if(curMat && curMat.e===null){ curMat.e=parseFloat(F[0]); curMat.nu=parseFloat(F[1]); } break;
+      case 'PLASTIC': if(curMat){
+          const s=parseFloat(F[0]), ep=parseFloat(F[1])||0;
+          if(!isNaN(s)) curMat.plastic.push([ep,s]);
+        } break;
+
+      case 'SECTION': if(curSection) curSection.data.push(F); break;
+
+      case 'MASSVAL':{
+        const v=parseFloat(F[0]);
+        if(!isNaN(v)&&massElset) tgt().massVals.set(massElset,v);
+        break;
+      }
+
+      case 'BOUNDARY':{
+        if(!F[0]) break;
+        model.boundaries.push({set:F[0].toUpperCase(),type:bcType,f:F.slice(1)});
+        break;
+      }
+
+      case 'SURFACE':
+        if(curSurf&&F[0]) curSurf.rows.push([F[0],(F[1]||'').toUpperCase()]);
+        break;
+      case 'FRICTION':{
+        const v=parseFloat(F[0]);
+        if(curInter&&!isNaN(v)&&curInter.fs===null) curInter.fs=v;
+        break;
+      }
+      case 'CONTACTPAIR': if(curCP&&F[0]&&F[1]) curCP.rows.push([F[0],F[1]]); break;
+      case 'TIE': if(curTie&&F[0]&&F[1]) curTie.rows.push([F[0],F[1]]); break;
+      case 'MPC': if(F.length>=3&&F[0]) model.mpcs.push({type:F[0].toUpperCase(),a:F[1],b:F[2]}); break;
+      case 'EQUATION':{
+        if(eqNeed===0){
+          eqNeed=parseInt(F[0],10)||0;
+          curEq={terms:[]};
+          if(eqNeed) model.equations.push(curEq);
+        }else if(curEq){
+          for(let k=0;k+2<F.length&&curEq.terms.length<eqNeed;k+=3)
+            curEq.terms.push([F[k],parseInt(F[k+1],10),parseFloat(F[k+2])]);
+          if(curEq.terms.length>=eqNeed) eqNeed=0;
+        }
+        break;
+      }
+    }
+  }
+  return model;
+}
+
+/* ============================================================
+   요소 타입 분류
+   ============================================================ */
+function classify(t){
+  t=(t||'').toUpperCase();
+  if(!t) return null;
+  if(t.startsWith('C3D20')||t.startsWith('C3D27')) return {cat:'solid',sub:'hex20',nn:20};
+  if(t.startsWith('C3D15')) return {cat:'solid',sub:'wedge15',nn:15};
+  if(t.startsWith('C3D10')) return {cat:'solid',sub:'tet10',nn:10};
+  if(t.startsWith('C3D8')||t.startsWith('SC8')||t.startsWith('COH3D8')||t.startsWith('CAX8')||t.startsWith('DC3D8'))
+    return {cat:'solid',sub:'hex8',nn:8,red:/8R/.test(t)};
+  if(t.startsWith('C3D6')||t.startsWith('SC6')||t.startsWith('COH3D6')||t.startsWith('DC3D6'))
+    return {cat:'solid',sub:'wedge6',nn:6};
+  if(t.startsWith('C3D4')||t.startsWith('DC3D4')) return {cat:'solid',sub:'tet4',nn:4};
+
+  if(t.startsWith('S8')||t.startsWith('S9')) return {cat:'shell',sub:'quad8',nn:8};
+  if(t.startsWith('S6')||t.startsWith('STRI65')) return {cat:'shell',sub:'tri6',nn:6};
+  if(t.startsWith('S4')||t.startsWith('M3D4')||t.startsWith('SFM3D4')||t.startsWith('R3D4')||
+     t.startsWith('CPS4')||t.startsWith('CPE4')) return {cat:'shell',sub:'quad4',nn:4,red:/4R/.test(t)};
+  if(t.startsWith('S3')||t.startsWith('STRI3')||t.startsWith('M3D3')||t.startsWith('SFM3D3')||
+     t.startsWith('R3D3')||t.startsWith('CPS3')||t.startsWith('CPE3')) return {cat:'shell',sub:'tri3',nn:3};
+
+  if(t.startsWith('T3D2')||t.startsWith('T2D2')) return {cat:'beam',sub:'truss2',nn:2,truss:true};
+  if(t.startsWith('T3D3')) return {cat:'beam',sub:'truss3',nn:3,truss:true};
+  if(t.startsWith('B31')||t.startsWith('B33')||t.startsWith('B21')||t.startsWith('B23'))
+    return {cat:'beam',sub:'beam2',nn:2};
+  if(t.startsWith('B32')||t.startsWith('B22')) return {cat:'beam',sub:'beam3',nn:3};
+
+  if(t==='MASS') return {cat:'mass',nn:1};
+  if(t.startsWith('ROTARYI')) return {cat:'inertia',nn:1};
+  if(t.startsWith('SPRING')||t.startsWith('DASHPOT')||t.startsWith('CONN3D2')||t.startsWith('CONN2D2'))
+    return {cat:'discrete',nn:2};
+  return null;
+}
+
+/* Abaqus 면 번호 → 로컬 절점 인덱스 (외향 법선 기준) */
+const FACE={
+  hex8:{S1:[0,1,2,3],S2:[4,7,6,5],S3:[0,4,5,1],S4:[1,5,6,2],S5:[2,6,7,3],S6:[3,7,4,0]},
+  wedge6:{S1:[0,1,2],S2:[3,5,4],S3:[0,1,4,3],S4:[1,2,5,4],S5:[2,0,3,5]},
+  tet4:{S1:[0,1,2],S2:[0,3,1],S3:[1,3,2],S4:[2,3,0]}
+};
+FACE.hex20=FACE.hex8; FACE.tet10=FACE.tet4; FACE.wedge15=FACE.wedge6;
+
+const DYNA_KEYWORD={
+  hex8:'*ELEMENT_SOLID (8절점)', wedge6:'*ELEMENT_SOLID (축약 6면체)',
+  tet4:'*ELEMENT_SOLID (축약 4면체)', tet10:'*ELEMENT_SOLID_TET4TOTET10',
+  hex20:'*ELEMENT_SOLID (코너 8절점만)', wedge15:'*ELEMENT_SOLID (코너 6절점만)',
+  quad4:'*ELEMENT_SHELL', tri3:'*ELEMENT_SHELL (축약 삼각형)',
+  quad8:'*ELEMENT_SHELL (코너 4절점만)', tri6:'*ELEMENT_SHELL (코너 3절점만)',
+  beam2:'*ELEMENT_BEAM', beam3:'*ELEMENT_BEAM (2절점 축약)',
+  truss2:'*ELEMENT_BEAM (ELFORM 3)', truss3:'*ELEMENT_BEAM (ELFORM 3)',
+  mass:'*ELEMENT_MASS', discrete:'*ELEMENT_DISCRETE'
+};
+
+/* ============================================================
+   좌표 변환
+   ============================================================ */
+function makeTransform(inst){
+  const t=inst.t||[0,0,0], r=inst.rot;
+  if(!r) return p=>[p[0]+t[0],p[1]+t[1],p[2]+t[2]];
+  const [ax,ay,az,bx,by,bz,ang]=r;
+  let ux=bx-ax,uy=by-ay,uz=bz-az;
+  const L=Math.hypot(ux,uy,uz)||1; ux/=L;uy/=L;uz/=L;
+  const th=ang*Math.PI/180,c=Math.cos(th),s=Math.sin(th),C=1-c;
+  const R=[[c+ux*ux*C,ux*uy*C-uz*s,ux*uz*C+uy*s],
+           [uy*ux*C+uz*s,c+uy*uy*C,uy*uz*C-ux*s],
+           [uz*ux*C-uy*s,uz*uy*C+ux*s,c+uz*uz*C]];
+  return p=>{
+    const x=p[0]-ax,y=p[1]-ay,z=p[2]-az;
+    return [R[0][0]*x+R[0][1]*y+R[0][2]*z+ax+t[0],
+            R[1][0]*x+R[1][1]*y+R[1][2]*z+ay+t[1],
+            R[2][0]*x+R[2][1]*y+R[2][2]*z+az+t[2]];
+  };
+}
+
+/* ============================================================
+   변환 본체
+   ============================================================ */
+const UNIT_DEFAULT={
+  mmts:{rho:7.85e-9,e:210000,nu:.3,end:.02,label:'mm-ton-s-N'},
+  mkgs:{rho:7850,e:2.1e11,nu:.3,end:.02,label:'m-kg-s-N'},
+  mmkgms:{rho:7.85e-6,e:210,nu:.3,end:20,label:'mm-kg-ms-kN'}
+};
+
+function convert(model,opt,log){
+  const cv={
+    title:model.title||'Converted from Abaqus INP',
+    nodes:[], solids:[], tet10s:[], shells:[], beams:[], masses:[], discretes:[],
+    parts:[], sections:[], mats:[], curves:[], nsets:[], esets:[], spcs:[],
+    segsets:[], contacts:[], nrbs:[], interps:[], lineq:[], imap:[],
+    counts:{}
+  };
+  const UD=UNIT_DEFAULT[opt.unit];
+
+  /* 인스턴스 목록 결정 */
+  let instances=model.instances.slice();
+  if(instances.length===0){
+    const root=model.parts.get('__ROOT__');
+    if(root.nodes.size>0){
+      instances=[{name:'',partName:'__ROOT__',t:[0,0,0],rot:null,part:newPart('L'),dataN:0}];
+    }else{
+      for(const [k,p] of model.parts){
+        if(k==='__ROOT__') continue;
+        instances.push({name:p.name,partName:k,t:[0,0,0],rot:null,part:newPart('L'),dataN:0});
+      }
+      if(instances.length) log.warn('어셈블리 정의가 없어 파트를 원위치에 한 번씩 배치했습니다.');
+    }
+  }
+  if(instances.length===0){ log.err('절점을 찾지 못했습니다. Abaqus INP 파일이 맞는지 확인해 주세요.'); return cv; }
+
+  /* 재료 MID */
+  const midOf=new Map(); let midSeq=0;
+  function getMid(name){
+    const key=(name||'').toUpperCase();
+    if(midOf.has(key)) return midOf.get(key);
+    const mid=++midSeq;
+    const m=model.materials.get(key);
+    if(!m){
+      cv.mats.push({mid,type:'elastic',name:name||'DEFAULT_STEEL',
+                    rho:UD.rho,e:UD.e,nu:UD.nu});
+      if(name) log.warn(`재료 "${name}" 정의를 찾지 못해 기본 강재 물성으로 채웠습니다 (MID ${mid}).`);
+    }else{
+      const rho=(m.density===null||isNaN(m.density))?UD.rho:m.density;
+      if(m.density===null) log.warn(`재료 "${m.name}"에 밀도가 없어 기본값을 넣었습니다.`);
+      const e=(m.e===null||isNaN(m.e))?UD.e:m.e;
+      const nu=(m.nu===null||isNaN(m.nu))?UD.nu:m.nu;
+      if(m.plastic.length>0){
+        let lcid=0;
+        if(m.plastic.length>1){
+          lcid=cv.curves.length+1;
+          cv.curves.push({lcid,name:m.name+'_STRESS_STRAIN',pts:m.plastic.slice()});
+        }
+        cv.mats.push({mid,type:'plastic',name:m.name,rho,e,nu,
+                      sigy:m.plastic[0][1],lcss:lcid,
+                      etan:m.plastic.length>1?0:0});
+      }else{
+        cv.mats.push({mid,type:'elastic',name:m.name,rho,e,nu});
+      }
+    }
+    midOf.set(key,mid);
+    return mid;
+  }
+
+  /* 세트 이름 → ID 배열 해석 (중첩 세트 지원) */
+  function resolveSet(map,name,depth){
+    depth=depth||0;
+    const arr=map.get((name||'').toUpperCase());
+    if(!arr||depth>6) return [];
+    const out=[];
+    for(const v of arr){
+      if(typeof v==='number') out.push(v);
+      else out.push(...resolveSet(map,v,depth+1));
+    }
+    return out;
+  }
+
+  const usedNode=new Set(), usedElem=new Set();
+  let maxNode=0, maxElem=0;
+  let pidSeq=0, secSeq=0;
+  const nodeCoord=new Map();          // 전역 절점 좌표 (보 방향절점 계산용)
+  const globalNsets=new Map();        // 전역 nset 이름 → SID
+  const typeCount=new Map();
+  const instMaps=new Map();           // 인스턴스명 → {elsets,nsets}
+  const instPartOf=new Map();         // 인스턴스명 → 파트명
+  const elemInfo=new Map();           // 전역 EID → {cat,sub,c}
+  const needElemInfo = opt.contact &&
+    (model.surfaces.length>0||model.contactPairs.length>0||model.ties.length>0||
+     model.couplings.length>0||model.rigidBodies.length>0);
+
+  for(const inst of instances){
+    const base=model.parts.get(inst.partName);
+    if(!base){ log.warn(`인스턴스 "${inst.name}"가 참조한 파트 ${inst.partName}를 찾을 수 없습니다.`); continue; }
+
+    /* 파트 + 인스턴스 로컬 정의 병합 */
+    const P=newPart(base.name);
+    for(const [k,v] of base.nodes) P.nodes.set(k,v);
+    for(const [k,v] of inst.part.nodes) P.nodes.set(k,v);
+    for(const [k,v] of base.elements) P.elements.set(k,v);
+    for(const [k,v] of inst.part.elements) P.elements.set(k,v);
+    for(const [k,v] of base.nsets) P.nsets.set(k,v);
+    for(const [k,v] of inst.part.nsets) P.nsets.set(k,v);
+    for(const [k,v] of base.elsets) P.elsets.set(k,v);
+    for(const [k,v] of inst.part.elsets) P.elsets.set(k,v);
+    P.sections=base.sections.concat(inst.part.sections);
+    for(const [k,v] of base.massVals) P.massVals.set(k,v);
+
+    /* offset 결정 */
+    let nOff=0, eOff=0;
+    for(const id of P.nodes.keys()){ if(usedNode.has(id)){ nOff=maxNode; break; } }
+    for(const id of P.elements.keys()){ if(usedElem.has(id)){ eOff=maxElem; break; } }
+    if(nOff||eOff) log.info(`인스턴스 "${inst.name}" ID 충돌 → 절점 +${nOff}, 요소 +${eOff} offset 적용`);
+
+    const T=makeTransform(inst);
+
+    for(const [id,p] of P.nodes){
+      const nid=id+nOff;
+      const q=T(p);
+      cv.nodes.push([nid,q[0],q[1],q[2]]);
+      nodeCoord.set(nid,q);
+      usedNode.add(nid);
+      if(nid>maxNode) maxNode=nid;
+    }
+
+    /* 단면 → PART */
+    const elemPid=new Map();
+    const secOfElem=new Map();
+    for(const sec of P.sections){
+      const eids=resolveSet(P.elsets,sec.elset);
+      if(eids.length===0){ log.warn(`단면이 참조한 요소집합 "${sec.elset}"이 비어 있습니다.`); continue; }
+      const sample=P.elements.get(eids[0]);
+      const cls=sample?classify(sample.type):null;
+      if(!cls) continue;
+      const secid=++secSeq, pid=++pidSeq;
+      const mid=opt.mat?getMid(sec.material):getMid('');
+      const title=(inst.name?inst.name+'_':'')+(sec.elset||'PART'+pid);
+
+      const S={secid,cat:cls.cat};
+      if(cls.cat==='solid'){
+        S.kind='solid';
+        S.elform = cls.sub==='tet10'&&opt.tet10 ? 16 : (cls.red?1:2);
+        if(cls.sub==='tet4'||cls.sub==='wedge6') S.elform=1;
+      }else if(cls.cat==='shell'){
+        S.kind='shell';
+        S.elform = opt.shell==='auto' ? (cls.red?2:16) : parseInt(opt.shell,10);
+        let th=0;
+        if(sec.data.length&&sec.data[0].length) th=parseFloat(sec.data[0][0]);
+        if(!th||isNaN(th)){ th=1.0; log.warn(`쉘 단면 "${sec.elset}" 두께를 못 읽어 1.0으로 넣었습니다.`); }
+        S.t=th;
+        S.nip = sec.data.length&&sec.data[0][1]?parseInt(sec.data[0][1],10)||5:5;
+      }else if(cls.cat==='beam'){
+        S.kind='beam';
+        S.truss=!!cls.truss;
+        S.elform=cls.truss?3:1;
+        const d=sec.data[0]||[];
+        S.shape=sec.shape;
+        S.dims=d.map(x=>parseFloat(x)).filter(x=>!isNaN(x));
+        const o=sec.data[1]||[];
+        const n1=o.map(x=>parseFloat(x)).filter(x=>!isNaN(x));
+        S.n1=(n1.length>=3)?n1.slice(0,3):null;
+        if(S.shape==='CIRC'&&S.dims.length>=1){ S.a=Math.PI*S.dims[0]*S.dims[0]; S.d1=2*S.dims[0]; }
+        else if(S.shape==='RECT'&&S.dims.length>=2){ S.a=S.dims[0]*S.dims[1]; S.d1=S.dims[0]; S.d2=S.dims[1]; }
+        else { S.a=S.dims[0]||1; S.d1=Math.sqrt(Math.abs(S.a))||1; S.d2=S.d1;
+               if(!sec.shape) log.warn(`보 단면 "${sec.elset}" 형상을 해석하지 못해 단면적을 근사했습니다.`); }
+      }
+      cv.sections.push(S);
+      cv.parts.push({pid,secid,mid,title});
+      for(const e of eids){ elemPid.set(e+eOff,pid); secOfElem.set(e+eOff,S); }
+    }
+
+    /* 미지정 요소용 기본 PART */
+    const fallback={};
+    function fallbackPid(cat,cls){
+      if(fallback[cat]) return fallback[cat];
+      const secid=++secSeq,pid=++pidSeq,mid=getMid('');
+      const S={secid,cat};
+      if(cat==='solid'){S.kind='solid';S.elform=1;}
+      else if(cat==='shell'){S.kind='shell';S.elform=opt.shell==='auto'?2:parseInt(opt.shell,10);S.t=1.0;S.nip=5;}
+      else if(cat==='beam'){S.kind='beam';S.elform=1;S.a=1;S.d1=1;S.d2=1;S.n1=null;}
+      else if(cat==='discrete'){S.kind='discrete';}
+      cv.sections.push(S);
+      cv.parts.push({pid,secid,mid,title:'UNASSIGNED_'+cat.toUpperCase()});
+      log.warn(`단면이 지정되지 않은 ${cat} 요소가 있어 임시 PART ${pid}에 모았습니다.`);
+      return (fallback[cat]=pid);
+    }
+
+    /* 요소 변환 */
+    let orientSeq=0;
+    for(const [id,el] of P.elements){
+      const cls=classify(el.type);
+      const eid=id+eOff;
+      usedElem.add(eid); if(eid>maxElem) maxElem=eid;
+      if(!cls){
+        typeCount.set(el.type+'|?', (typeCount.get(el.type+'|?')||0)+1);
+        continue;
+      }
+      const key=el.type+'|'+(cls.sub||cls.cat);
+      typeCount.set(key,(typeCount.get(key)||0)+1);
+      const c=el.conn.map(n=>n+nOff);
+      if(needElemInfo&&(cls.cat==='solid'||cls.cat==='shell'))
+        elemInfo.set(eid,{cat:cls.cat,sub:cls.sub,c});
+      const noPid=(cls.cat==='mass'||cls.cat==='inertia');
+      const pid=noPid?0:(elemPid.get(eid)||fallbackPid(cls.cat,cls));
+      const S=secOfElem.get(eid);
+
+      if(cls.cat==='solid'){
+        if(cls.sub==='hex8'||cls.sub==='hex20'){
+          cv.solids.push([eid,pid,c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7]]);
+        }else if(cls.sub==='wedge6'||cls.sub==='wedge15'){
+          cv.solids.push([eid,pid,c[0],c[1],c[2],c[2],c[3],c[4],c[5],c[5]]);
+        }else if(cls.sub==='tet4'){
+          cv.solids.push([eid,pid,c[0],c[1],c[2],c[2],c[3],c[3],c[3],c[3]]);
+        }else if(cls.sub==='tet10'){
+          if(opt.tet10) cv.tet10s.push([eid,pid].concat(c.slice(0,10)));
+          else cv.solids.push([eid,pid,c[0],c[1],c[2],c[2],c[3],c[3],c[3],c[3]]);
+        }
+      }else if(cls.cat==='shell'){
+        if(cls.sub==='quad4'||cls.sub==='quad8') cv.shells.push([eid,pid,c[0],c[1],c[2],c[3]]);
+        else cv.shells.push([eid,pid,c[0],c[1],c[2],c[2]]);
+      }else if(cls.cat==='beam'){
+        let n3=0;
+        if(!cls.truss && opt.beamNode && S && S.n1){
+          const p1=nodeCoord.get(c[0]), p2=nodeCoord.get(c[1]);
+          if(p1&&p2){
+            const len=Math.hypot(p2[0]-p1[0],p2[1]-p1[1],p2[2]-p1[2])||1;
+            const v=S.n1, vl=Math.hypot(v[0],v[1],v[2])||1;
+            const mx=(p1[0]+p2[0])/2+v[0]/vl*len,
+                  my=(p1[1]+p2[1])/2+v[1]/vl*len,
+                  mz=(p1[2]+p2[2])/2+v[2]/vl*len;
+            n3=++maxNode;
+            cv.nodes.push([n3,mx,my,mz]);
+            nodeCoord.set(n3,[mx,my,mz]);
+            usedNode.add(n3);
+            orientSeq++;
+          }
+        }
+        cv.beams.push([eid,pid,c[0],c[1],n3]);
+      }else if(cls.cat==='mass'){
+        let mv=0;
+        for(const [en,v] of P.massVals){
+          const ids=resolveSet(P.elsets,en);
+          if(ids.indexOf(id)>=0){ mv=v; break; }
+        }
+        cv.masses.push([eid,c[0],mv]);
+        if(!mv) log.warn(`질량 요소 ${eid}의 값을 찾지 못해 0으로 두었습니다.`);
+      }else if(cls.cat==='discrete'){
+        cv.discretes.push([eid,pid,c[0],c[1]||0]);
+      }
+    }
+    if(orientSeq) log.ok(`보 요소 방향절점 ${orientSeq}개를 생성했습니다.`);
+
+    /* 세트 */
+    if(opt.sets){
+      for(const [nm] of P.nsets){
+        const ids=resolveSet(P.nsets,nm).map(v=>v+nOff);
+        if(!ids.length) continue;
+        const full=(inst.name?inst.name+'_':'')+nm;
+        cv.nsets.push({sid:cv.nsets.length+1,name:full,ids});
+        globalNsets.set(full.toUpperCase(),cv.nsets.length);
+        if(!globalNsets.has(nm)) globalNsets.set(nm,cv.nsets.length);
+      }
+      for(const [nm] of P.elsets){
+        const ids=resolveSet(P.elsets,nm).map(v=>v+eOff);
+        if(!ids.length) continue;
+        const first=P.elements.get(ids[0]-eOff);
+        const cls=first?classify(first.type):null;
+        if(!cls||['solid','shell','beam'].indexOf(cls.cat)<0) continue;
+        cv.esets.push({sid:cv.esets.length+1,cat:cls.cat,
+                       name:(inst.name?inst.name+'_':'')+nm,ids});
+      }
+    }
+
+    /* 어셈블리 레벨 세트 */
+    const instKey=(inst.name||'').toUpperCase();
+    for(const s of model.asmNsets){
+      if(s.instance!==instKey) continue;
+      const tmp=new Map(P.nsets); tmp.set('__TMP__',s.ids);
+      const ids=resolveSet(tmp,'__TMP__').map(v=>v+nOff);
+      if(!ids.length) continue;
+      cv.nsets.push({sid:cv.nsets.length+1,name:s.name,ids});
+      globalNsets.set(s.name.toUpperCase(),cv.nsets.length);
+    }
+
+    /* 이름 해석용 전역 맵 */
+    const EM=new Map(), NM=new Map();
+    for(const nm of P.elsets.keys()) EM.set(nm,resolveSet(P.elsets,nm).map(v=>v+eOff));
+    for(const nm of P.nsets.keys()) NM.set(nm,resolveSet(P.nsets,nm).map(v=>v+nOff));
+    for(const s of model.asmNsets) if(s.instance===instKey){
+      const tmp=new Map(P.nsets); tmp.set('__T__',s.ids);
+      NM.set(s.name,resolveSet(tmp,'__T__').map(v=>v+nOff));
+    }
+    for(const s of model.asmElsets) if(s.instance===instKey){
+      const tmp=new Map(P.elsets); tmp.set('__T__',s.ids);
+      EM.set(s.name,resolveSet(tmp,'__T__').map(v=>v+eOff));
+    }
+    instMaps.set(instKey,{elsets:EM,nsets:NM,nOff,eOff});
+    instPartOf.set(instKey,base.name);
+  }
+
+  /* ============ 표면 · 접촉 · 구속 ============ */
+  if(opt.contact){
+    const upper=s=>String(s||'').trim().toUpperCase();
+
+    function lookIn(kind,ref,pref){
+      const R=upper(ref);
+      if(pref&&instMaps.has(pref)){
+        const v=instMaps.get(pref)[kind].get(R);
+        if(v&&v.length) return v;
+      }
+      const d=R.indexOf('.');
+      if(d>0){
+        const im=instMaps.get(R.slice(0,d));
+        if(im){ const v=im[kind].get(R.slice(d+1)); if(v&&v.length) return v; }
+      }
+      for(const im of instMaps.values()){ const v=im[kind].get(R); if(v&&v.length) return v; }
+      return null;
+    }
+    const lookElset=(r,p)=>lookIn('elsets',r,p);
+    const lookNset =(r,p)=>lookIn('nsets',r,p);
+
+    function segOf(eid,face){
+      const info=elemInfo.get(eid);
+      if(!info) return null;
+      const c=info.c;
+      if(info.cat==='shell'){
+        let s=c.length>=4?[c[0],c[1],c[2],c[3]]:[c[0],c[1],c[2],c[2]];
+        if(face==='SNEG'||face==='S2')
+          s=(c.length>=4)?[s[3],s[2],s[1],s[0]]:[c[2],c[1],c[0],c[0]];
+        return s;
+      }
+      const tab=FACE[info.sub];
+      if(!tab) return null;
+      const idx=tab[face]||tab.S1;
+      const s=idx.map(i=>c[i]);
+      if(s.length===3) s.push(s[2]);
+      return s.every(v=>v!==undefined)?s:null;
+    }
+
+    function findSurfDef(R){
+      const d=R.indexOf('.');
+      if(d>0){
+        const inst=R.slice(0,d), local=R.slice(d+1);
+        const pn=instPartOf.get(inst);
+        const def=model.surfaces.find(s=>s.name===local&&s.owner===pn);
+        if(def) return {def,pref:inst};
+        const any=model.surfaces.find(s=>s.name===local);
+        if(any) return {def:any,pref:inst};
+      }
+      const def=model.surfaces.find(s=>s.name===R&&s.owner==='__ASM__')
+              ||model.surfaces.find(s=>s.name===R);
+      return def?{def,pref:null}:null;
+    }
+
+    const surfCache=new Map();
+    function buildSurf(ref,depth){
+      const R=upper(ref);
+      if(surfCache.has(R)) return surfCache.get(R);
+      if(depth>4) return null;
+      const found=findSurfDef(R);
+      let res=null;
+      if(found){
+        const {def,pref}=found;
+        if(def.stype==='NODE'){
+          const ids=[];
+          for(const [r] of def.rows){
+            const v=lookNset(r,pref);
+            if(v) ids.push(...v);
+            else{
+              const n=parseInt(r,10);
+              if(!isNaN(n)&&instMaps.size===1) ids.push(n+[...instMaps.values()][0].nOff);
+            }
+          }
+          res={type:'node',ids:[...new Set(ids)],name:R};
+        }else{
+          const segs=[];
+          for(const [r,face] of def.rows){
+            const es=lookElset(r,pref);
+            if(es){
+              for(const e of es){ const s=segOf(e,face||'S1'); if(s) segs.push(s); }
+              continue;
+            }
+            const sub=buildSurf(r,depth+1);
+            if(sub&&sub.type==='seg') segs.push(...sub.segs);
+            else log.warn(`표면 "${def.name}"이 참조한 "${r}"을 찾지 못했습니다.`);
+          }
+          res={type:'seg',segs,name:R};
+        }
+      }else{
+        const es=lookElset(R);
+        if(es){
+          const segs=[];
+          for(const e of es){ const s=segOf(e,'S1'); if(s) segs.push(s); }
+          res={type:'seg',segs,name:R};
+        }else{
+          const ns=lookNset(R);
+          if(ns) res={type:'node',ids:ns,name:R};
+        }
+      }
+      surfCache.set(R,res);
+      return res;
+    }
+
+    const segSid=new Map(), nodeSid=new Map();
+    function segSetId(s){
+      if(segSid.has(s.name)) return segSid.get(s.name);
+      const sid=cv.segsets.length+1;
+      cv.segsets.push({sid,name:s.name,segs:s.segs});
+      segSid.set(s.name,sid);
+      return sid;
+    }
+    function nodeSetId(name,ids){
+      if(nodeSid.has(name)) return nodeSid.get(name);
+      cv.nsets.push({sid:cv.nsets.length+1,name,ids});
+      nodeSid.set(name,cv.nsets.length);
+      return cv.nsets.length;
+    }
+    const surfNodes=s=>{
+      if(!s) return [];
+      if(s.type==='node') return s.ids;
+      const set=new Set();
+      for(const g of s.segs) for(const n of g) set.add(n);
+      return [...set];
+    };
+
+    function addContact(kind,title,S,M,fs){
+      const c={cid:cv.contacts.length+1,kind,title,fs,fd:fs};
+      if(S.type==='node'){ c.ssid=nodeSetId(S.name,S.ids); c.sstyp=4; }
+      else{ c.ssid=segSetId(S); c.sstyp=0; }
+      if(M){
+        if(M.type==='node'){ c.msid=nodeSetId(M.name,M.ids); c.mstyp=4; }
+        else{ c.msid=segSetId(M); c.mstyp=0; }
+      }else{ c.msid=0; c.mstyp=0; }
+      cv.contacts.push(c);
+      cv.imap.push([title,'*CONTACT_'+kind]);
+      return c;
+    }
+
+    /* --- 접촉 쌍 --- */
+    for(const cp of model.contactPairs){
+      const inter=model.interactions.get(cp.interaction);
+      const fs=(inter&&inter.fs!==null&&inter.fs!==undefined)?inter.fs:opt.mu;
+      for(const [sl,ma] of cp.rows){
+        const S=buildSurf(sl,0), M=buildSurf(ma,0);
+        if(!S||!M||(S.type==='seg'&&!S.segs.length)||(M.type==='seg'&&!M.segs.length)){
+          log.warn(`접촉쌍 "${sl} / ${ma}"의 표면을 만들지 못해 건너뜁니다.`); continue;
+        }
+        const tied=cp.tied||cp.ctype==='TIED';
+        const kind=tied
+          ? (S.type==='node'?'TIED_NODES_TO_SURFACE_OFFSET_ID':'TIED_SURFACE_TO_SURFACE_OFFSET_ID')
+          : (S.type==='node'?'AUTOMATIC_NODES_TO_SURFACE_ID':'AUTOMATIC_SURFACE_TO_SURFACE_ID');
+        addContact(kind,(cp.interaction||'CONTACT')+'_'+S.name+'_'+M.name,S,M,tied?0:fs);
+      }
+    }
+
+    /* --- *TIE --- */
+    for(const tie of model.ties){
+      for(const [sl,ma] of tie.rows){
+        const S=buildSurf(sl,0), M=buildSurf(ma,0);
+        if(!S||!M){ log.warn(`*TIE "${tie.name}"의 표면을 찾지 못했습니다.`); continue; }
+        const kind=S.type==='node'?'TIED_NODES_TO_SURFACE_OFFSET_ID':'TIED_SURFACE_TO_SURFACE_OFFSET_ID';
+        addContact(kind,tie.name,S,M,0);
+      }
+    }
+
+    /* --- general contact --- */
+    if(model.generalContact){
+      const c={cid:cv.contacts.length+1,kind:'AUTOMATIC_SINGLE_SURFACE_ID',
+               title:'GENERAL_CONTACT',ssid:0,msid:0,sstyp:2,mstyp:0,fs:opt.mu,fd:opt.mu};
+      cv.contacts.push(c);
+      cv.imap.push(['*CONTACT (general contact)','*CONTACT_AUTOMATIC_SINGLE_SURFACE']);
+      log.warn('일반 접촉(general contact)은 전체 파트 단일 표면 접촉 하나로 대체했습니다. 제외 조건은 옮기지 않았습니다.');
+    }
+
+    /* --- 절점 참조 --- */
+    function nodeRef(ref){
+      const R=upper(ref);
+      const v=lookNset(R);
+      if(v&&v.length) return v;
+      const d=R.indexOf('.');
+      if(d>0){
+        const im=instMaps.get(R.slice(0,d));
+        const n=parseInt(R.slice(d+1),10);
+        if(im&&!isNaN(n)) return [n+im.nOff];
+      }
+      const n=parseInt(R,10);
+      if(!isNaN(n)){
+        if(instMaps.size===1) return [n+[...instMaps.values()][0].nOff];
+        return [n];
+      }
+      return null;
+    }
+
+    function addNRB(title,ids,pnode){
+      const uniq=[...new Set(ids)].filter(v=>usedNode.has(v));
+      if(uniq.length<2) return false;
+      const nsid=nodeSetId('NRB_'+title,uniq);
+      cv.nrbs.push({pid:++pidSeq,nsid,pnode:pnode||0,title});
+      return true;
+    }
+
+    /* --- MPC --- */
+    if(model.mpcs.length){
+      const groups=new Map();
+      for(const m of model.mpcs){
+        if(['BEAM','TIE','PIN','LINK'].indexOf(m.type)<0){
+          log.warn(`*MPC ${m.type} 형식은 변환하지 않았습니다.`); continue;
+        }
+        const key=m.type+'|'+upper(m.b);
+        if(!groups.has(key)) groups.set(key,{type:m.type,master:m.b,slaves:[]});
+        groups.get(key).slaves.push(m.a);
+      }
+      let n=0;
+      for(const g of groups.values()){
+        const mi=nodeRef(g.master);
+        if(!mi){ log.warn(`*MPC 기준절점 "${g.master}"을 찾지 못했습니다.`); continue; }
+        const ids=[...mi];
+        for(const s of g.slaves){ const v=nodeRef(s); if(v) ids.push(...v); }
+        if(addNRB('MPC_'+g.type+'_'+(++n),ids,mi[0])) {
+          if(g.type==='PIN'||g.type==='LINK')
+            log.warn(`*MPC ${g.type}는 병진만 구속하지만 강체 구속으로 바뀌어 회전까지 묶입니다.`);
+        }
+      }
+      if(n) cv.imap.push([`*MPC (${model.mpcs.length}행)`,'*CONSTRAINED_NODAL_RIGID_BODY']);
+    }
+
+    /* --- *COUPLING --- */
+    for(const cp of model.couplings){
+      const rn=nodeRef(cp.ref);
+      const S=buildSurf(cp.surf,0);
+      const ids=surfNodes(S);
+      if(!rn||!ids.length){ log.warn(`*COUPLING "${cp.name}"의 기준절점 또는 표면을 찾지 못했습니다.`); continue; }
+      if(cp.kind==='DISTRIBUTING'){
+        cv.interps.push({icid:cv.interps.length+1,dnid:rn[0],nodes:ids,title:cp.name});
+        cv.imap.push(['*COUPLING '+cp.name+' (distributing)','*CONSTRAINED_INTERPOLATION']);
+      }else{
+        if(addNRB('CPL_'+cp.name.replace(/\s+/g,'_'),ids.concat(rn),rn[0]))
+          cv.imap.push(['*COUPLING '+cp.name+' (kinematic)','*CONSTRAINED_NODAL_RIGID_BODY']);
+      }
+    }
+
+    /* --- *RIGID BODY --- */
+    for(const rb of model.rigidBodies){
+      const ids=[];
+      if(rb.elset){
+        const es=lookElset(rb.elset);
+        if(es) for(const e of es){ const info=elemInfo.get(e); if(info) ids.push(...info.c); }
+      }
+      for(const k of ['pin','tie']) if(rb[k]){ const v=lookNset(rb[k]); if(v) ids.push(...v); }
+      const rn=rb.ref?nodeRef(rb.ref):null;
+      if(rn) ids.push(...rn);
+      if(addNRB('RIGID_'+(rb.elset||rb.pin||rb.tie||'BODY'),ids,rn?rn[0]:0)){
+        cv.imap.push(['*RIGID BODY '+(rb.elset||''),'*CONSTRAINED_NODAL_RIGID_BODY']);
+        log.info('*RIGID BODY를 절점 강체로 바꿨습니다. 파트 전체가 강체라면 *MAT_RIGID가 더 낫습니다.');
+      }
+    }
+
+    /* --- *EQUATION --- */
+    for(const eq of model.equations){
+      const resolved=eq.terms.map(t=>({ids:nodeRef(t[0]),dof:t[1],coef:t[2]}));
+      if(resolved.some(r=>!r.ids)){ log.warn('*EQUATION의 절점 참조를 찾지 못해 건너뜁니다.'); continue; }
+      const n=Math.max(...resolved.map(r=>r.ids.length));
+      if(resolved.some(r=>r.ids.length!==1&&r.ids.length!==n))
+        log.warn('*EQUATION의 절점집합 크기가 서로 달라 일부만 변환했습니다.');
+      for(let k=0;k<n;k++){
+        const terms=resolved.map(r=>[r.ids.length===1?r.ids[0]:r.ids[k],r.dof,r.coef])
+                            .filter(t=>t[0]!==undefined);
+        if(terms.length<2) continue;
+        cv.lineq.push({lcid:cv.lineq.length+1,terms});
+      }
+    }
+    if(cv.lineq.length) cv.imap.push([`*EQUATION (${cv.lineq.length}개)`,'*CONSTRAINED_LINEAR_GLOBAL']);
+
+    if(cv.segsets.length) log.ok(`표면 ${cv.segsets.length}개를 *SET_SEGMENT로 만들었습니다.`);
+    if(cv.contacts.length) log.ok(`접촉 정의 ${cv.contacts.length}건을 변환했습니다.`);
+    if(cv.nrbs.length+cv.interps.length+cv.lineq.length)
+      log.ok(`구속 ${cv.nrbs.length+cv.interps.length+cv.lineq.length}건을 변환했습니다.`);
+  }
+
+  /* 경계조건 */
+  if(opt.bc){
+    const DOFMAP={ENCASTRE:[1,1,1,1,1,1],PINNED:[1,1,1,0,0,0],
+                  XSYMM:[1,0,0,0,1,1],YSYMM:[0,1,0,1,0,1],ZSYMM:[0,0,1,1,1,0],
+                  XASYMM:[0,1,1,1,0,0],YASYMM:[1,0,1,0,1,0],ZASYMM:[1,1,0,0,0,1]};
+    const agg=new Map();
+    for(const b of model.boundaries){
+      const sid=globalNsets.get(b.set);
+      if(!sid){ log.warn(`경계조건이 참조한 절점집합 "${b.set}"을 세트 목록에서 찾지 못했습니다.`); continue; }
+      let dof=agg.get(sid)||[0,0,0,0,0,0];
+      const t=(b.f[0]||'').toUpperCase();
+      if(DOFMAP[t]){ DOFMAP[t].forEach((v,i)=>{ if(v) dof[i]=1; }); }
+      else if(b.type&&DOFMAP[b.type]){ DOFMAP[b.type].forEach((v,i)=>{ if(v) dof[i]=1; }); }
+      else{
+        const d1=parseInt(b.f[0],10), d2=parseInt(b.f[1],10);
+        const mag=b.f.length>2?parseFloat(b.f[2]):0;
+        if(!isNaN(d1)){
+          const hi=isNaN(d2)?d1:d2;
+          for(let d=d1;d<=hi&&d<=6;d++) dof[d-1]=1;
+          if(mag) log.warn(`"${b.set}"의 강제변위(${mag})는 SPC로 옮길 수 없어 고정 조건으로만 넣었습니다.`);
+        }
+      }
+      agg.set(sid,dof);
+    }
+    for(const [sid,dof] of agg) cv.spcs.push({sid,dof});
+    if(cv.spcs.length) log.ok(`경계조건 ${cv.spcs.length}건을 *BOUNDARY_SPC_SET으로 변환했습니다.`);
+  }
+
+  /* 미변환 키워드 */
+  if(model.unsupported.size){
+    const list=[...model.unsupported.entries()].sort((a,b)=>b[1]-a[1]).slice(0,14)
+      .map(([k,v])=>`*${k}(${v})`).join(', ');
+    log.warn('변환하지 않은 키워드: '+list+(model.unsupported.size>14?' 외':''));
+  }
+
+  cv.typeCount=typeCount;
+  cv.counts={
+    node:cv.nodes.length, solid:cv.solids.length+cv.tet10s.length,
+    shell:cv.shells.length, beam:cv.beams.length, mass:cv.masses.length,
+    part:cv.parts.length, mat:cv.mats.length,
+    nset:cv.nsets.length, eset:cv.esets.length,
+    segset:cv.segsets.length, contact:cv.contacts.length,
+    constr:cv.nrbs.length+cv.interps.length+cv.lineq.length
+  };
+  if(maxNode>99999999) log.err('절점 ID가 8자리를 넘습니다. 고정포맷 카드에서 잘릴 수 있습니다.');
+  return cv;
+}
+
+/* ============================================================
+   .k 파일 작성
+   ============================================================ */
+function buildK(cv,opt,srcName){
+  const UD=UNIT_DEFAULT[opt.unit];
+  const O=[];
+  O.push('*KEYWORD');
+  O.push('*TITLE');
+  O.push('$#                                                                         title');
+  O.push((cv.title||'converted model').slice(0,80));
+  O.push('$');
+  O.push('$  Converted from Abaqus input deck: '+srcName);
+  O.push('$  Assumed unit system: '+UD.label);
+  O.push('$  Check materials, sections and contacts before running.');
+  O.push('$');
+
+  if(opt.ctrl){
+    O.push('*CONTROL_TERMINATION');
+    O.push('$#  endtim    endcyc     dtmin    endeng    endmas     nosol');
+    O.push(f10(UD.end)+i10(0)+f10(0)+f10(0)+f10(0)+i10(0));
+    O.push('*CONTROL_ENERGY');
+    O.push('$#    hgen      rwen    slnten     rylen     irgen');
+    O.push(i10(2)+i10(2)+i10(2)+i10(2)+i10(2));
+    O.push('*DATABASE_BINARY_D3PLOT');
+    O.push('$#      dt      lcdt      beam     npltc    psetid');
+    O.push(f10(UD.end/20)+i10(0)+i10(0)+i10(0)+i10(0));
+    O.push('*DATABASE_GLSTAT');
+    O.push('$#      dt    binary      lcur     ioopt');
+    O.push(f10(UD.end/100)+i10(0)+i10(0)+i10(1));
+  }
+
+  /* PART */
+  for(const p of cv.parts){
+    O.push('*PART');
+    O.push('$#                                                                         title');
+    O.push(p.title.slice(0,80));
+    O.push('$#     pid     secid       mid     eosid      hgid      grav    adpopt      tmid');
+    O.push(i10(p.pid)+i10(p.secid)+i10(p.mid)+i10(0)+i10(0)+i10(0)+i10(0)+i10(0));
+  }
+
+  /* SECTION */
+  for(const s of cv.sections){
+    if(s.kind==='solid'){
+      O.push('*SECTION_SOLID');
+      O.push('$#   secid    elform       aet');
+      O.push(i10(s.secid)+i10(s.elform)+i10(0));
+    }else if(s.kind==='shell'){
+      O.push('*SECTION_SHELL');
+      O.push('$#   secid    elform      shrf       nip     propt   qr/irid     icomp     setyp');
+      O.push(i10(s.secid)+i10(s.elform)+f10(0.8333)+i10(s.nip||5)+i10(1)+i10(0)+i10(0)+i10(1));
+      O.push('$#      t1        t2        t3        t4      nloc     marea      idof    edgset');
+      O.push(f10(s.t)+f10(s.t)+f10(s.t)+f10(s.t)+f10(0)+f10(0)+f10(0)+i10(0));
+    }else if(s.kind==='beam'){
+      O.push('*SECTION_BEAM');
+      O.push('$#   secid    elform      shrf   qr/irid       cst     scoor        nsm');
+      O.push(i10(s.secid)+i10(s.elform)+f10(1.0)+f10(2.0)+i10(s.shape==='CIRC'?1:0)+f10(0)+f10(0));
+      if(s.elform===3){
+        O.push('$#       a    rampt    stress');
+        O.push(f10(s.a||1)+f10(0)+f10(0));
+      }else{
+        O.push('$#     ts1       ts2       tt1       tt2     nsloc     ntloc');
+        const d1=s.d1||1;
+        const d2=(s.shape==='CIRC')?0:(s.d2||s.d1||1);
+        O.push(f10(d1)+f10(d1)+f10(d2)+f10(d2)+f10(0)+f10(0));
+      }
+    }else if(s.kind==='discrete'){
+      O.push('*SECTION_DISCRETE');
+      O.push('$#   secid       dro        kd        v0        cl        fd');
+      O.push(i10(s.secid)+i10(0)+f10(0)+f10(0)+f10(0)+f10(0));
+      O.push('$#     cdl        tdl');
+      O.push(f10(0)+f10(0));
+    }
+  }
+
+  /* MAT */
+  for(const m of cv.mats){
+    if(m.type==='plastic'){
+      O.push('*MAT_PIECEWISE_LINEAR_PLASTICITY_TITLE');
+      O.push(m.name.slice(0,80));
+      O.push('$#     mid        ro         e        pr      sigy      etan      fail      tdel');
+      O.push(i10(m.mid)+f10(m.rho)+f10(m.e)+f10(m.nu)+f10(m.sigy)+f10(0)+f10(1e21)+f10(0));
+      O.push('$#       c         p      lcss      lcsr        vp');
+      O.push(f10(0)+f10(0)+i10(m.lcss||0)+i10(0)+f10(0));
+      O.push('$#    eps1      eps2      eps3      eps4      eps5      eps6      eps7      eps8');
+      O.push(f10(0).repeat(8));
+      O.push('$#     es1       es2       es3       es4       es5       es6       es7       es8');
+      O.push(f10(0).repeat(8));
+    }else{
+      O.push('*MAT_ELASTIC_TITLE');
+      O.push(m.name.slice(0,80));
+      O.push('$#     mid        ro         e        pr        da        db  not used');
+      O.push(i10(m.mid)+f10(m.rho)+f10(m.e)+f10(m.nu)+f10(0)+f10(0)+i10(0));
+    }
+  }
+
+  /* CURVE */
+  for(const c of cv.curves){
+    O.push('*DEFINE_CURVE_TITLE');
+    O.push(c.name.slice(0,80));
+    O.push('$#    lcid      sidr       sfa       sfo      offa      offo    dattyp     lcint');
+    O.push(i10(c.lcid)+i10(0)+f10(1)+f10(1)+f10(0)+f10(0)+i10(0)+i10(0));
+    O.push('$#                a1                  o1');
+    for(const [x,y] of c.pts) O.push(f20(x)+f20(y));
+  }
+
+  /* NODE */
+  if(cv.nodes.length){
+    O.push('*NODE');
+    O.push('$#   nid               x               y               z      tc      rc');
+    for(const n of cv.nodes) O.push(i8(n[0])+f16(n[1])+f16(n[2])+f16(n[3])+pad(0,8)+pad(0,8));
+  }
+
+  /* ELEMENT_SOLID */
+  if(cv.solids.length){
+    O.push('*ELEMENT_SOLID');
+    O.push('$#   eid     pid      n1      n2      n3      n4      n5      n6      n7      n8');
+    for(const e of cv.solids) O.push(e.map(i8).join(''));
+  }
+  if(cv.tet10s.length){
+    O.push('*ELEMENT_SOLID_TET4TOTET10');
+    O.push('$#   eid     pid');
+    for(const e of cv.tet10s){
+      O.push(i8(e[0])+i8(e[1]));
+      O.push(e.slice(2).map(i8).join(''));
+    }
+  }
+  if(cv.shells.length){
+    O.push('*ELEMENT_SHELL');
+    O.push('$#   eid     pid      n1      n2      n3      n4');
+    for(const e of cv.shells) O.push(e.map(i8).join(''));
+  }
+  if(cv.beams.length){
+    O.push('*ELEMENT_BEAM');
+    O.push('$#   eid     pid      n1      n2      n3     rt1     rr1     rt2     rr2   local');
+    for(const e of cv.beams)
+      O.push(i8(e[0])+i8(e[1])+i8(e[2])+i8(e[3])+i8(e[4])+i8(0)+i8(0)+i8(0)+i8(0)+i8(2));
+  }
+  if(cv.masses.length){
+    O.push('*ELEMENT_MASS');
+    O.push('$#   eid     nid            mass     pid');
+    for(const e of cv.masses) O.push(i8(e[0])+i8(e[1])+f16(e[2])+i8(0));
+  }
+  if(cv.discretes.length){
+    O.push('*ELEMENT_DISCRETE');
+    O.push('$#   eid     pid      n1      n2     vid           s       pf      offset');
+    for(const e of cv.discretes)
+      O.push(i8(e[0])+i8(e[1])+i8(e[2])+i8(e[3])+i8(0)+f16(1.0)+i8(0)+f16(0));
+  }
+
+  /* SET */
+  const chunkOut=(ids,W)=>{
+    for(let i=0;i<ids.length;i+=8){
+      let s='';
+      for(let j=i;j<Math.min(i+8,ids.length);j++) s+=W(ids[j]);
+      O.push(s);
+    }
+  };
+  for(const s of cv.nsets){
+    O.push('*SET_NODE_LIST_TITLE');
+    O.push(s.name.slice(0,80));
+    O.push('$#     sid       da1       da2       da3       da4    solver');
+    O.push(i10(s.sid)+f10(0)+f10(0)+f10(0)+f10(0)+'      MECH');
+    chunkOut(s.ids,i10);
+  }
+  for(const s of cv.esets){
+    const kw=s.cat==='solid'?'*SET_SOLID_TITLE':(s.cat==='shell'?'*SET_SHELL_LIST_TITLE':'*SET_BEAM_TITLE');
+    O.push(kw);
+    O.push(s.name.slice(0,80));
+    O.push('$#     sid       da1       da2       da3       da4    solver');
+    O.push(i10(s.sid)+f10(0)+f10(0)+f10(0)+f10(0)+'      MECH');
+    chunkOut(s.ids,i10);
+  }
+
+  for(const s of cv.segsets){
+    O.push('*SET_SEGMENT_TITLE');
+    O.push(s.name.slice(0,80));
+    O.push('$#     sid       da1       da2       da3       da4    solver');
+    O.push(i10(s.sid)+f10(0)+f10(0)+f10(0)+f10(0)+'      MECH');
+    O.push('$#      n1        n2        n3        n4        a1        a2        a3        a4');
+    for(const g of s.segs) O.push(i10(g[0])+i10(g[1])+i10(g[2])+i10(g[3])+f10(0)+f10(0)+f10(0)+f10(0));
+  }
+
+  /* SPC */
+  for(const b of cv.spcs){
+    O.push('*BOUNDARY_SPC_SET');
+    O.push('$#    nsid       cid      dofx      dofy      dofz     dofrx     dofry     dofrz');
+    O.push(i10(b.sid)+i10(0)+b.dof.map(i10).join(''));
+  }
+
+  /* 구속 */
+  for(const r of cv.nrbs){
+    O.push('*CONSTRAINED_NODAL_RIGID_BODY_TITLE');
+    O.push(r.title.slice(0,80));
+    O.push('$#     pid       cid      nsid     pnode      iprt    drflag    rrflag');
+    O.push(i10(r.pid)+i10(0)+i10(r.nsid)+i10(r.pnode)+i10(0)+i10(0)+i10(0));
+  }
+  for(const p of cv.interps){
+    O.push('*CONSTRAINED_INTERPOLATION');
+    O.push('$#    icid      dnid      ddof      cidd      ityp     idnsw       fgm');
+    O.push(i10(p.icid)+i10(p.dnid)+i10(123456)+i10(0)+i10(0)+i10(0)+i10(0));
+    O.push('$#    inid      idof    twghtx    twghty    twghtz    rwghtx    rwghty    rwghtz');
+    for(const n of p.nodes)
+      O.push(i10(n)+i10(123)+f10(1)+f10(0)+f10(0)+f10(0)+f10(0)+f10(0));
+  }
+  for(const q of cv.lineq){
+    O.push('*CONSTRAINED_LINEAR_GLOBAL');
+    O.push('$#    lcid');
+    O.push(i10(q.lcid));
+    O.push('$#     nid       dof      coef');
+    for(const t of q.terms) O.push(i10(t[0])+i10(t[1])+f10(t[2]));
+  }
+
+  /* 접촉 */
+  for(const c of cv.contacts){
+    O.push('*CONTACT_'+c.kind);
+    O.push('$#     cid                                                               heading');
+    O.push(i10(c.cid)+c.title.slice(0,70));
+    O.push('$#    ssid      msid     sstyp     mstyp    sboxid    mboxid       spr       mpr');
+    O.push(i10(c.ssid)+i10(c.msid)+i10(c.sstyp)+i10(c.mstyp)+i10(0)+i10(0)+i10(1)+i10(1));
+    O.push('$#      fs        fd        dc        vc       vdc    penchk        bt        dt');
+    O.push(f10(c.fs)+f10(c.fd)+f10(0)+f10(0)+f10(20)+i10(0)+f10(0)+f10(1e20));
+    O.push('$#     sfs       sfm       sst       mst      sfst      sfmt       fsf       vsf');
+    O.push(f10(1)+f10(1)+f10(0)+f10(0)+f10(1)+f10(1)+f10(1)+f10(1));
+  }
+
+  O.push('*END');
+  return O.join('\n')+'\n';
+}
+
+/* ============================================================
+   UI
+   ============================================================ */
+const $=id=>document.getElementById(id);
+const FILES=new Map();          // KEY -> {key,name,text}
+let mainKey=null, userPicked=false, outText=null;
+
+function readText(f){
+  return new Promise(res=>{
+    const r=new FileReader();
+    r.onload=()=>res(r.result); r.onerror=()=>res('');
+    r.readAsText(f);
+  });
+}
+
+function walkEntry(entry,out){
+  return new Promise(res=>{
+    if(entry.isFile){ entry.file(f=>{out.push(f);res();},()=>res()); return; }
+    if(entry.isDirectory){
+      const rd=entry.createReader(), all=[];
+      const step=()=>rd.readEntries(async es=>{
+        if(!es.length){ for(const e of all) await walkEntry(e,out); res(); return; }
+        all.push(...es); step();
+      },()=>res());
+      step(); return;
+    }
+    res();
+  });
+}
+
+async function collect(dt){
+  const out=[];
+  if(dt.items&&dt.items.length&&dt.items[0].webkitGetAsEntry){
+    const entries=[];
+    for(const it of dt.items){ const e=it.webkitGetAsEntry(); if(e) entries.push(e); }
+    if(entries.length){ for(const e of entries) await walkEntry(e,out); return out; }
+  }
+  return [...dt.files];
+}
+
+async function addFiles(list){
+  for(const f of list){
+    if(f.size>200*1024*1024) continue;
+    const text=await readText(f);
+    if(!text) continue;
+    FILES.set(f.name.toUpperCase(),{key:f.name.toUpperCase(),name:f.name,text,size:f.size});
+  }
+  if(!userPicked||!FILES.has(mainKey)) mainKey=detectMain();
+  renderFiles();
+}
+
+function scoreMain(f){
+  let s=0;
+  if(/^\*heading/im.test(f.text)) s+=100;
+  if(/^\*(assembly|instance)\b/im.test(f.text)) s+=40;
+  if(/^\*(step|material)\b/im.test(f.text)) s+=25;
+  if(/^\*include\b/im.test(f.text)) s+=30;
+  if(/\.inp$/i.test(f.name)) s+=50;
+  return s;
+}
+function detectMain(){
+  const refd=new Set();
+  for(const f of FILES.values()) for(const r of includeRefs(f.text)) refd.add(r.key);
+  let cands=[...FILES.values()].filter(f=>!refd.has(f.key));
+  if(!cands.length) cands=[...FILES.values()];
+  cands.sort((a,b)=>scoreMain(b)-scoreMain(a)||b.size-a.size);
+  return cands.length?cands[0].key:null;
+}
+
+function renderFiles(){
+  const box=$('filelist');
+  if(!FILES.size){
+    box.classList.add('hidden'); box.innerHTML='';
+    $('run').disabled=true; return;
+  }
+  const refd=new Set(), missing=new Set();
+  for(const f of FILES.values()) for(const r of includeRefs(f.text)){
+    refd.add(r.key);
+    if(!FILES.has(r.key)) missing.add(r.raw);
+  }
+  let html='<div class="fhead">메인 덱을 고르면 그 파일의 *INCLUDE를 따라 나머지를 병합합니다</div>';
+  for(const f of FILES.values()){
+    const isMain=f.key===mainKey;
+    const role=isMain?'<span class="role main">메인 덱</span>'
+      :(refd.has(f.key)?'<span class="role">include</span>':'<span class="role un">미참조</span>');
+    html+=`<label class="fr"><input type="radio" name="mainpick" value="${escapeHtml(f.key)}" ${isMain?'checked':''}>`
+        + `<span class="nm">${escapeHtml(f.name)}</span>`
+        + `<span class="sz">${(f.size/1024).toFixed(0)} KB</span>${role}</label>`;
+  }
+  for(const m of missing)
+    html+=`<div class="fr"><span style="width:13px"></span><span class="nm">${escapeHtml(m)}</span><span class="role miss">없음</span></div>`;
+  box.innerHTML=html;
+  box.classList.remove('hidden');
+  box.querySelectorAll('input[name=mainpick]').forEach(r=>{
+    r.addEventListener('change',()=>{ mainKey=r.value; userPicked=true; renderFiles(); });
+  });
+  $('run').disabled=!mainKey;
+  $('dl').disabled=true;
+  $('resSec').classList.add('hidden');
+}
+
+$('drop').addEventListener('click',()=>$('file').click());
+$('drop').addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();$('file').click();} });
+$('file').addEventListener('change',e=>{ addFiles([...e.target.files]); $('file').value=''; });
+['dragenter','dragover'].forEach(ev=>$('drop').addEventListener(ev,e=>{e.preventDefault();$('drop').classList.add('hot');}));
+['dragleave','drop'].forEach(ev=>$('drop').addEventListener(ev,e=>{e.preventDefault();$('drop').classList.remove('hot');}));
+$('drop').addEventListener('drop',async e=>{
+  e.preventDefault();
+  const files=await collect(e.dataTransfer);
+  addFiles(files);
+});
+$('clear').addEventListener('click',()=>{
+  FILES.clear(); mainKey=null; userPicked=false; outText=null;
+  renderFiles();
+  $('dl').disabled=true;
+  $('resSec').classList.add('hidden');
+});
+
+$('run').addEventListener('click',()=>{
+  const main=FILES.get(mainKey);
+  if(!main) return;
+  const t0=performance.now();
+  const log=newLog();
+  const ex=expandIncludes(main.text,FILES,log,[],null);
+  const fileText=ex.lines.join('\n');
+  const fileName=main.name;
+  if(ex.stats.merged)
+    log.ok(`*INCLUDE ${ex.stats.merged}개 파일을 병합했습니다 (총 ${ex.lines.length.toLocaleString()}줄).`);
+  const unused=[...FILES.keys()].filter(k=>k!==mainKey&&!ex.stats.used.has(k));
+  if(unused.length) log.info('병합에 쓰이지 않은 파일: '+unused.map(k=>FILES.get(k).name).join(', '));
+  const opt={
+    sets:$('optSets').checked, mat:$('optMat').checked, bc:$('optBC').checked,
+    ctrl:$('optCtrl').checked, tet10:$('optTet10').checked,
+    beamNode:$('optBeamNode').checked, contact:$('optContact').checked,
+    mu:parseFloat($('inpMu').value)||0,
+    shell:$('selShell').value, unit:$('selUnit').value
+  };
+  let cv;
+  try{
+    const model=parseInp(fileText,log);
+    log.info(`파트 ${Math.max(0,model.parts.size-1)}개, 인스턴스 ${model.instances.length}개, 재료 ${model.materials.size}개를 읽었습니다.`);
+    cv=convert(model,opt,log);
+    outText=buildK(cv,opt,fileName);
+    log.ok(`변환 완료 · ${outText.split('\n').length.toLocaleString()}줄`);
+  }catch(err){
+    log.err('변환 중 오류: '+err.message);
+    console.error(err);
+    cv=cv||{counts:{},typeCount:new Map()};
+    outText=null;
+  }
+  render(cv,log,performance.now()-t0);
+});
+
+function render(cv,log,ms){
+  $('resSec').classList.remove('hidden');
+  $('elapsed').textContent=ms.toFixed(0)+' ms';
+
+  const C=cv.counts||{};
+  const cards=[['절점',C.node],['솔리드',C.solid],['쉘',C.shell],['보',C.beam],
+               ['PART',C.part],['재료',C.mat],['세그먼트세트',C.segset],
+               ['접촉',C.contact],['구속',C.constr]];
+  $('stats').innerHTML=cards.map(([k,v])=>
+    `<div class="stat"><div class="v">${(v||0).toLocaleString()}</div><div class="k">${k}</div></div>`).join('');
+
+  const rows=[];
+  const tc=cv.typeCount||new Map();
+  [...tc.entries()].sort((a,b)=>b[1]-a[1]).forEach(([k,n])=>{
+    const [src,sub]=k.split('|');
+    const dst = sub==='?' ? '<span style="color:var(--red)">변환 안 됨</span>' : (DYNA_KEYWORD[sub]||sub);
+    rows.push(`<tr><td class="src">${src}</td><td class="gut">&rarr;</td><td class="dst">${dst}</td><td class="cnt">${n.toLocaleString()}</td></tr>`);
+  });
+  $('mapBody').innerHTML=rows.length?rows.join(''):'<tr><td colspan="4">인식된 요소가 없습니다.</td></tr>';
+
+  const im=(cv.imap||[]);
+  if(im.length){
+    const seen=new Map();
+    for(const [s,d] of im){ const k=s+'||'+d; seen.set(k,(seen.get(k)||0)+1); }
+    $('imapBody').innerHTML=[...seen.entries()].map(([k,n])=>{
+      const [s,d]=k.split('||');
+      return `<tr><td class="src">${escapeHtml(s)}</td><td class="gut">&rarr;</td><td class="dst">${escapeHtml(d)}</td><td class="cnt">${n}</td></tr>`;
+    }).join('');
+    $('imapHead').classList.remove('hidden');
+  }else{
+    $('imapBody').innerHTML=''; $('imapHead').classList.add('hidden');
+  }
+
+  const tags={info:'note',ok:'ok',warn:'warn',err:'error'};
+  $('log').innerHTML=log.items.map(it=>
+    `<div class="${it.lv}"><span class="tag">${tags[it.lv]}</span><span>${escapeHtml(it.m)}</span></div>`).join('');
+  const nw=log.items.filter(i=>i.lv==='warn').length, ne=log.items.filter(i=>i.lv==='err').length;
+  $('logCount').textContent=`경고 ${nw} · 오류 ${ne}`;
+
+  if(outText){
+    const lines=outText.split('\n');
+    $('prev').textContent=lines.slice(0,400).join('\n')+(lines.length>400?'\n\n... 이하 '+(lines.length-400).toLocaleString()+'줄 생략':'');
+    $('dl').disabled=false;
+  }else{
+    $('prev').textContent='(출력 없음)';
+    $('dl').disabled=true;
+  }
+  $('resSec').scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+$('dl').addEventListener('click',()=>{
+  if(!outText) return;
+  const src=FILES.get(mainKey);
+  const base=((src&&src.name)||'model').replace(/\.[^.]+$/,'');
+  const blob=new Blob([outText],{type:'text/plain'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=base+'.k';
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},500);
+});
+
+/* 예제 모델 — 메인 덱 + include 블록 */
+const SAMPLE_MAIN=`*Heading
+Battery module demo - two cells on a tray
+**
+** 메쉬는 별도 블록 파일에 있습니다
+*Include, input=cell_mesh.blk
+**
+*Assembly, name=Assembly
+*Instance, name=CELL-1, part=CELL
+*End Instance
+*Instance, name=CELL-2, part=CELL
+15., 0., 0.
+*End Instance
+*Instance, name=TRAY-1, part=TRAY
+*End Instance
+*Nset, nset=FIXED, instance=TRAY-1
+1, 2, 3, 4
+*Nset, nset=REF, instance=TRAY-1
+1
+*Surface, type=ELEMENT, name=TRAY_TOP
+TRAY-1.TRAY_ALL, SPOS
+*Surface, type=ELEMENT, name=CELL1_BOT
+CELL-1.CELL_ALL, S1
+*Surface, type=ELEMENT, name=CELL2_BOT
+CELL-2.CELL_ALL, S1
+*End Assembly
+**
+*Tie, name=Tie-1
+CELL1_BOT, TRAY_TOP
+**
+*Surface Interaction, name=IntProp-1
+*Friction
+0.15
+*Contact Pair, interaction=IntProp-1, type=SURFACE TO SURFACE
+CELL2_BOT, TRAY_TOP
+**
+*Mpc
+BEAM, CELL-1.BOTTOM, REF
+**
+*Equation
+2
+CELL-2.BOTTOM, 1, 1.0, REF, 1, -1.0
+**
+*Include, input=materials.inc
+**
+*Step, name=Drop
+*Dynamic, Explicit
+, 0.02
+*Boundary
+FIXED, ENCASTRE
+*End Step
+`;
+
+const SAMPLE_MESH=`*Part, name=CELL
+*Node
+1,  0.,  0.,  0.
+2, 10.,  0.,  0.
+3, 10., 10.,  0.
+4,  0., 10.,  0.
+5,  0.,  0., 20.
+6, 10.,  0., 20.
+7, 10., 10., 20.
+8,  0., 10., 20.
+*Element, type=C3D8R
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*Elset, elset=CELL_ALL, generate
+1, 1, 1
+*Nset, nset=BOTTOM
+1, 2, 3, 4
+*Solid Section, elset=CELL_ALL, material=CELL_JELLYROLL
+,
+*End Part
+**
+*Part, name=TRAY
+*Node
+1,  -5.,  -5., -2.
+2,  35.,  -5., -2.
+3,  35.,  25., -2.
+4,  -5.,  25., -2.
+*Element, type=S4R
+1, 1, 2, 3, 4
+*Elset, elset=TRAY_ALL, generate
+1, 1, 1
+*Nset, nset=TRAY_EDGE, generate
+1, 4, 1
+*Shell Section, elset=TRAY_ALL, material=AL6061
+1.5, 5
+*End Part
+`;
+
+const SAMPLE_MAT=`*Material, name=CELL_JELLYROLL
+*Density
+2.2e-09,
+*Elastic
+5000., 0.3
+**
+*Material, name=AL6061
+*Density
+2.7e-09,
+*Elastic
+70000., 0.33
+*Plastic
+270., 0.
+310., 0.02
+340., 0.08
+`;
+
+$('sample').addEventListener('click',()=>{
+  FILES.clear();
+  const put=(n,t)=>FILES.set(n.toUpperCase(),{key:n.toUpperCase(),name:n,text:t,size:t.length});
+  put('battery_module_demo.inp',SAMPLE_MAIN);
+  put('cell_mesh.blk',SAMPLE_MESH);
+  put('materials.inc',SAMPLE_MAT);
+  userPicked=false;
+  mainKey=detectMain();
+  renderFiles();
+});
+</script>
+</body>
+</html>
