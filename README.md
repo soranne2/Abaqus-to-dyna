@@ -1,1 +1,0 @@
-# Abaqus-to-dyna
