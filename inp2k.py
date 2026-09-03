@@ -41,6 +41,16 @@ v1.3:
 - Final SET order: explicit NSET/ELSET (source order), source SURFACE sets
   (source order), derived contact/constraint sets. Reassign SIDs and update
   all contact/SPC/NRB references after ordering. Member order is unchanged.
+
+v1.4:
+- One PART/SECTION per source property and instance, regardless of mesh shape.
+  Mixed solid shapes use ELFORM 1; mixed shell shapes use one quad-compatible
+  formulation. Original material, thickness and SET ordering are retained.
+- Exactly two shared hourglass definitions: HGID 1 for shells, HGID 2 for solids.
+  All shell/solid PARTs reference these, including fully integrated elements.
+- Support C3D5 pyramids, repeat apex IDs in all eight solid node slots, correct
+  tetrahedral degeneration, and check solid node references before writing.
+- Use one installed Korean-capable sans-serif family throughout the GUI.
 """
 
 import os
@@ -69,24 +79,24 @@ except Exception:                                    # pragma: no cover
     pd = None
     HAVE_PANDAS = False
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
 FOAM_DEFAULT_TC = 0.55
 
-# Per-part initial hourglass settings: (IHQ, QM, QB/VDC, QW).
+# Shared initial hourglass settings: (IHQ, QM, QB/VDC, QW).
 # None leaves the corresponding fixed-width field blank (solver default).
 # Sources: https://lsdyna.ansys.com/hourglass/
 # https://lsdyna.ansys.com/negative-volumes-in-brick-elements/
 # Card layout: Ansys PyDYNA auto/hourglass/hourglass.py.
 HOURGLASS_DEFAULTS = {
-    "shell_2": (4, 0.03, 0.03, 0.03),
-    "shell_16": (8, 0.10, 0.10, 0.10),
-    "solid_1_elastic": (6, 1.00, None, None),
-    "solid_1_plastic": (6, 0.10, None, None),
-    "solid_1_foam57": (6, 0.10, None, None),
+    "shell": (4, 0.03, 0.03, 0.03),
+    "solid": (6, 0.10, None, None),
 }
+# IHQ 8 is specific to shell ELFORM 16. With one shared shell card, use IHQ 4
+# for reduced-integration shells; fully integrated shells do not need it.
+# HGID assignment does not force an inactive hourglass mode to become active.
 
 
 def name_key(value):
@@ -132,6 +142,8 @@ def classify(t):
         r = dict(cat="solid", sub="hex8", nn=8, red="8R" in u)
     elif u.startswith(("C3D6", "SC6", "COH3D6", "DC3D6")):
         r = dict(cat="solid", sub="wedge6", nn=6)
+    elif u.startswith(("C3D5", "DC3D5")):
+        r = dict(cat="solid", sub="pyramid5", nn=5)
     elif u.startswith(("C3D4", "DC3D4")):
         r = dict(cat="solid", sub="tet4", nn=4)
     elif u.startswith(("S8", "S9")):
@@ -166,8 +178,9 @@ def classify(t):
 DYNA_KEYWORD = {
     "hex8": "*ELEMENT_SOLID (8절점)",
     "wedge6": "*ELEMENT_SOLID (축약 6면체)",
+    "pyramid5": "*ELEMENT_SOLID (5절점 피라미드)",
     "tet4": "*ELEMENT_SOLID (축약 4면체)",
-    "tet10": "*ELEMENT_SOLID_TET4TOTET10",
+    "tet10": "*ELEMENT_SOLID (10절점 또는 코너 4절점)",
     "hex20": "*ELEMENT_SOLID (코너 8절점만)",
     "wedge15": "*ELEMENT_SOLID (코너 6절점만)",
     "quad4": "*ELEMENT_SHELL",
@@ -193,6 +206,9 @@ FACE = {
 FACE["hex20"] = FACE["hex8"]
 FACE["tet10"] = FACE["tet4"]
 FACE["wedge15"] = FACE["wedge6"]
+# Abaqus C3D5 S1..S5 labels, with outward normals for positive volume.
+FACE["pyramid5"] = {"S1": (0, 3, 2, 1), "S2": (0, 1, 4),
+                    "S3": (1, 2, 4), "S4": (2, 3, 4), "S5": (3, 0, 4)}
 
 # Segment connectivity uses outward normals for standard positive-volume
 # Abaqus solid connectivity. Face labels themselves are unchanged.
@@ -1166,7 +1182,6 @@ class Converter:
         self.set_output = []
         self._set_source_order = None
         self.hourglasses = []
-        self.part_subtypes = {}
         self.contacts = []
         self.section_hits = {}
 
@@ -1327,6 +1342,15 @@ class Converter:
             self.inst_part_of[key] = base.name
             if no or eo:
                 self.log.info('인스턴스 "%s": 절점 +%d, 요소 +%d offset' % (key, no, eo))
+        # Validate against nodes actually emitted, rather than a min/max range.
+        if HAVE_NUMPY:
+            node_blocks = [ids + ctx["nOff"] for ctx in self.contexts.values()
+                           for ids, _ in ctx["P"].nblocks if len(ids)]
+            self._solid_node_ids = (np.unique(np.concatenate(node_blocks))
+                                    if node_blocks else np.empty(0, np.int64))
+        else:
+            self._solid_node_ids = {int(n) + ctx["nOff"] for ctx in self.contexts.values()
+                                    for ids, _ in ctx["P"].nblocks for n in ids}
         for kind, records in (("nsets", self.m.asm_nsets), ("elsets", self.m.asm_elsets)):
             for rec in records:
                 self.asm_defs[kind].setdefault(rec["name"], []).append(rec)
@@ -1464,33 +1488,19 @@ class Converter:
         self._sid = len(self.set_output)
 
     def assign_hourglasses(self):
-        """Each applicable PART receives its own HGID, equal to its PID."""
+        """Keep two stable shared IDs, independent of part count and ordering."""
         sections = {s["secid"]: s for s in self.sections}
-        mats = {m["mid"]: m for m in self.mats}
-        self.hourglasses = []
+        self.hourglasses = [dict(hgid=hgid, ihq=values[0], qm=values[1],
+                                 qb=values[2], qw=values[3],
+                                 title="HG_" + kind.upper(), rule=kind)
+                            for hgid, kind in ((1, "shell"), (2, "solid"))
+                            for values in [HOURGLASS_DEFAULTS[kind]]]
+        n = 0
         for p in self.parts:
-            p["hgid"] = 0
-            section = sections[p["secid"]]
-            kind, elform = section.get("kind"), section.get("elform")
-            shapes = self.part_subtypes.get(p["pid"], set())
-            rule = None
-            if kind == "shell" and shapes & {"quad4", "quad8"}:
-                if elform in (2, 16):
-                    rule = "shell_%d" % elform
-            elif (kind == "solid" and elform == 1
-                  and shapes & {"hex8", "hex20", "wedge6", "wedge15"}):
-                rule = "solid_1_" + mats[p["mid"]]["type"]
-            if rule not in HOURGLASS_DEFAULTS:
-                continue
-            ihq, qm, qb, qw = HOURGLASS_DEFAULTS[rule]
-            p["hgid"] = p["pid"]
-            self.hourglasses.append(dict(hgid=p["hgid"], ihq=ihq, qm=qm,
-                                         qb=qb, qw=qw, title="HG_" + p["title"], rule=rule))
-        if self.hourglasses:
-            self.log.ok("쉘/솔리드 PART %d개에 *HOURGLASS 및 HGID를 연결했습니다."
-                        % len(self.hourglasses))
-            self.log.info("Hourglass 기본값은 준정적·저속 구조해석용 초기값입니다. "
-                          "실제 해석의 hourglass 에너지와 강성 민감도를 확인하세요.")
+            p["hgid"] = {"shell": 1, "solid": 2}.get(sections[p["secid"]].get("kind"), 0)
+            n += bool(p["hgid"])
+        self.log.ok("공통 *HOURGLASS 2개 생성: 쉘 HGID=1, 솔리드 HGID=2 · PART %d개 연결" % n)
+        self.log.info("Hourglass는 준정적·저속 해석용 초기값이며, 실제 작동 여부는 요소 적분 공식에 따릅니다.")
 
     def emit_source_sets(self):
         """Emit first definitions in original interleaved order, including surfaces."""
@@ -1707,7 +1717,7 @@ class Converter:
             wanted = ("shell" if sec["type"] in ("SHELL SECTION", "SHELL GENERAL SECTION", "MEMBRANE SECTION")
                       else "beam" if sec["type"] in ("BEAM SECTION", "BEAM GENERAL SECTION", "TRUSS SECTION")
                       else "solid")
-            groups = {}
+            classes, hit_all = [], []
             for bi, blk in enumerate(P.eblocks):
                 cls = classify(blk["type"])
                 if not cls or cls["cat"] != wanted:
@@ -1716,27 +1726,23 @@ class Converter:
                 hit = gi[(gi >= start) & (gi < end)] if HAVE_NUMPY and isinstance(gi, np.ndarray) else [g for g in gi if start <= g < end]
                 if not len(hit):
                     continue
-                signature = (cls["cat"], cls["sub"], cls["red"], cls["truss"])
-                if signature not in groups:
-                    groups[signature] = (cls, [])
-                groups[signature][1].extend(int(g) for g in hit)
-            for cls, hit in groups.values():
+                classes.append(cls)
+                hit_all.extend(int(g) for g in hit)
+            if hit_all:
                 self.sec_seq += 1
                 self.pid_seq += 1
                 secid, pid = self.sec_seq, self.pid_seq
                 mid = self.get_mid(sec["material"]) if opt["mat"] else self.get_mid("")
                 title = (inst["name"] + "_" if inst["name"] else "") + sec["elset"]
-                if len(groups) > 1:
-                    title += "_" + cls["sub"].upper() + ("R" if cls["red"] else "")
-                S = self.make_section(secid, cls, sec)
+                S = self.make_property_section(secid, classes, sec)
                 self.sections.append(S)
                 sec_of_pid[pid] = S
                 self.parts.append(dict(pid=pid, secid=secid, mid=mid, title=title))
-                self.section_hits[id(sec)] = self.section_hits.get(id(sec), 0) + len(hit)
+                self.section_hits[id(sec)] = self.section_hits.get(id(sec), 0) + len(hit_all)
                 if HAVE_NUMPY and isinstance(pid_all, np.ndarray):
-                    pid_all[hit] = pid
+                    pid_all[hit_all] = pid
                 else:
-                    for g in hit:
+                    for g in hit_all:
                         pid_all[g] = pid
 
         seg_eids = set()
@@ -1755,6 +1761,30 @@ class Converter:
                    + self.counts["beam"] + self.counts["mass"] + self.counts["disc"])
             self._tick(len(blk["ids"]), "요소 %s" % f"{tot:,}")
 
+    def make_property_section(self, secid, classes, sec):
+        """Select one compatible section for all shapes in a source property."""
+        cat = classes[0]["cat"]
+        cls = classes[0]
+        if cat == "shell":
+            quads = [c for c in classes if c["sub"] in ("quad4", "quad8")]
+            # A triangle encountered first must not choose the quad formulation.
+            cls = next((c for c in quads if c["red"]), quads[0] if quads else cls)
+        S = self.make_section(secid, cls, sec)
+        if cat == "solid":
+            subs = {c["sub"] for c in classes}
+            keep_tet10 = self.opt["tet10"] and subs == {"tet10"}
+            forms = {self.make_section(secid, c, sec)["elform"] for c in classes}
+            S["elform"] = 16 if keep_tet10 else (next(iter(forms)) if len(forms) == 1 else 1)
+            if len(subs) > 1:
+                S["elform"] = 1
+            if self.opt["tet10"] and "tet10" in subs and not keep_tet10:
+                self.log.warn('프로퍼티 "%s": 다른 솔리드 형상과 공통 PART를 유지하기 위해 '
+                              'C3D10을 코너 4절점으로 축약합니다.' % sec["elset"])
+        if len({(c["sub"], c["red"]) for c in classes}) > 1:
+            self.log.info('프로퍼티 "%s": 혼합 요소를 하나의 PART/SECTION(ELFORM=%s)에 연결합니다.'
+                          % (sec["elset"], S.get("elform", "-")))
+        return S
+
     def make_section(self, secid, cls, sec):
         opt = self.opt
         S = dict(secid=secid, cat=cls["cat"])
@@ -1762,7 +1792,7 @@ class Converter:
             S["kind"] = "solid"
             if cls["sub"] == "tet10" and opt["tet10"]:
                 S["elform"] = 16
-            elif cls["sub"] in ("tet4", "wedge6"):
+            elif cls["sub"] in ("tet4", "tet10", "pyramid5", "wedge6", "wedge15"):
                 S["elform"] = 1
             else:
                 S["elform"] = 1 if cls["red"] else 2
@@ -1880,6 +1910,82 @@ class Converter:
                     self.node_coord[n] = (p[0], p[1], p[2])
             fh.write(("\n".join(out) + "\n").encode("latin-1"))
 
+    def normalize_solid_conn(self, blk):
+        """Normalize only recognizable collapsed-brick padding, before offsets.
+
+        A zero placeholder must never become a seemingly real node after adding
+        an instance offset. Missing base/corner nodes are errors, not padding.
+        """
+        cls = classify(blk["type"])
+        sub, conn, ids = cls["sub"], blk["conn"], blk["ids"]
+        required = {"hex20": 8, "wedge15": 6,
+                    "tet10": 10 if self.opt["tet10"] else 4}.get(sub, cls["nn"])
+        is_array = HAVE_NUMPY and isinstance(conn, np.ndarray)
+        widths = {conn.shape[1]} if is_array else {len(row) for row in conn}
+        if sub == "hex8" and widths == {5}:
+            # Some preprocessors export a collapsed C3D8 using five entries.
+            conn = (np.column_stack([conn] + [conn[:, 4]] * 3) if is_array
+                    else [list(row) + [row[4]] * 3 for row in conn])
+            widths = {8}
+        if any(w < required for w in widths):
+            k = 0 if is_array else next(k for k, row in enumerate(conn) if len(row) < required)
+            raise ValueError("*ELEMENT %s EID=%s: 코너/필수 절점 %d개가 필요합니다."
+                             % (blk["type"], int(ids[k]), required))
+        # Only output corners are needed for higher-order shapes being reduced.
+        conn = conn[:, :required] if is_array else [row[:required] for row in conn]
+        if sub == "hex8":
+            repaired = 0
+            if is_array:
+                candidates = np.flatnonzero((conn[:, 5:] == 0).any(axis=1))
+                if len(candidates):
+                    conn = conn.copy()
+                for k in candidates:
+                    row = conn[k]
+                    if (all(x > 0 for x in row[:5]) and len(set(row[:5])) == 5
+                            and all(x in (0, row[4]) for x in row[5:])):
+                        conn[k, 5:] = row[4]
+                        repaired += 1
+            else:
+                for row in conn:
+                    if (0 in row[5:] and all(x > 0 for x in row[:5])
+                            and len(set(row[:5])) == 5
+                            and all(x in (0, row[4]) for x in row[5:])):
+                        row[5:] = [row[4]] * 3
+                        repaired += 1
+            if repaired:
+                self.log.info("피라미드형 C3D8 %d개: 빈 N6~N8을 apex N5로 연결했습니다." % repaired)
+        # Check zero/negative IDs locally, before any instance offset is applied.
+        if is_array:
+            bad = conn <= 0
+            if bad.any():
+                k, j = np.unravel_index(bad.argmax(), bad.shape)
+                raise ValueError("*ELEMENT %s EID=%s: invalid node id %s (N%d)."
+                                 % (blk["type"], int(ids[k]), int(conn[k, j]), j + 1))
+        else:
+            for k, row in enumerate(conn):
+                for j, value in enumerate(row):
+                    if value <= 0:
+                        raise ValueError("*ELEMENT %s EID=%s: invalid node id %s (N%d)."
+                                         % (blk["type"], ids[k], value, j + 1))
+        return conn
+
+    def validate_solid_nodes(self, eid, cn, elem_type):
+        """Reject unresolved node references with an actionable element ID."""
+        if HAVE_NUMPY and isinstance(cn, np.ndarray):
+            for start in range(0, len(eid), 200000):
+                block = cn[start:start + 200000]
+                bad = ~np.isin(block, self._solid_node_ids)
+                if bad.any():
+                    k, j = np.unravel_index(bad.argmax(), bad.shape)
+                    raise ValueError("*ELEMENT %s EID=%s: invalid node id %s (N%d), *NODE 정의 없음."
+                                     % (elem_type, int(eid[start + k]), int(block[k, j]), j + 1))
+        else:
+            for k, row in enumerate(cn):
+                for j, value in enumerate(row):
+                    if value not in self._solid_node_ids:
+                        raise ValueError("*ELEMENT %s EID=%s: invalid node id %s (N%d), *NODE 정의 없음."
+                                         % (elem_type, eid[k], value, j + 1))
+
     # ---------- 요소 블록 쓰기 ----------
     def write_block(self, blk, pid_arr, sec_of_pid, fallback, n_off, e_off,
                     seg_eids, P):
@@ -1893,6 +1999,8 @@ class Converter:
         if cls is None:
             return
         cat, sub = cls["cat"], cls["sub"]
+        if cat == "solid":
+            conn = self.normalize_solid_conn(blk)
 
         # PID 결정
         if cat in ("mass", "inertia"):
@@ -1904,11 +2012,6 @@ class Converter:
                 pid_arr = _fill_zero(pid_arr, fb)
 
         # 접촉면용 연결 정보
-        if cat in ("solid", "shell"):
-            pids = (np.unique(pid_arr) if HAVE_NUMPY and isinstance(pid_arr, np.ndarray)
-                    else set(pid_arr))
-            for pid in pids:
-                self.part_subtypes.setdefault(int(pid), set()).add(sub)
         if seg_eids and cat in ("solid", "shell"):
             for k in range(n):
                 eid0 = int(ids[k])
@@ -1922,19 +2025,22 @@ class Converter:
         cn = _add(conn, n_off)
 
         if cat == "solid":
+            self.validate_solid_nodes(eid, cn, t)
             f = self._tmp("solid")
             if sub in ("hex8", "hex20"):
                 cols = [0, 1, 2, 3, 4, 5, 6, 7]
+            elif sub == "pyramid5":
+                cols = [0, 1, 2, 3, 4, 4, 4, 4]
             elif sub in ("wedge6", "wedge15"):
                 cols = [0, 1, 2, 2, 3, 4, 5, 5]
             elif sub == "tet4":
-                cols = [0, 1, 2, 2, 3, 3, 3, 3]
+                cols = [0, 1, 2, 3, 3, 3, 3, 3]
             elif sub == "tet10":
                 if self.opt["tet10"]:
-                    self.write_tet10(eid, pid_arr, cn)
+                    self.write_tet10(eid, pid_arr, cn, sec_of_pid)
                     self.counts["solid"] += n
                     return
-                cols = [0, 1, 2, 2, 3, 3, 3, 3]
+                cols = [0, 1, 2, 3, 3, 3, 3, 3]
             else:
                 return
             self.write_ints(f, [eid, pid_arr] + [_col(cn, c) for c in cols], 8)
@@ -1973,13 +2079,24 @@ class Converter:
                 out.append("".join(str(int(c[k])).rjust(w) for c in cols))
             fh.write(("\n".join(out) + "\n").encode("latin-1"))
 
-    def write_tet10(self, eid, pid, cn):
+    def write_tet10(self, eid, pid, cn, sec_of_pid):
         f = self._tmp("tet10")
-        out = []
+        out, linear = [], []
         for k in range(len(eid)):
-            out.append(i8(int(_at(eid, k))) + i8(int(_at(pid, k))))
-            out.append("".join(i8(int(_at2(cn, k, j))) for j in range(10)))
-        f.write(("\n".join(out) + "\n").encode("latin-1"))
+            p = int(_at(pid, k))
+            header = i8(int(_at(eid, k))) + i8(p)
+            if sec_of_pid[p]["elform"] == 16:
+                out.append(header)
+                # Abaqus edge 3-1 is node 7; LS-DYNA puts it in slot 10.
+                out.append("".join(i8(int(_at2(cn, k, j)))
+                                   for j in (0, 1, 2, 3, 4, 5, 7, 8, 9, 6)))
+            else:
+                linear.append(header + "".join(i8(int(_at2(cn, k, j)))
+                                               for j in (0, 1, 2, 3, 3, 3, 3, 3)))
+        if out:
+            f.write(("\n".join(out) + "\n").encode("latin-1"))
+        if linear:
+            self._tmp("solid").write(("\n".join(linear) + "\n").encode("latin-1"))
 
     def write_beams(self, eid, pid, cn, cls, sec_of_pid):
         f = self._tmp("beam")
@@ -2064,6 +2181,11 @@ class Converter:
         try:
             s = [c[i] for i in idx]
         except IndexError:
+            return None
+        # A collapsed brick has triangular faces and may have a zero-area face.
+        # Preserve face labels and orientation, but never emit line/point sets.
+        s = ordered_unique(s)
+        if len(s) < 3:
             return None
         if len(s) == 3:
             s.append(s[2])
@@ -2679,7 +2801,7 @@ def write_k(cv, opt, out_path, src_name, progress=None):
                   "$#   nid               x               y               z      tc      rc"])
     dump("solid", ["*ELEMENT_SOLID",
                    "$#   eid     pid      n1      n2      n3      n4      n5      n6      n7      n8"])
-    dump("tet10", ["*ELEMENT_SOLID_TET4TOTET10", "$#   eid     pid"])
+    dump("tet10", ["*ELEMENT_SOLID", "$#   eid     pid", "$# next row: n1..n10"])
     dump("shell", ["*ELEMENT_SHELL",
                    "$#   eid     pid      n1      n2      n3      n4"])
     dump("beam", ["*ELEMENT_BEAM",
@@ -2845,16 +2967,19 @@ PALETTE = dict(
 )
 
 
-def _pick_font(cands, default):
+def _pick_font(cands, default, root=None):
     try:
         import tkinter.font as tkfont
-        fams = set(f.lower() for f in tkfont.families())
+        fams = set(f.lower() for f in tkfont.families(root=root))
         for c in cands:
             if c.lower() in fams:
                 return c
     except Exception:
         pass
-    return default
+    try:
+        return tkfont.nametofont(default, root=root).actual("family")
+    except Exception:
+        return default
 
 
 def round_rect(cv, x1, y1, x2, y2, r, **kw):
@@ -3064,18 +3189,22 @@ def run_gui():
         return 1
 
     P = PALETTE
-    ui = _pick_font(["Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR",
-                     "Segoe UI", "Helvetica Neue"], "TkDefaultFont")
-    mn = _pick_font(["Cascadia Mono", "JetBrains Mono", "Consolas", "SF Mono",
-                     "Menlo", "DejaVu Sans Mono"], "TkFixedFont")
+    root = tk.Tk()
+    ui = _pick_font(["Pretendard", "Noto Sans KR", "Noto Sans CJK KR",
+                     "Malgun Gothic", "맑은 고딕", "Apple SD Gothic Neo",
+                     "Segoe UI", "Helvetica Neue"], "TkDefaultFont", root)
+    # Labels, entries, file paths, numbers and log all use one font family.
+    import tkinter.font as tkfont
+    for font_name in tkfont.names(root=root):
+        tkfont.nametofont(font_name, root=root).configure(family=ui)
+    root.option_add("*Font", (ui, 10))
     F_H1 = (ui, 19, "bold")
     F_LB = (ui, 11)
     F_SM = (ui, 9)
     F_HD = (ui, 9, "bold")
-    F_MN = (mn, 9)
+    F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root = tk.Tk()
     root.title("INP2K  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
@@ -3154,7 +3283,7 @@ def run_gui():
     c1.pack(fill="x", pady=(14, 0))
     pathvar = tk.StringVar(value="선택된 파일이 없습니다")
     outvar = tk.StringVar(value="")
-    tk.Label(f1, textvariable=pathvar, bg=P["card"], fg=P["text"], font=F_MN,
+    tk.Label(f1, textvariable=pathvar, bg=P["card"], fg=P["text"], font=F_BODY,
              anchor="w").pack(fill="x")
 
     def pick():
@@ -3182,7 +3311,7 @@ def run_gui():
     RButton(r1, "파일 선택", pick, kind="ghost", w=104, h=34, font=F_LB).pack(side="left")
     tk.Label(r1, text="출력", bg=P["card"], fg=P["faint"],
              font=F_SM).pack(side="left", padx=(16, 6))
-    oe = tk.Entry(r1, textvariable=outvar, font=F_MN, bg=P["card2"], fg=P["text"],
+    oe = tk.Entry(r1, textvariable=outvar, font=F_BODY, bg=P["card2"], fg=P["text"],
                   insertbackground=P["text"], relief="flat", bd=0,
                   highlightthickness=1, highlightbackground=P["line"],
                   highlightcolor=P["accent"])
@@ -3197,7 +3326,7 @@ def run_gui():
              ("mat", "재료·단면", "MAT / SECTION"),
              ("bc", "경계조건", "BOUNDARY_SPC_SET"),
              ("contact", "접촉·구속", "CONTACT / CONSTRAINED"),
-             ("tet10", "2차 사면체 유지", "C3D10 → TET4TOTET10"),
+             ("tet10", "2차 사면체 유지", "C3D10 전용 프로퍼티에 적용"),
              ("beamNode", "보 방향절점", "단면 n1로 자동 생성")]
     grid = tk.Frame(f2, bg=P["card"])
     grid.pack(fill="x")
@@ -3223,7 +3352,7 @@ def run_gui():
     tk.Label(r2, text="마찰계수", bg=P["card"], fg=P["faint"],
              font=F_SM).pack(side="left", padx=(20, 8))
     muvar = tk.StringVar(value="0.2")
-    tk.Entry(r2, textvariable=muvar, width=6, font=F_MN, bg=P["card2"], fg=P["text"],
+    tk.Entry(r2, textvariable=muvar, width=6, font=F_BODY, bg=P["card2"], fg=P["text"],
              insertbackground=P["text"], relief="flat", bd=0, justify="center",
              highlightthickness=1, highlightbackground=P["line"],
              highlightcolor=P["accent"]).pack(side="left", ipady=5)
@@ -3257,7 +3386,7 @@ def run_gui():
     # ---------- 로그 ----------
     c4, f4 = card(wrap, "로그", F_HD)
     c4.pack(fill="both", expand=True, pady=(14, 0))
-    txt = tk.Text(f4, font=F_MN, wrap="word", bg=P["card"], fg=P["text"],
+    txt = tk.Text(f4, font=F_BODY, wrap="word", bg=P["card"], fg=P["text"],
                   relief="flat", bd=0, highlightthickness=0, height=13,
                   insertbackground=P["text"], spacing1=1, spacing3=1)
     sb = tk.Scrollbar(f4, command=txt.yview, relief="flat", bd=0,
@@ -3515,7 +3644,7 @@ def main():
     ap.add_argument("--no-sets", action="store_true", help="세트 출력 안 함")
     ap.add_argument("--no-contact", action="store_true", help="접촉·구속 변환 안 함")
     ap.add_argument("--no-ctrl", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--tet10", action="store_true", help="C3D10을 2차 사면체로 유지")
+    ap.add_argument("--tet10", action="store_true", help="C3D10 전용 프로퍼티에서 2차 사면체 유지 (혼합 프로퍼티는 코너 축약)")
     ap.add_argument("--shell", default="auto", choices=["auto", "2", "16"])
     ap.add_argument("--unit", default="mmts", choices=list(UNIT_DEFAULT))
     ap.add_argument("--mu", type=float, default=0.2, help="기본 마찰계수")
