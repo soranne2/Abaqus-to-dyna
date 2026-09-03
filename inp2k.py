@@ -8,6 +8,20 @@ CLI:  python inp2k.py model.inp -o model.k --no-sets
 
 numpy가 있으면 절점/요소 블록을 통째로 벡터 처리한다(수 배 빠름).
 없으면 순수 파이썬 경로로 동작한다.
+
+v1.1 (based on soranne2/Abaqus-to-dyna, b00caa28):
+- Repeated ELSET chunks and part/instance/assembly section references resolve
+  before PID assignment; missing INCLUDE files are explicit errors.
+- HYPERFOAM -> MAT_LOW_DENSITY_FOAM (57): E=1, TC=0.55; UNIAXIAL TEST DATA
+  supplies a compression nominal strain/stress DEFINE_CURVE linked by LCID.
+  Coefficients alone or non-uniaxial tables cannot supply this curve.
+- NSET, ELSET and SURFACE cards follow first appearance after INCLUDE expansion.
+  Repeated definitions merge at their first position. Per-part sets/surfaces
+  expand in instance order. Member order is preserved; derived constraint sets
+  follow source sets. SET IDs are newly allocated in this order.
+- Every mesh surface is exported, even without a contact. NODE surfaces only
+  yield segments where all corner nodes of an exterior mesh face are present.
+  Unsupported analytical/edge surfaces are reported, never replaced by S1.
 """
 
 import os
@@ -36,7 +50,24 @@ except Exception:                                    # pragma: no cover
     pd = None
     HAVE_PANDAS = False
 
-VERSION = "1.0"
+VERSION = "1.1"
+
+# User-requested defaults. Values use the input deck's stress unit.
+FOAM_DEFAULT_E = 1.0
+FOAM_DEFAULT_TC = 0.55
+
+
+def name_key(value):
+    return str(value or "").strip().strip("\"'").upper()
+
+
+def abaqus_float(value):
+    return float(str(value).replace("D", "E").replace("d", "e"))
+
+
+def ordered_unique(values):
+    """Keep the first occurrence; never numerically sort an input set."""
+    return list(dict.fromkeys(values))
 
 # ============================================================
 # 단위계 기본값 (재료 정보가 없을 때 채워 넣는 값)
@@ -130,6 +161,13 @@ FACE = {
 FACE["hex20"] = FACE["hex8"]
 FACE["tet10"] = FACE["tet4"]
 FACE["wedge15"] = FACE["wedge6"]
+
+# Segment connectivity uses outward normals for standard positive-volume
+# Abaqus solid connectivity. Face labels themselves are unchanged.
+FACE["hex8"].update(S1=(0, 3, 2, 1), S2=(4, 5, 6, 7), S3=(0, 1, 5, 4),
+                    S4=(1, 2, 6, 5), S5=(2, 3, 7, 6), S6=(3, 0, 4, 7))
+FACE["wedge6"].update(S1=(0, 2, 1), S2=(3, 4, 5))
+FACE["tet4"].update(S1=(0, 2, 1), S2=(0, 1, 3), S3=(1, 2, 3), S4=(2, 0, 3))
 
 UNSUPPORTED_QUIET = {
     "STEP", "END STEP", "DYNAMIC", "STATIC", "OUTPUT", "NODE OUTPUT",
@@ -301,6 +339,7 @@ def scan_file(path):
     """('kw', str) / ('data', bytes) 이벤트를 순서대로 yield.
     데이터 블록은 바이트 그대로 넘겨 디코딩 비용을 없앤다."""
     carry = b""
+    pending_kw = None
     with open(path, "rb") as fh:
         while True:
             raw = fh.read(CHUNK)
@@ -313,42 +352,52 @@ def scan_file(path):
                 carry = raw
                 continue
             carry = raw[cut + 1:]
-            for ev in _scan_bytes(raw[:cut + 1]):
-                yield ev
+            for kind, payload in _scan_bytes(raw[:cut + 1]):
+                if pending_kw is not None:
+                    if kind == "kw" and payload.startswith("**"):
+                        continue
+                    if kind == "data":
+                        while pending_kw.rstrip().endswith(",") and payload:
+                            first, sep, rest = payload.partition(b"\n")
+                            s = first.decode("latin-1").strip()
+                            # Keyword continuations contain parameters, not the
+                            # first numeric data row after a trailing comma.
+                            if not re.match(r"^[A-Za-z][A-Za-z0-9 _-]*(?:\s*=|\s*,|\s*$)", s):
+                                break
+                            pending_kw += s
+                            payload = rest if sep else b""
+                        if not payload and pending_kw.rstrip().endswith(","):
+                            continue
+                    yield ("kw", pending_kw)
+                    pending_kw = None
+                if kind == "kw" and not payload.startswith("**") and payload.rstrip().endswith(","):
+                    pending_kw = payload
+                elif payload:
+                    yield kind, payload
     if carry.strip():
-        for ev in _scan_bytes(carry + b"\n"):
-            yield ev
+        for kind, payload in _scan_bytes(carry + b"\n"):
+            if pending_kw is not None:
+                if kind == "data" and re.match(rb"^[ \t]*[A-Za-z][A-Za-z0-9 _-]*=", payload):
+                    pending_kw += payload.decode("latin-1").strip()
+                    payload = b""
+                yield "kw", pending_kw
+                pending_kw = None
+            if payload:
+                yield kind, payload
+    if pending_kw is not None:
+        yield "kw", pending_kw
 
 
 def _scan_bytes(buf):
     pos = 0
-    n = len(buf)
-    star = 0x2A          # '*'
-    while pos < n:
-        if buf[pos] == star:
-            end = buf.find(b"\n", pos)
-            if end < 0:
-                end = n
-            line = buf[pos:end].decode("latin-1").rstrip()
-            while line.endswith(",") and end < n:
-                nend = buf.find(b"\n", end + 1)
-                if nend < 0:
-                    nend = n
-                nxt = buf[end + 1:nend].decode("latin-1").strip()
-                if nxt.startswith("*"):
-                    break
-                line += nxt
-                end = nend
-            yield ("kw", line)
-            pos = end + 1
-        else:
-            idx = buf.find(b"\n*", pos)
-            if idx < 0:
-                yield ("data", buf[pos:])
-                pos = n
-            else:
-                yield ("data", buf[pos:idx + 1])
-                pos = idx + 1
+    # Abaqus accepts leading whitespace before keyword lines.
+    for match in re.finditer(rb"(?m)^[ \t]*\*[^\n]*(?:\n|$)", buf):
+        if match.start() > pos:
+            yield "data", buf[pos:match.start()]
+        yield "kw", match.group().decode("latin-1").strip()
+        pos = match.end()
+    if pos < len(buf):
+        yield "data", buf[pos:]
 
 
 def parse_keyword(line):
@@ -369,7 +418,8 @@ def parse_keyword(line):
 # ============================================================
 # 수치 블록 파싱
 # ============================================================
-_TBL = {ord(" "): None, ord("\t"): None, ord("\r"): None}
+_TBL = {ord(" "): None, ord("\t"): None, ord("\r"): None,
+        ord("D"): "E", ord("d"): "e"}
 
 
 def piece_to_flat(b, hint=0):
@@ -468,6 +518,7 @@ class Model:
         self.rigid_bodies = []
         self.general_contact = False
         self.el_types = set()
+        self.set_defs = []  # Interleaved NSET/ELSET/SURFACE source order.
 
 
 # ============================================================
@@ -508,6 +559,16 @@ class Parser:
         self.pend_type = ""
         self.pend_nset = None
         self.pend_elset = None
+        self.in_assembly = False
+        self.set_seen = set()
+        self.cur_test = None
+
+    def remember_set(self, kind, name, part=None, surface=None):
+        key = (kind, id(part) if part is not None else None, name_key(name))
+        if key not in self.set_seen:
+            self.set_seen.add(key)
+            self.m.set_defs.append(dict(kind=kind, name=name_key(name),
+                                       part=part, surface=surface))
 
     # ---- 대상 파트 ----
     def tgt(self):
@@ -551,7 +612,8 @@ class Parser:
         self.pieces = []
         if not txt.strip():
             return
-        txt = txt.replace(",\n", ",")
+        # A trailing comma is an empty field, not a continuation of the next
+        # material/test/section record. Sets accept each physical line too.
         for line in txt.split("\n"):
             line = line.strip()
             if line:
@@ -633,7 +695,11 @@ class Parser:
         m = self.m
         self.mode = None
 
-        if kw == "HEADING":
+        if kw == "ASSEMBLY":
+            self.in_assembly = True
+        elif kw == "END ASSEMBLY":
+            self.in_assembly = False
+        elif kw == "HEADING":
             self.mode = "HEADING"
         elif kw == "PART":
             nm = (p.get("NAME") or ("PART%d" % len(m.parts))).upper()
@@ -656,8 +722,9 @@ class Parser:
             self.pend_part = self.tgt()
             self.pend_nset = None
             if p.get("NSET"):
-                self.pend_nset = []
-                self.pend_part.nsets[p["NSET"].upper()] = self.pend_nset
+                nm = name_key(p["NSET"])
+                self.pend_nset = self.pend_part.nsets.setdefault(nm, [])
+                self.remember_set("nsets", nm, self.pend_part)
         elif kw == "ELEMENT":
             self.mode = "ELEMENT"
             self.el_type = (p.get("TYPE") or "").upper()
@@ -666,28 +733,43 @@ class Parser:
             m.el_types.add(self.el_type)
             self.pend_elset = None
             if p.get("ELSET"):
-                self.pend_elset = []
-                self.pend_part.elsets[p["ELSET"].upper()] = self.pend_elset
+                nm = name_key(p["ELSET"])
+                self.pend_elset = self.pend_part.elsets.setdefault(nm, [])
+                self.remember_set("elsets", nm, self.pend_part)
         elif kw in ("NSET", "ELSET"):
             is_node = kw == "NSET"
             nm = ((p.get("NSET") if is_node else p.get("ELSET")) or "UNNAMED").upper()
             self.set_gen = bool(p.get("GENERATE"))
             self.set_arr = []
-            if p.get("INSTANCE"):
-                rec = dict(name=nm, instance=p["INSTANCE"].upper(), ids=self.set_arr)
+            if p.get("INSTANCE") or (self.in_assembly and not self.cur_inst):
+                rec = dict(name=nm, instance=name_key(p.get("INSTANCE")), ids=self.set_arr)
                 (m.asm_nsets if is_node else m.asm_elsets).append(rec)
+                self.remember_set("nsets" if is_node else "elsets", nm)
             else:
                 d = self.tgt().nsets if is_node else self.tgt().elsets
                 if nm in d:
                     self.set_arr = d[nm]
                 else:
                     d[nm] = self.set_arr
+                self.remember_set("nsets" if is_node else "elsets", nm, self.tgt())
             self.mode = "SET"
         elif kw == "MATERIAL":
             nm = (p.get("NAME") or "MAT%d" % len(m.materials)).upper()
             self.cur_mat = dict(name=p.get("NAME") or nm, density=None,
-                                e=None, nu=None, plastic=[])
+                                e=None, nu=None, plastic=[], hyperfoam=False,
+                                tests=[], hyperfoam_data=[])
             m.materials[nm] = self.cur_mat
+        elif kw == "HYPERFOAM":
+            if self.cur_mat is not None:
+                self.cur_mat["hyperfoam"] = True
+                self.cur_mat["hyperfoam_params"] = dict(p)
+            self.mode = "HYPERFOAM"
+        elif kw in ("UNIAXIAL TEST DATA", "BIAXIAL TEST DATA", "PLANAR TEST DATA",
+                    "VOLUMETRIC TEST DATA", "SIMPLE SHEAR TEST DATA"):
+            self.cur_test = dict(kind=kw, params=dict(p), rows=[])
+            if self.cur_mat is not None:
+                self.cur_mat["tests"].append(self.cur_test)
+            self.mode = "TESTDATA"
         elif kw in ("DENSITY", "ELASTIC", "PLASTIC"):
             self.mode = kw
         elif kw in SECTION_KW:
@@ -707,8 +789,11 @@ class Parser:
                      else (self.cur_part.name if self.cur_part is not self.root else "__ASM__"))
             self.cur_surf = dict(name=(p.get("NAME") or "SURF%d" % len(m.surfaces)).upper(),
                                  stype=(p.get("TYPE") or "ELEMENT").upper(),
-                                 owner=owner, rows=[])
+                                 owner=owner, rows=[], part=(self.tgt() if
+                                     self.cur_inst or self.cur_part is not self.root else None))
             m.surfaces.append(self.cur_surf)
+            self.remember_set("surface", self.cur_surf["name"],
+                              self.cur_surf["part"], self.cur_surf)
             self.mode = "SURFACE"
         elif kw == "SURFACE INTERACTION":
             self.cur_inter = dict(name=(p.get("NAME") or "").upper(), fs=None)
@@ -759,7 +844,7 @@ class Parser:
 
     # ---- 일반 데이터 줄 ----
     def data_line(self, line):
-        F = [x.strip() for x in line.split(",")]
+        F = [x.strip().strip("\"'") for x in line.split(",")]
         mode = self.mode
         m = self.m
         if mode == "HEADING":
@@ -798,30 +883,39 @@ class Parser:
         elif mode == "DENSITY":
             if self.cur_mat:
                 try:
-                    self.cur_mat["density"] = float(F[0])
+                    self.cur_mat["density"] = abaqus_float(F[0])
                 except (ValueError, IndexError):
                     pass
         elif mode == "ELASTIC":
             if self.cur_mat and self.cur_mat["e"] is None:
                 try:
-                    self.cur_mat["e"] = float(F[0])
-                    self.cur_mat["nu"] = float(F[1])
+                    self.cur_mat["e"] = abaqus_float(F[0])
+                    self.cur_mat["nu"] = abaqus_float(F[1])
                 except (ValueError, IndexError):
                     pass
         elif mode == "PLASTIC":
             if self.cur_mat:
                 try:
-                    sy = float(F[0])
-                    ep = float(F[1]) if len(F) > 1 and F[1] else 0.0
+                    sy = abaqus_float(F[0])
+                    ep = abaqus_float(F[1]) if len(F) > 1 and F[1] else 0.0
                     self.cur_mat["plastic"].append((ep, sy))
                 except (ValueError, IndexError):
                     pass
+        elif mode in ("TESTDATA", "HYPERFOAM"):
+            try:
+                row = [abaqus_float(x) for x in F if x]
+            except ValueError:
+                raise ValueError("잘못된 %s 수치 데이터: %s" % (mode, line))
+            if mode == "TESTDATA" and self.cur_test is not None:
+                self.cur_test["rows"].append(row)
+            elif self.cur_mat is not None:
+                self.cur_mat["hyperfoam_data"].append(row)
         elif mode == "SECTION":
             if self.cur_section is not None:
                 self.cur_section["data"].append(F)
         elif mode == "MASSVAL":
             try:
-                self.tgt().massvals[self.mass_elset] = float(F[0])
+                self.tgt().massvals[self.mass_elset] = abaqus_float(F[0])
             except (ValueError, IndexError):
                 pass
         elif mode == "BOUNDARY":
@@ -833,7 +927,7 @@ class Parser:
         elif mode == "FRICTION":
             if self.cur_inter and self.cur_inter["fs"] is None:
                 try:
-                    self.cur_inter["fs"] = float(F[0])
+                    self.cur_inter["fs"] = abaqus_float(F[0])
                 except (ValueError, IndexError):
                     pass
         elif mode == "CONTACTPAIR":
@@ -859,7 +953,7 @@ class Parser:
                 while k + 2 < len(F) and len(self.cur_eq["terms"]) < self.eq_need:
                     try:
                         self.cur_eq["terms"].append(
-                            (F[k], int(F[k + 1]), float(F[k + 2])))
+                            (F[k], int(F[k + 1]), abaqus_float(F[k + 2])))
                     except ValueError:
                         pass
                     k += 3
@@ -917,15 +1011,17 @@ def read_deck(path, parser, log, progress=None):
                 if not ref:
                     log.warn("*INCLUDE 경로를 읽지 못했습니다.")
                     continue
-                target = resolve_include(ref, base_dir, cache, log)
+                target = resolve_include(ref, os.path.dirname(os.path.abspath(fp)),
+                                         cache.setdefault(os.path.dirname(os.path.abspath(fp)), {}), log)
+                if not target:
+                    target = resolve_include(ref, base_dir, cache, log)
                 if not target:
                     stats["missing"].append(ref)
-                    log.err("*INCLUDE 파일을 찾지 못했습니다: %s" % ref)
-                    continue
+                    raise FileNotFoundError("*INCLUDE 파일을 찾지 못했습니다: %s (기준: %s)"
+                                            % (ref, os.path.dirname(os.path.abspath(fp))))
                 key = os.path.normcase(os.path.abspath(target))
                 if key in stack or depth > 12:
-                    log.err("*INCLUDE 순환 참조를 끊었습니다: %s" % ref)
-                    continue
+                    raise ValueError("*INCLUDE 순환 참조 또는 중첩 한도 초과: " + ref)
                 parser.flush()
                 stats["total"] += os.path.getsize(target)
                 log.ok("*INCLUDE 병합: %s (%.1f MB)"
@@ -1024,6 +1120,19 @@ class Converter:
         self.global_nsets = {}
 
         self.tmp = {}
+        self.contexts = {}
+        self.asm_defs = {"nsets": {}, "elsets": {}}
+        self._resolved = {}
+        self._resolve_warnings = set()
+        self._surf_cache = {}
+        self._surface_defs = {}
+        self._seg_sid = {}
+        self._node_sid = {}
+        self._element_sid = {}
+        self._sid = 0
+        self.set_output = []
+        self.contacts = []
+        self.section_hits = {}
 
     # ---------- 임시 파일 ----------
     def _tmp(self, key):
@@ -1055,7 +1164,17 @@ class Converter:
                 self.log.warn('재료 "%s"에 밀도가 없어 기본값을 넣었습니다.' % mat["name"])
             e = UD["e"] if mat["e"] is None else mat["e"]
             nu = UD["nu"] if mat["nu"] is None else mat["nu"]
-            if mat["plastic"]:
+            if mat.get("hyperfoam"):
+                pts = self.foam_curve(mat)
+                lcid = len(self.curves) + 1
+                self.curves.append(dict(lcid=lcid,
+                                        name=mat["name"] + "_COMPRESSION", pts=pts))
+                self.mats.append(dict(mid=mid, type="foam57", name=mat["name"],
+                                      rho=rho, e=FOAM_DEFAULT_E, tc=FOAM_DEFAULT_TC,
+                                      lcid=lcid))
+                self.log.ok('HYPERFOAM "%s" → MAT57, E=%g, TC=%g, LCID=%d (%d점)'
+                            % (mat["name"], FOAM_DEFAULT_E, FOAM_DEFAULT_TC, lcid, len(pts)))
+            elif mat["plastic"]:
                 lcid = 0
                 if len(mat["plastic"]) > 1:
                     lcid = len(self.curves) + 1
@@ -1070,6 +1189,58 @@ class Converter:
                                       rho=rho, e=e, nu=nu))
         self.mid_of[key] = mid
         return mid
+
+    def foam_curve(self, mat):
+        """Abaqus nominal stress,strain -> MAT57 compression strain,stress.
+
+        Abaqus: SIMACAEKEYRefMap/simakey-r-uniaxialtestdata.htm.
+        MAT57: Ansys PyDYNA MatLowDensityFoam (LCID is nominal stress/strain).
+        No coefficient fitting, true-stress conversion, or smoothing is done.
+        """
+        tests = [t for t in mat.get("tests", []) if t["kind"] == "UNIAXIAL TEST DATA"]
+        rows = []
+        for t in tests:
+            if name_key(t["params"].get("DIRECTION")) == "TENSION":
+                self.log.warn('HYPERFOAM "%s": 인장 시험표는 MAT57 압축 LCID에서 제외합니다.' % mat["name"])
+                continue
+            rows.extend(t["rows"])
+        if not rows or any(len(r) < 2 for r in rows):
+            raise ValueError('HYPERFOAM "%s": MAT57에 연결할 *UNIAXIAL TEST DATA '
+                             '(nominal stress, nominal strain)가 필요합니다.' % mat["name"])
+        if any(not math.isfinite(v) for r in rows for v in r[:2]):
+            raise ValueError('HYPERFOAM "%s": 시험표에 비유한 수치가 있습니다.' % mat["name"])
+        # Signed Abaqus compression is negative. Do not fold a tension branch
+        # onto compression when both branches are supplied.
+        has_negative_strain = any(r[1] < 0 for r in rows)
+        if has_negative_strain:
+            if any(r[1] > 0 for r in rows):
+                self.log.warn('HYPERFOAM "%s": 압축 분기만 LCID에 연결합니다.' % mat["name"])
+            rows = [r for r in rows if r[1] <= 0]
+        else:
+            self.log.warn('HYPERFOAM "%s": 양수 시험값을 압축 크기로 해석합니다. '
+                          '입력 표가 압축 시험인지 확인하세요.' % mat["name"])
+        pairs = {}
+        for r in rows:
+            stress, strain = r[:2]
+            if strain * stress < 0:
+                raise ValueError('HYPERFOAM "%s": 응력·변형률 부호가 서로 다릅니다.' % mat["name"])
+            x, y = abs(strain), abs(stress)
+            if not 0 <= x < 1:
+                raise ValueError('HYPERFOAM "%s": 압축 nominal strain은 0 이상 1 미만이어야 합니다.' % mat["name"])
+            if x in pairs and not math.isclose(pairs[x], y, rel_tol=1e-9, abs_tol=1e-12):
+                raise ValueError('HYPERFOAM "%s": 같은 변형률에 다른 응력이 있습니다. '
+                                 '단일 압축 loading curve가 필요합니다.' % mat["name"])
+            pairs[x] = y
+        if not any(x > 0 for x in pairs):
+            raise ValueError('HYPERFOAM "%s": 유효한 압축 시험점이 없습니다.' % mat["name"])
+        if 0.0 not in pairs:
+            pairs[0.0] = 0.0
+            self.log.info('HYPERFOAM "%s": LCID 원점 (0,0)을 추가했습니다.' % mat["name"])
+        if any(t["kind"] != "UNIAXIAL TEST DATA" for t in mat.get("tests", [])):
+            self.log.warn('HYPERFOAM "%s": 이축·체적·전단 시험표는 MAT57 단축 압축곡선에 합치지 않습니다.' % mat["name"])
+        if any(len(r) > 2 and r[2] != 0 for r in rows):
+            self.log.warn('HYPERFOAM "%s": 횡변형률은 MAT57 LCID에 포함되지 않습니다.' % mat["name"])
+        return sorted(pairs.items())
 
     # ---------- 세트 해석 ----------
     @staticmethod
@@ -1090,6 +1261,257 @@ class Converter:
         if self.progress and self.done_items >= self._next_tick:
             self._next_tick = self.done_items + 100000
             self.progress(self.done_items, max(self.total_items, 1), label)
+
+    def prepare_contexts(self, instances):
+        """Resolve scopes before assigning sections or generating surface cards."""
+        root = self.m.parts["__ROOT__"]
+        if root.nblocks and not any(i["partName"] == "__ROOT__" for i in instances):
+            instances.insert(0, dict(name="", partName="__ROOT__", t=[0, 0, 0],
+                                     rot=None, part=Part("L"), dataN=0))
+        for inst in instances:
+            base = self.m.parts.get(inst["partName"])
+            if base is None:
+                self.log.warn('인스턴스 "%s"의 파트가 없습니다.' % inst["name"])
+                continue
+            P = merge_parts(base, inst["part"])
+            key = name_key(inst["name"])
+            if key in self.contexts:
+                raise ValueError("중복 인스턴스 이름: " + key)
+            ns = [b[0] for b in P.nblocks if len(b[0])]
+            es = [b["ids"] for b in P.eblocks if len(b["ids"])]
+            nmin = min((int(_amin(a)) for a in ns), default=1)
+            emin = min((int(_amin(a)) for a in es), default=1)
+            no = self.max_node if ns and nmin <= self.max_node else 0
+            eo = self.max_elem if es and emin <= self.max_elem else 0
+            self.max_node = max(self.max_node, max((int(_amax(a)) + no for a in ns), default=0))
+            self.max_elem = max(self.max_elem, max((int(_amax(a)) + eo for a in es), default=0))
+            self.contexts[key] = dict(inst=inst, base=base, P=P, index=EidIndex(P),
+                                      nOff=no, eOff=eo)
+            self.inst_maps[key] = dict(nOff=no, eOff=eo, nsets={}, elsets={})
+            self.inst_part_of[key] = base.name
+            if no or eo:
+                self.log.info('인스턴스 "%s": 절점 +%d, 요소 +%d offset' % (key, no, eo))
+        for kind, records in (("nsets", self.m.asm_nsets), ("elsets", self.m.asm_elsets)):
+            for rec in records:
+                self.asm_defs[kind].setdefault(rec["name"], []).append(rec)
+            # Flat/global definitions following an assembly can contain I.SET
+            # or I.123 references, and may be used by root-level sections.
+            if "" not in self.contexts:
+                for nm, ids in getattr(root, kind).items():
+                    self.asm_defs[kind].setdefault(nm, []).append(dict(name=nm, instance="", ids=ids))
+        for surf in self.m.surfaces:
+            for ref, pref in self.surface_bindings(surf):
+                self._surface_defs[ref] = (surf, pref)
+        self._needed_elements = set()
+        self._need_all_surface_elements = any(s["stype"] == "NODE" for s in self.m.surfaces)
+        for ref, (surf, pref) in self._surface_defs.items():
+            if surf["stype"] == "ELEMENT":
+                for row, _ in surf["rows"]:
+                    self._needed_elements.update(self.resolve_ids("elsets", row, pref))
+        if self.opt["contact"]:
+            for rb in self.m.rigid_bodies:
+                self._needed_elements.update(self.resolve_ids("elsets", rb["elset"]))
+
+    def surface_bindings(self, surf):
+        part = surf.get("part")
+        if part is None:
+            return [(surf["name"], None)]
+        return [((key + "." if key else "") + surf["name"], key)
+                for key, ctx in self.contexts.items()
+                if part is ctx["base"] or part is ctx["inst"]["part"]]
+
+    def resolve_ids(self, kind, ref, pref=None, active=None):
+        R = name_key(ref)
+        pref = name_key(pref) if pref is not None else None
+        local = self.contexts.get(pref)
+        # Millions of node/element IDs must not each create a cache entry.
+        try:
+            numeric = int(R)
+        except ValueError:
+            numeric = None
+        if numeric is not None:
+            numeric_ctx = local if local is not None else self.contexts.get("")
+            off = numeric_ctx["nOff" if kind == "nsets" else "eOff"] if numeric_ctx else 0
+            return [numeric + off]
+        token = (kind, pref, R)
+        if token in self._resolved:
+            return self._resolved[token]
+        active = set() if active is None else active
+        if token in active:
+            raise ValueError("세트 순환 참조: %s / %s" % (pref or "ASSEMBLY", R))
+        active = active | {token}
+        values = []
+        if local is not None and R in getattr(local["P"], kind):
+            offset = local["nOff" if kind == "nsets" else "eOff"]
+            for v in getattr(local["P"], kind)[R]:
+                if isinstance(v, int):
+                    values.append(v + offset)
+                else:
+                    values.extend(self.resolve_ids(kind, v, pref, active))
+        elif R in self.asm_defs[kind]:
+            for rec in self.asm_defs[kind][R]:
+                owner = rec["instance"] or None
+                if owner is not None and owner not in self.contexts:
+                    if token not in self._resolve_warnings:
+                        self._resolve_warnings.add(token)
+                        self.log.warn('세트 "%s"가 없는 인스턴스 "%s"를 참조합니다.' % (R, owner))
+                    continue
+                owner_ctx = self.contexts.get(owner) or self.contexts.get("")
+                off = owner_ctx["nOff" if kind == "nsets" else "eOff"] if owner_ctx else 0
+                for v in rec["ids"]:
+                    if isinstance(v, int):
+                        values.append(v + off)
+                    else:
+                        values.extend(self.resolve_ids(kind, v, owner, active))
+        else:
+            prefix = next((key for key in sorted(self.contexts, key=len, reverse=True)
+                           if key and R.startswith(key + ".")), None)
+            if prefix is not None:
+                values = self.resolve_ids(kind, R[len(prefix) + 1:], prefix, active)
+            else:
+                try:
+                    n = int(R)
+                except ValueError:
+                    n = None
+                if n is not None:
+                    if local is not None:
+                        values = [n + local["nOff" if kind == "nsets" else "eOff"]]
+                    elif "" in self.contexts:
+                        values = [n + self.contexts[""]["nOff" if kind == "nsets" else "eOff"]]
+                    else:
+                        values = [n]
+                elif pref is None:
+                    matches = [key for key, ctx in self.contexts.items() if R in getattr(ctx["P"], kind)]
+                    if len(matches) == 1:
+                        values = self.resolve_ids(kind, R, matches[0], active)
+                    elif len(matches) > 1 and token not in self._resolve_warnings:
+                        self._resolve_warnings.add(token)
+                        self.log.warn('세트 "%s"가 여러 인스턴스에 있습니다. INSTANCE.SET 참조가 필요합니다.' % R)
+        values = ordered_unique(values)
+        self._resolved[token] = values
+        return values
+
+    def append_set(self, kind, record):
+        self._sid += 1
+        record["sid"] = self._sid
+        record["kind"] = kind
+        self.set_output.append(record)
+        (self.nsets if kind == "node" else self.segsets if kind == "segment" else self.esets).append(record)
+        return record["sid"]
+
+    def emit_source_sets(self):
+        """Emit first definitions in original interleaved order, including surfaces."""
+        for src in self.m.set_defs:
+            if src["kind"] == "surface":
+                for ref, _ in self.surface_bindings(src["surface"]):
+                    s = self.build_surf(ref)
+                    if s and s["type"] == "seg" and s["segs"]:
+                        self.seg_set_id(s)
+                    elif s and s["type"] == "node":
+                        segs = self.faces_for_nodes(s["ids"])
+                        if segs:
+                            self.seg_set_id(dict(name=ref, segs=segs))
+                        else:
+                            self.log.warn('절점 표면 "%s": 모든 코너 절점이 포함된 외부 면이 없어 SEGMENT를 만들지 못했습니다.' % ref)
+                        self.node_set_id(ref, s["ids"])
+                    else:
+                        self.log.warn('표면 "%s": 변환할 유효한 세그먼트가 없습니다.' % ref)
+                continue
+            if not self.opt["sets"]:
+                continue
+            part, nm, kind = src["part"], src["name"], src["kind"]
+            if part is None or (part is self.m.parts["__ROOT__"] and "" not in self.contexts):
+                bindings = [(nm, None)]
+            else:
+                bindings = [((key + "_" if key else "") + nm, key)
+                            for key, ctx in self.contexts.items()
+                            if part is ctx["base"] or part is ctx["inst"]["part"]]
+            for title, pref in bindings:
+                ids = self.resolve_ids(kind, nm, pref)
+                if not ids:
+                    self.log.warn('세트 "%s"의 구성원을 찾지 못했습니다.' % title)
+                    continue
+                if kind == "nsets":
+                    sid = self.node_set_id(title, ids)
+                    alias = ((pref + ".") if pref else "") + nm
+                    self.global_nsets[alias] = sid
+                    self.global_nsets.setdefault(nm, sid)
+                else:
+                    groups = self.element_set_groups(ids)
+                    for cat, members in groups.items():
+                        title2 = title + ("_" + cat.upper() if len(groups) > 1 else "")
+                        key = (cat, title2)
+                        if key in self._element_sid:
+                            existing = self._element_sid[key]
+                            existing["ids"] = ordered_unique(existing["ids"] + members)
+                        else:
+                            record = dict(cat=cat, name=title2, ids=members)
+                            self.append_set("element", record)
+                            self._element_sid[key] = record
+
+    def element_set_groups(self, ids):
+        if not HAVE_NUMPY:
+            groups = {}
+            for eid in ids:
+                info = self.element_location(eid)
+                if info:
+                    ctx, bi, _ = info
+                    cls = classify(ctx["P"].eblocks[bi]["type"])
+                    if cls and cls["cat"] in ("solid", "shell", "beam"):
+                        groups.setdefault(cls["cat"], []).append(eid)
+            return groups
+        src = np.asarray(ids, dtype=np.int64)
+        cats = np.zeros(len(src), dtype=np.uint8)
+        codes = {"solid": 1, "shell": 2, "beam": 3}
+        for ctx in self.contexts.values():
+            idx = ctx["index"]
+            if not idx.total:
+                continue
+            local = src - ctx["eOff"]
+            pos = np.searchsorted(idx.sorted, local)
+            valid = pos < idx.total
+            rows = np.flatnonzero(valid)
+            rows = rows[idx.sorted[pos[rows]] == local[rows]]
+            if not len(rows):
+                continue
+            global_pos = idx.order[pos[rows]]
+            blocks = np.searchsorted(np.asarray(idx.starts), global_pos, side="right") - 1
+            block_codes = np.asarray([codes.get((classify(b["type"]) or {}).get("cat"), 0)
+                                      for b in ctx["P"].eblocks], dtype=np.uint8)
+            cats[rows] = block_codes[blocks]
+        names = {v: k for k, v in codes.items()}
+        return {names[int(c)]: src[cats == c].tolist()
+                for c in ordered_unique(cats.tolist()) if c}
+
+    def element_location(self, eid):
+        for ctx in self.contexts.values():
+            loc = ctx["index"].one(eid - ctx["eOff"])
+            if loc is not None:
+                return ctx, loc[0], loc[1]
+        return None
+
+    def faces_for_nodes(self, ids):
+        selected = set(ids)
+        candidates = []
+        for eid, info in self.elem_info.items():
+            if info["cat"] == "shell":
+                s = self.seg_of(eid, "SPOS")
+                if s and set(s) <= selected:
+                    candidates.append(s)
+            else:
+                for face in FACE.get(info["sub"], {}):
+                    s = self.seg_of(eid, face)
+                    if s and set(s) <= selected:
+                        candidates.append(s)
+        return self.exterior_faces(candidates)
+
+    @staticmethod
+    def exterior_faces(candidates):
+        count = {}
+        for s in candidates:
+            k = tuple(sorted(set(s)))
+            count[k] = count.get(k, 0) + 1
+        return [s for s in candidates if count[tuple(sorted(set(s)))] == 1]
 
     # ---------- 실행 ----------
     def run(self):
@@ -1112,8 +1534,8 @@ class Converter:
             self.log.err("절점을 찾지 못했습니다. Abaqus INP 파일이 맞는지 확인해 주세요.")
             return
 
-        need_info = self.opt["contact"] and (
-            m.surfaces or m.contact_pairs or m.ties or m.couplings or m.rigid_bodies)
+        self.prepare_contexts(instances)
+        need_info = bool(m.surfaces or (self.opt["contact"] and m.rigid_bodies))
         need_coord = False
         if self.opt["beamNode"]:
             for t in m.el_types:
@@ -1135,6 +1557,12 @@ class Converter:
                 continue
             self.do_instance(inst, base, need_info, need_coord)
 
+        for P in m.parts.values():
+            for sec in P.sections:
+                if not self.section_hits.get(id(sec)):
+                    self.log.warn('단면 "%s"에 매칭되는 요소가 없습니다. ELSET 참조/요소 종류를 확인하세요.' % sec["elset"])
+        self.emit_source_sets()
+
         if self.opt["contact"]:
             self.do_interactions()
         if self.opt["bc"]:
@@ -1148,25 +1576,10 @@ class Converter:
 
     # ---------- 인스턴스 ----------
     def do_instance(self, inst, base, need_info, need_coord):
-        P = merge_parts(base, inst["part"])
+        ctx = self.contexts[name_key(inst["name"])]
+        P = ctx["P"]
         opt = self.opt
-
-        # ID offset
-        n_ids_all = [b[0] for b in P.nblocks]
-        e_ids_all = [b["ids"] for b in P.eblocks]
-        min_n = min((int(_amin(a)) for a in n_ids_all), default=0)
-        max_n = max((int(_amax(a)) for a in n_ids_all), default=0)
-        min_e = min((int(_amin(a)) for a in e_ids_all), default=0)
-        max_e = max((int(_amax(a)) for a in e_ids_all), default=0)
-        n_off = self.max_node if (n_ids_all and min_n <= self.max_node) else 0
-        e_off = self.max_elem if (e_ids_all and min_e <= self.max_elem) else 0
-        if n_off or e_off:
-            self.log.info('인스턴스 "%s" ID 충돌 → 절점 +%d, 요소 +%d offset 적용'
-                          % (inst["name"], n_off, e_off))
-        if n_ids_all:
-            self.max_node = max(self.max_node, max_n + n_off)
-        if e_ids_all:
-            self.max_elem = max(self.max_elem, max_e + e_off)
+        n_off, e_off = ctx["nOff"], ctx["eOff"]
 
         # ----- 절점 -----
         tr = make_transform(inst)
@@ -1178,59 +1591,61 @@ class Converter:
             self.counts["node"] += len(ids)
             self._tick(len(ids), "절점 %s" % f"{self.counts['node']:,}")
 
-        # ----- 단면 -> PART -----
-        eid_index = EidIndex(P)
+        # ----- 단면 -> PART (part / instance / assembly references) -----
+        eid_index = ctx["index"]
         pid_all = _zeros_int(eid_index.total)
         sec_of_pid = {}
-        for sec in P.sections:
-            eids = self.resolve_set(P.elsets, sec["elset"])
-            if not eids:
-                self.log.warn('단면이 참조한 요소집합 "%s"이 비어 있습니다.' % sec["elset"])
+        root = self.m.parts["__ROOT__"]
+        sections = [(sec, name_key(inst["name"])) for sec in P.sections]
+        if base is not root:
+            sections.extend((sec, None) for sec in root.sections)
+        for sec, pref in sections:
+            eids = self.resolve_ids("elsets", sec["elset"], pref)
+            gi = eid_index.positions([e - e_off for e in eids])
+            if gi is None or not len(gi):
                 continue
-            loc = eid_index.one(int(eids[0]))
-            cls = classify(P.eblocks[loc[0]]["type"]) if loc else None
-            if cls is None:
-                continue
-            self.sec_seq += 1
-            self.pid_seq += 1
-            secid, pid = self.sec_seq, self.pid_seq
-            mid = self.get_mid(sec["material"]) if opt["mat"] else self.get_mid("")
-            title = (inst["name"] + "_" if inst["name"] else "") + (sec["elset"] or "PART%d" % pid)
-            S = self.make_section(secid, cls, sec)
-            self.sections.append(S)
-            sec_of_pid[pid] = S
-            self.parts.append(dict(pid=pid, secid=secid, mid=mid, title=title))
-            gi = eid_index.positions(eids)
-            if gi is not None and len(gi):
+            # A source ELSET can span several blocks/formulations. Select
+            # compatible elements from every block, not just its first ID.
+            wanted = ("shell" if sec["type"] in ("SHELL SECTION", "SHELL GENERAL SECTION", "MEMBRANE SECTION")
+                      else "beam" if sec["type"] in ("BEAM SECTION", "BEAM GENERAL SECTION", "TRUSS SECTION")
+                      else "solid")
+            groups = {}
+            for bi, blk in enumerate(P.eblocks):
+                cls = classify(blk["type"])
+                if not cls or cls["cat"] != wanted:
+                    continue
+                start, end = eid_index.starts[bi], eid_index.starts[bi] + eid_index.sizes[bi]
+                hit = gi[(gi >= start) & (gi < end)] if HAVE_NUMPY and isinstance(gi, np.ndarray) else [g for g in gi if start <= g < end]
+                if not len(hit):
+                    continue
+                signature = (cls["cat"], cls["sub"], cls["red"], cls["truss"])
+                if signature not in groups:
+                    groups[signature] = (cls, [])
+                groups[signature][1].extend(int(g) for g in hit)
+            for cls, hit in groups.values():
+                self.sec_seq += 1
+                self.pid_seq += 1
+                secid, pid = self.sec_seq, self.pid_seq
+                mid = self.get_mid(sec["material"]) if opt["mat"] else self.get_mid("")
+                title = (inst["name"] + "_" if inst["name"] else "") + sec["elset"]
+                if len(groups) > 1:
+                    title += "_" + cls["sub"].upper() + ("R" if cls["red"] else "")
+                S = self.make_section(secid, cls, sec)
+                self.sections.append(S)
+                sec_of_pid[pid] = S
+                self.parts.append(dict(pid=pid, secid=secid, mid=mid, title=title))
+                self.section_hits[id(sec)] = self.section_hits.get(id(sec), 0) + len(hit)
                 if HAVE_NUMPY and isinstance(pid_all, np.ndarray):
-                    pid_all[gi] = pid
+                    pid_all[hit] = pid
                 else:
-                    for g in gi:
+                    for g in hit:
                         pid_all[g] = pid
 
-        # ----- 접촉면에 필요한 요소 표시 -----
-        seg_eids = None
+        seg_eids = set()
         if need_info:
-            seg_eids = set()
-            inst_u = (inst["name"] or "").upper()
-            for sf in self.m.surfaces:
-                for ref, _face in sf["rows"]:
-                    nm = str(ref).upper()
-                    if "." in nm:
-                        pre, nm2 = nm.split(".", 1)
-                        if pre != inst_u:
-                            continue
-                        nm = nm2
-                    if nm in P.elsets:
-                        seg_eids.update(int(x) for x in self.resolve_set(P.elsets, nm))
-            for rb in self.m.rigid_bodies:
-                if rb["elset"] and rb["elset"] in P.elsets:
-                    seg_eids.update(int(x) for x in self.resolve_set(P.elsets, rb["elset"]))
-
-        # ----- 세트 -----
-        if opt["sets"]:
-            self.emit_sets(P, inst, n_off, e_off, eid_index)
-        self.register_maps(P, inst, n_off, e_off, base)
+            for blk in P.eblocks:
+                seg_eids.update(int(e) for e in blk["ids"]
+                                if self._need_all_surface_elements or int(e) + e_off in self._needed_elements)
 
         # ----- 요소 -----
         fallback = {}
@@ -1517,75 +1932,8 @@ class Converter:
             self.log.warn("질량 요소 %d개의 값을 찾지 못해 0으로 두었습니다." % miss)
 
     # ---------- 세트 ----------
-    def emit_sets(self, P, inst, n_off, e_off, eid_index):
-        pre = (inst["name"] + "_") if inst["name"] else ""
-        for nm in list(P.nsets.keys()):
-            ids = [int(v) + n_off for v in self.resolve_set(P.nsets, nm)]
-            if not ids:
-                continue
-            self.nsets.append(dict(sid=len(self.nsets) + 1, name=pre + nm, ids=ids))
-            self.global_nsets[(pre + nm).upper()] = len(self.nsets)
-            self.global_nsets.setdefault(nm.upper(), len(self.nsets))
-        for nm in list(P.elsets.keys()):
-            ids = [int(v) for v in self.resolve_set(P.elsets, nm)]
-            if not ids:
-                continue
-            loc = eid_index.one(ids[0])
-            cls = classify(P.eblocks[loc[0]]["type"]) if loc else None
-            if not cls or cls["cat"] not in ("solid", "shell", "beam"):
-                continue
-            self.esets.append(dict(sid=len(self.esets) + 1, cat=cls["cat"],
-                                   name=pre + nm, ids=[i + e_off for i in ids]))
-        for s in self.m.asm_nsets:
-            if s["instance"] != (inst["name"] or "").upper():
-                continue
-            tmp = dict(P.nsets)
-            tmp["__T__"] = s["ids"]
-            ids = [int(v) + n_off for v in self.resolve_set(tmp, "__T__")]
-            if not ids:
-                continue
-            self.nsets.append(dict(sid=len(self.nsets) + 1, name=s["name"], ids=ids))
-            self.global_nsets[s["name"].upper()] = len(self.nsets)
-
-    def register_maps(self, P, inst, n_off, e_off, base):
-        EM, NM = {}, {}
-        for nm in P.elsets:
-            EM[nm] = [int(v) + e_off for v in self.resolve_set(P.elsets, nm)]
-        for nm in P.nsets:
-            NM[nm] = [int(v) + n_off for v in self.resolve_set(P.nsets, nm)]
-        key = (inst["name"] or "").upper()
-        for s in self.m.asm_nsets:
-            if s["instance"] == key:
-                tmp = dict(P.nsets)
-                tmp["__T__"] = s["ids"]
-                NM[s["name"]] = [int(v) + n_off for v in self.resolve_set(tmp, "__T__")]
-        for s in self.m.asm_elsets:
-            if s["instance"] == key:
-                tmp = dict(P.elsets)
-                tmp["__T__"] = s["ids"]
-                EM[s["name"]] = [int(v) + e_off for v in self.resolve_set(tmp, "__T__")]
-        self.inst_maps[key] = dict(elsets=EM, nsets=NM, nOff=n_off, eOff=e_off)
-        self.inst_part_of[key] = base.name
-
-    # ---------- 접촉 · 구속 ----------
     def look(self, kind, ref, pref=None):
-        R = str(ref or "").strip().upper()
-        if pref and pref in self.inst_maps:
-            v = self.inst_maps[pref][kind].get(R)
-            if v:
-                return v
-        if "." in R:
-            pre, loc = R.split(".", 1)
-            im = self.inst_maps.get(pre)
-            if im:
-                v = im[kind].get(loc)
-                if v:
-                    return v
-        for im in self.inst_maps.values():
-            v = im[kind].get(R)
-            if v:
-                return v
-        return None
+        return self.resolve_ids(kind, ref, pref) or None
 
     def seg_of(self, eid, face):
         info = self.elem_info.get(eid)
@@ -1593,7 +1941,9 @@ class Converter:
             return None
         c = info["c"]
         if info["cat"] == "shell":
-            if len(c) >= 4:
+            if face not in ("SPOS", "SNEG", "S1", "S2"):
+                return None
+            if info["sub"] in ("quad4", "quad8"):
                 s = [c[0], c[1], c[2], c[3]]
                 if face in ("SNEG", "S2"):
                     s = [s[3], s[2], s[1], s[0]]
@@ -1605,7 +1955,9 @@ class Converter:
         tab = FACE.get(info["sub"])
         if not tab:
             return None
-        idx = tab.get(face) or tab["S1"]
+        idx = tab.get(face)
+        if idx is None:
+            return None
         try:
             s = [c[i] for i in idx]
         except IndexError:
@@ -1615,89 +1967,98 @@ class Converter:
         return s
 
     def find_surf_def(self, R):
-        if "." in R:
-            pre, loc = R.split(".", 1)
-            pn = self.inst_part_of.get(pre)
-            for s in self.m.surfaces:
-                if s["name"] == loc and s["owner"] == pn:
-                    return s, pre
-            for s in self.m.surfaces:
-                if s["name"] == loc:
-                    return s, pre
-        for s in self.m.surfaces:
-            if s["name"] == R and s["owner"] == "__ASM__":
-                return s, None
-        for s in self.m.surfaces:
-            if s["name"] == R:
-                return s, None
+        R = name_key(R)
+        if R in self._surface_defs:
+            return self._surface_defs[R]
+        matches = [(d, pref) for ref, (d, pref) in self._surface_defs.items()
+                   if d["name"] == R]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            self.log.warn('표면 "%s"가 여러 인스턴스에 있습니다. INSTANCE.SURFACE를 지정하세요.' % R)
         return None, None
 
     def build_surf(self, ref, depth=0, cache=None):
-        if cache is None:
-            cache = self._surf_cache
-        R = str(ref or "").strip().upper()
+        cache = self._surf_cache if cache is None else cache
+        R = name_key(ref)
         if R in cache:
             return cache[R]
-        if depth > 4:
-            return None
+        if depth > 32:
+            raise ValueError("표면 순환 참조 또는 과도한 중첩: " + R)
         d, pref = self.find_surf_def(R)
-        res = None
-        if d is not None:
-            if d["stype"] == "NODE":
-                ids = []
-                for row in d["rows"]:
-                    v = self.look("nsets", row[0], pref)
-                    if v:
-                        ids.extend(v)
-                res = dict(type="node", ids=sorted(set(ids)), name=R)
-            else:
-                segs = []
-                for row in d["rows"]:
-                    r, face = row[0], (row[1] or "S1")
-                    es = self.look("elsets", r, pref)
-                    if es:
-                        for e in es:
-                            s = self.seg_of(int(e), face)
-                            if s:
-                                segs.append(s)
-                        continue
-                    sub = self.build_surf(r, depth + 1, cache)
-                    if sub and sub["type"] == "seg":
-                        segs.extend(sub["segs"])
+        if d is None:
+            ids = self.resolve_ids("nsets", R)
+            return dict(type="node", ids=ids, name=R) if ids else None
+        canonical = ((pref + ".") if pref else "") + d["name"]
+        if canonical in cache:
+            cache[R] = cache[canonical]
+            return cache[R]
+        if d["stype"] == "NODE":
+            ids = []
+            for r, _ in d["rows"]:
+                ids.extend(self.resolve_ids("nsets", r, pref))
+            result = dict(type="node", ids=ordered_unique(ids), name=canonical)
+        elif d["stype"] == "ELEMENT":
+            segs, automatic = [], []
+            for row, face in d["rows"]:
+                es = self.resolve_ids("elsets", row, pref)
+                if es:
+                    missing = 0
+                    for eid in es:
+                        if face:
+                            seg = self.seg_of(eid, face)
+                            if seg:
+                                segs.append(seg)
+                            else:
+                                missing += 1
+                        else:
+                            info = self.elem_info.get(eid)
+                            if not info:
+                                missing += 1
+                                continue
+                            faces = ["SPOS"] if info["cat"] == "shell" else FACE.get(info["sub"], {})
+                            automatic.extend(g for f in faces for g in [self.seg_of(eid, f)] if g)
+                    if missing:
+                        self.log.warn('표면 "%s": %s / %s에서 %d개 면을 매칭하지 못했습니다.'
+                                      % (canonical, row, face or "외부면", missing))
+                else:
+                    nested = ((pref + ".") if pref else "") + name_key(row)
+                    if nested not in self._surface_defs:
+                        nested = name_key(row)
+                    if nested in self._surface_defs:
+                        sub = self.build_surf(nested, depth + 1, cache)
+                        if sub and sub["type"] == "seg":
+                            segs.extend(sub["segs"])
                     else:
-                        self.log.warn('표면 "%s"이 참조한 "%s"을 찾지 못했습니다.'
-                                      % (d["name"], r))
-                res = dict(type="seg", segs=segs, name=R)
+                        self.log.warn('표면 "%s"의 참조 "%s"를 찾지 못했습니다.' % (canonical, row))
+            segs.extend(self.exterior_faces(automatic))
+            result = dict(type="seg", segs=[list(g) for g in ordered_unique(tuple(g) for g in segs)], name=canonical)
         else:
-            es = self.look("elsets", R)
-            if es:
-                segs = []
-                for e in es:
-                    s = self.seg_of(int(e), "S1")
-                    if s:
-                        segs.append(s)
-                res = dict(type="seg", segs=segs, name=R)
-            else:
-                ns = self.look("nsets", R)
-                if ns:
-                    res = dict(type="node", ids=ns, name=R)
-        cache[R] = res
-        return res
+            self.log.warn('표면 "%s"의 TYPE=%s는 메시 SEGMENT로 변환할 수 없습니다.' % (canonical, d["stype"]))
+            result = None
+        cache[R] = cache[canonical] = result
+        return result
 
     def seg_set_id(self, s):
-        if s["name"] in self._seg_sid:
-            return self._seg_sid[s["name"]]
-        sid = len(self.segsets) + 1
-        self.segsets.append(dict(sid=sid, name=s["name"], segs=s["segs"]))
-        self._seg_sid[s["name"]] = sid
+        key = name_key(s["name"])
+        if key in self._seg_sid:
+            return self._seg_sid[key]
+        sid = self.append_set("segment", dict(name=s["name"], segs=s["segs"]))
+        self._seg_sid[key] = sid
         return sid
 
     def node_set_id(self, name, ids):
-        if name in self._node_sid:
-            return self._node_sid[name]
-        self.nsets.append(dict(sid=len(self.nsets) + 1, name=name, ids=list(ids)))
-        self._node_sid[name] = len(self.nsets)
-        return len(self.nsets)
+        key = name_key(name)
+        ids = ordered_unique(ids)
+        if key in self._node_sid:
+            sid = self._node_sid[key]
+            existing = next(s for s in self.nsets if s["sid"] == sid)
+            existing["ids"] = ordered_unique(existing["ids"] + ids)
+            return sid
+        sid = self.append_set("node", dict(name=name, ids=ids))
+        self._node_sid[key] = sid
+        self.global_nsets[key] = sid
+        return sid
 
     @staticmethod
     def surf_nodes(s):
@@ -1708,7 +2069,7 @@ class Converter:
         out = set()
         for g in s["segs"]:
             out.update(g)
-        return sorted(out)
+        return ordered_unique(n for g in s["segs"] for n in g)
 
     def add_contact(self, kind, title, S, M, fs):
         c = dict(cid=len(self.contacts) + 1, kind=kind, title=title, fs=fs, fd=fs)
@@ -1764,10 +2125,6 @@ class Converter:
         return True
 
     def do_interactions(self):
-        self.contacts = []
-        self._surf_cache = {}
-        self._seg_sid = {}
-        self._node_sid = {}
         m = self.m
         opt = self.opt
 
@@ -1924,7 +2281,10 @@ class Converter:
                   "YASYMM": [1, 0, 1, 0, 1, 0], "ZASYMM": [1, 1, 0, 0, 0, 1]}
         agg = {}
         for b in self.m.boundaries:
+            ids = self.resolve_ids("nsets", b["set"])
             sid = self.global_nsets.get(b["set"])
+            if not sid and ids:
+                sid = self.node_set_id(b["set"], ids)
             if not sid:
                 self.log.warn('경계조건이 참조한 절점집합 "%s"을 세트 목록에서 '
                               '찾지 못했습니다.' % b["set"])
@@ -2017,9 +2377,11 @@ def merge_parts(a, b):
     P.nblocks = a.nblocks + b.nblocks
     P.eblocks = a.eblocks + b.eblocks
     P.nsets = dict(a.nsets)
-    P.nsets.update(b.nsets)
+    for nm, ids in b.nsets.items():
+        P.nsets[nm] = P.nsets.get(nm, []) + ids
     P.elsets = dict(a.elsets)
-    P.elsets.update(b.elsets)
+    for nm, ids in b.elsets.items():
+        P.elsets[nm] = P.elsets.get(nm, []) + ids
     P.sections = a.sections + b.sections
     P.massvals = dict(a.massvals)
     P.massvals.update(b.massvals)
@@ -2054,7 +2416,7 @@ class EidIndex:
 
     def positions(self, eids):
         """요소 ID 목록 -> 전역 인덱스 배열(없는 것은 제외)"""
-        if not len(eids):
+        if not len(eids) or not self.total:
             return None
         if self.np_mode:
             e = np.asarray(eids, np.int64)
@@ -2101,7 +2463,7 @@ def write_k(cv, opt, out_path, src_name, progress=None):
     put("$#                                                                         title")
     put((cv.m.title or "converted model")[:80])
     put("$")
-    put("$  Converted from Abaqus input deck: " + src_name)
+    put("$  Converted from Abaqus input deck: " + src_name.encode("utf-8").decode("latin-1"))
     put("$  Assumed unit system: " + UD["label"])
     put("$  Check materials, sections and contacts before running.")
     put("$")
@@ -2162,7 +2524,15 @@ def write_k(cv, opt, out_path, src_name, progress=None):
             put(f10(0) * 2)
 
     for mt in cv.mats:
-        if mt["type"] == "plastic":
+        if mt["type"] == "foam57":
+            put("*MAT_LOW_DENSITY_FOAM_TITLE")
+            put(mt["name"][:80])
+            put("$#     mid        ro         e      lcid        tc        hu      beta      damp")
+            put(i10(mt["mid"]) + f10(mt["rho"]) + f10(mt["e"]) + i10(mt["lcid"])
+                + f10(mt["tc"]) + f10(1) + f10(0) + f10(0))
+            put("$#   shape      fail    bvflag        ed     beta1      kcon       ref")
+            put(f10(1) + f10(0) * 6)
+        elif mt["type"] == "plastic":
             put("*MAT_PIECEWISE_LINEAR_PLASTICITY_TITLE")
             put(mt["name"][:80])
             put("$#     mid        ro         e        pr      sigy      etan      fail      tdel")
@@ -2219,28 +2589,25 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         for i in range(0, len(ids), 8):
             put("".join(i10(v) for v in ids[i:i + 8]))
 
-    for s in cv.nsets:
-        put("*SET_NODE_LIST_TITLE")
-        put(s["name"][:80])
-        put("$#     sid       da1       da2       da3       da4    solver")
-        put(i10(s["sid"]) + f10(0) * 4 + "      MECH")
-        chunk_ids(s["ids"])
-    for s in cv.esets:
-        kw = ("*SET_SOLID_TITLE" if s["cat"] == "solid"
-              else "*SET_SHELL_LIST_TITLE" if s["cat"] == "shell" else "*SET_BEAM_TITLE")
+    # One source-ordered stream: do not regroup NSET/ELSET/SURFACE by type.
+    for s in cv.set_output:
+        if s["kind"] == "node":
+            kw = "*SET_NODE_LIST_TITLE"
+        elif s["kind"] == "segment":
+            kw = "*SET_SEGMENT_TITLE"
+        else:
+            kw = ("*SET_SOLID_TITLE" if s["cat"] == "solid" else
+                  "*SET_SHELL_LIST_TITLE" if s["cat"] == "shell" else "*SET_BEAM_TITLE")
         put(kw)
         put(s["name"][:80])
         put("$#     sid       da1       da2       da3       da4    solver")
         put(i10(s["sid"]) + f10(0) * 4 + "      MECH")
-        chunk_ids(s["ids"])
-    for s in cv.segsets:
-        put("*SET_SEGMENT_TITLE")
-        put(s["name"][:80])
-        put("$#     sid       da1       da2       da3       da4    solver")
-        put(i10(s["sid"]) + f10(0) * 4 + "      MECH")
-        put("$#      n1        n2        n3        n4        a1        a2        a3        a4")
-        for g in s["segs"]:
-            put(i10(g[0]) + i10(g[1]) + i10(g[2]) + i10(g[3]) + f10(0) * 4)
+        if s["kind"] == "segment":
+            put("$#      n1        n2        n3        n4        a1        a2        a3        a4")
+            for g in s["segs"]:
+                put("".join(i10(n) for n in g) + f10(0) * 4)
+        else:
+            chunk_ids(s["ids"])
 
     for b in cv.spcs:
         put("*BOUNDARY_SPC_SET")
@@ -2323,12 +2690,27 @@ def convert_file(inp_path, out_path, opt, log, progress=None):
     cv = Converter(model, opt, log,
                    lambda done, total, label: emit(
                        "convert", 45.0 + 45.0 * done / max(total, 1), label))
-    cv.run()
-    t_conv = time.time() - t1
-
-    emit("write", 90.0, "")
-    t2 = time.time()
-    size = write_k(cv, opt, out_path, os.path.basename(inp_path), progress)
+    pending_output = None
+    try:
+        cv.run()
+        t_conv = time.time() - t1
+        emit("write", 90.0, "")
+        t2 = time.time()
+        # An incomplete conversion must not overwrite a previously valid deck.
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        fd, pending_output = tempfile.mkstemp(prefix=".inp2k_", suffix=".tmp", dir=out_dir)
+        os.close(fd)
+        size = write_k(cv, opt, pending_output, os.path.basename(inp_path), progress)
+        os.replace(pending_output, out_path)
+        pending_output = None
+    finally:
+        for f in cv.tmp.values():
+            f.close()
+        if pending_output is not None:
+            try:
+                os.remove(pending_output)
+            except OSError:
+                pass
     t_write = time.time() - t2
     emit("done", 100.0, "")
 
