@@ -51,6 +51,11 @@ v1.4:
 - Support C3D5 pyramids, repeat apex IDs in all eight solid node slots, correct
   tetrahedral degeneration, and check solid node references before writing.
 - Use one installed Korean-capable sans-serif family throughout the GUI.
+
+v1.5:
+- Allocate CNRB PIDs after all output entities are known, starting above every
+  emitted node/element/PART/SECTION/MAT/curve/SET/HG/contact/constraint ID.
+  Recheck at write time; retain PART IDs, node-set links and source SET order.
 """
 
 import os
@@ -79,7 +84,7 @@ except Exception:                                    # pragma: no cover
     pd = None
     HAVE_PANDAS = False
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -1675,6 +1680,7 @@ class Converter:
         if self.opt["bc"]:
             self.do_boundaries()
         self.finalize_set_order()
+        self.finalize_nrb_ids()
 
         if m.unsupported:
             items = sorted(m.unsupported.items(), key=lambda kv: -kv[1])[:14]
@@ -2348,9 +2354,40 @@ class Converter:
         if len(uniq) < 2:
             return False
         nsid = self.node_set_id("NRB_" + title, uniq)
-        self.pid_seq += 1
-        self.nrbs.append(dict(pid=self.pid_seq, nsid=nsid, pnode=pnode, title=title))
+        # No other converted keyword refers to a CNRB by PID. Assign it once
+        # all parts, sets, contacts and constraints have been collected.
+        self.nrbs.append(dict(pid=0, nsid=nsid, pnode=pnode, title=title))
         return True
+
+    def finalize_nrb_ids(self):
+        """Give CNRBs a disjoint range based on actual output IDs, not counters.
+
+        CNRB PID shares the PART namespace. A higher common bound also keeps
+        its numeric IDs distinct from the other generated entity namespaces.
+        Existing CNRB PIDs are excluded so repeated finalization is stable.
+        NSID and PNODE remain explicit and do not depend on the assigned PID.
+        """
+        if not self.nrbs:
+            return
+        highest = max(self.max_node, self.max_elem, 0)
+        for records, key in ((self.parts, "pid"), (self.sections, "secid"),
+                             (self.mats, "mid"), (self.curves, "lcid"),
+                             (self.nsets, "sid"), (self.esets, "sid"),
+                             (self.segsets, "sid"), (self.hourglasses, "hgid"),
+                             (self.contacts, "cid"), (self.interps, "icid"),
+                             (self.lineq, "lcid")):
+            highest = max(highest, max((int(r[key]) for r in records), default=0))
+        last = highest + len(self.nrbs)
+        if last > 9999999999:
+            raise ValueError("CNRB PID를 위한 10자리 ID 공간이 부족합니다.")
+        changed = False
+        for i, rb in enumerate(self.nrbs, 1):
+            pid = highest + i
+            changed = changed or rb["pid"] != pid
+            rb["pid"] = pid
+        if changed:
+            self.log.ok("CNRB PID %d개를 중복 없는 범위 %d~%d에 배정했습니다."
+                        % (len(self.nrbs), highest + 1, last))
 
     def do_interactions(self):
         m = self.m
@@ -2680,6 +2717,8 @@ class EidIndex:
 # 출력
 # ============================================================
 def write_k(cv, opt, out_path, src_name, progress=None):
+    # Also covers callers that modify the converted model before exporting it.
+    cv.finalize_nrb_ids()
     UD = UNIT_DEFAULT[opt["unit"]]
     W = open(out_path, "wb")
 
