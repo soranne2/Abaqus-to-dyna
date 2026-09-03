@@ -22,6 +22,17 @@ v1.1 (based on soranne2/Abaqus-to-dyna, b00caa28):
 - Every mesh surface is exported, even without a contact. NODE surfaces only
   yield segments where all corner nodes of an exterior mesh face are present.
   Unsupported analytical/edge surfaces are reported, never replaced by S1.
+
+v1.2:
+- *ELEMENT, ELSET=... groups remain internal to property/surface resolution.
+  They do not create extra output SET cards. Explicit *ELSET declarations are
+  still exported at their first explicit declaration, including reused names.
+- Source SURFACEs remain independent SETs in source order, reused by contacts.
+  A NODE surface produces one segment set when mesh faces can be identified;
+  any node set needed by a contact is appended after the source sets.
+- TIED contact DC, VC, BT, DT, SFS, SFM, SFST, SFMT, FSF, VSF fields are blank.
+- CONTROL and DATABASE templates are never emitted. Legacy ctrl arguments are
+  accepted for compatibility only; there is no GUI control-generation option.
 """
 
 import os
@@ -50,7 +61,7 @@ except Exception:                                    # pragma: no cover
     pd = None
     HAVE_PANDAS = False
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -735,7 +746,8 @@ class Parser:
             if p.get("ELSET"):
                 nm = name_key(p["ELSET"])
                 self.pend_elset = self.pend_part.elsets.setdefault(nm, [])
-                self.remember_set("elsets", nm, self.pend_part)
+                # Property membership is needed internally, but an implicit
+                # element-block group is not an explicit user SET declaration.
         elif kw in ("NSET", "ELSET"):
             is_node = kw == "NSET"
             nm = ((p.get("NSET") if is_node else p.get("ELSET")) or "UNNAMED").upper()
@@ -1413,7 +1425,7 @@ class Converter:
                             self.seg_set_id(dict(name=ref, segs=segs))
                         else:
                             self.log.warn('절점 표면 "%s": 모든 코너 절점이 포함된 외부 면이 없어 SEGMENT를 만들지 못했습니다.' % ref)
-                        self.node_set_id(ref, s["ids"])
+                            self.node_set_id(ref, s["ids"])
                     else:
                         self.log.warn('표면 "%s": 변환할 유효한 세그먼트가 없습니다.' % ref)
                 continue
@@ -2468,19 +2480,7 @@ def write_k(cv, opt, out_path, src_name, progress=None):
     put("$  Check materials, sections and contacts before running.")
     put("$")
 
-    if opt["ctrl"]:
-        put("*CONTROL_TERMINATION")
-        put("$#  endtim    endcyc     dtmin    endeng    endmas     nosol")
-        put(f10(UD["end"]) + i10(0) + f10(0) + f10(0) + f10(0) + i10(0))
-        put("*CONTROL_ENERGY")
-        put("$#    hgen      rwen    slnten     rylen     irgen")
-        put(i10(2) * 5)
-        put("*DATABASE_BINARY_D3PLOT")
-        put("$#      dt      lcdt      beam     npltc    psetid")
-        put(f10(UD["end"] / 20) + i10(0) * 4)
-        put("*DATABASE_GLSTAT")
-        put("$#      dt    binary      lcur     ioopt")
-        put(f10(UD["end"] / 100) + i10(0) + i10(0) + i10(1))
+    # CONTROL / DATABASE generation is intentionally disabled.
 
     for p in cv.parts:
         put("*PART")
@@ -2642,9 +2642,17 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         put(i10(c["ssid"]) + i10(c["msid"]) + i10(c["sstyp"]) + i10(c["mstyp"])
             + i10(0) * 2 + i10(1) * 2)
         put("$#      fs        fd        dc        vc       vdc    penchk        bt        dt")
-        put(f10(c["fs"]) + f10(c["fd"]) + f10(0) * 2 + f10(20) + i10(0) + f10(0) + f10(1e20))
+        tied = c["kind"].startswith("TIED_")
+        if tied:
+            put(f10(c["fs"]) + f10(c["fd"]) + " " * 20
+                + f10(20) + i10(0) + " " * 20)
+        else:
+            put(f10(c["fs"]) + f10(c["fd"]) + f10(0) * 2 + f10(20) + i10(0) + f10(0) + f10(1e20))
         put("$#     sfs       sfm       sst       mst      sfst      sfmt       fsf       vsf")
-        put(f10(1) * 2 + f10(0) * 2 + f10(1) * 4)
+        if tied:
+            put(" " * 20 + f10(0) * 2 + " " * 40)
+        else:
+            put(f10(1) * 2 + f10(0) * 2 + f10(1) * 4)
 
     put("*END")
     size = W.tell()
@@ -2660,7 +2668,7 @@ def write_k(cv, opt, out_path, src_name, progress=None):
 # ============================================================
 # 전체 파이프라인
 # ============================================================
-DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=True, tet10=False,
+DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=False, tet10=False,
                    beamNode=True, contact=True, mu=0.2, shell="auto", unit="mmts")
 
 
@@ -3086,7 +3094,6 @@ def run_gui():
              ("mat", "재료·단면", "MAT / SECTION"),
              ("bc", "경계조건", "BOUNDARY_SPC_SET"),
              ("contact", "접촉·구속", "CONTACT / CONSTRAINED"),
-             ("ctrl", "CONTROL 카드", "템플릿 값이니 수정 필요"),
              ("tet10", "2차 사면체 유지", "C3D10 → TET4TOTET10"),
              ("beamNode", "보 방향절점", "단면 n1로 자동 생성")]
     grid = tk.Frame(f2, bg=P["card"])
@@ -3404,7 +3411,7 @@ def main():
     ap.add_argument("-o", "--out", help="출력 .k 경로")
     ap.add_argument("--no-sets", action="store_true", help="세트 출력 안 함")
     ap.add_argument("--no-contact", action="store_true", help="접촉·구속 변환 안 함")
-    ap.add_argument("--no-ctrl", action="store_true", help="CONTROL 카드 안 넣음")
+    ap.add_argument("--no-ctrl", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--tet10", action="store_true", help="C3D10을 2차 사면체로 유지")
     ap.add_argument("--shell", default="auto", choices=["auto", "2", "16"])
     ap.add_argument("--unit", default="mmts", choices=list(UNIT_DEFAULT))
@@ -3420,7 +3427,7 @@ def main():
 
     opt = dict(DEFAULT_OPT)
     opt.update(sets=not args.no_sets, contact=not args.no_contact,
-               ctrl=not args.no_ctrl, tet10=args.tet10,
+               ctrl=False, tet10=args.tet10,
                shell=args.shell, unit=args.unit, mu=args.mu)
     out = args.out or (os.path.splitext(args.input)[0] + ".k")
 
