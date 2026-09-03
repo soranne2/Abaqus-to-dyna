@@ -33,6 +33,14 @@ v1.2:
 - TIED contact DC, VC, BT, DT, SFS, SFM, SFST, SFMT, FSF, VSF fields are blank.
 - CONTROL and DATABASE templates are never emitted. Legacy ctrl arguments are
   accepted for compatibility only; there is no GUI control-generation option.
+
+v1.3:
+- Add per-PART *HOURGLASS / HGID for applicable shell/solid formulations.
+  Defaults are initial settings for quasi-static / low-velocity structural
+  simulations, not calibration against a solver run. No CONTROL is generated.
+- Final SET order: explicit NSET/ELSET (source order), source SURFACE sets
+  (source order), derived contact/constraint sets. Reassign SIDs and update
+  all contact/SPC/NRB references after ordering. Member order is unchanged.
 """
 
 import os
@@ -61,11 +69,24 @@ except Exception:                                    # pragma: no cover
     pd = None
     HAVE_PANDAS = False
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
 FOAM_DEFAULT_TC = 0.55
+
+# Per-part initial hourglass settings: (IHQ, QM, QB/VDC, QW).
+# None leaves the corresponding fixed-width field blank (solver default).
+# Sources: https://lsdyna.ansys.com/hourglass/
+# https://lsdyna.ansys.com/negative-volumes-in-brick-elements/
+# Card layout: Ansys PyDYNA auto/hourglass/hourglass.py.
+HOURGLASS_DEFAULTS = {
+    "shell_2": (4, 0.03, 0.03, 0.03),
+    "shell_16": (8, 0.10, 0.10, 0.10),
+    "solid_1_elastic": (6, 1.00, None, None),
+    "solid_1_plastic": (6, 0.10, None, None),
+    "solid_1_foam57": (6, 0.10, None, None),
+}
 
 
 def name_key(value):
@@ -1143,6 +1164,9 @@ class Converter:
         self._element_sid = {}
         self._sid = 0
         self.set_output = []
+        self._set_source_order = None
+        self.hourglasses = []
+        self.part_subtypes = {}
         self.contacts = []
         self.section_hits = {}
 
@@ -1407,13 +1431,71 @@ class Converter:
         self._sid += 1
         record["sid"] = self._sid
         record["kind"] = kind
+        record["_sort_key"] = (self._set_source_order or (2, 0)) + (self._sid,)
         self.set_output.append(record)
         (self.nsets if kind == "node" else self.segsets if kind == "segment" else self.esets).append(record)
         return record["sid"]
 
+    def mark_source_set(self, record):
+        if self._set_source_order is not None:
+            key = self._set_source_order + (record["sid"],)
+            record["_sort_key"] = min(record["_sort_key"], key)
+
+    def finalize_set_order(self):
+        """Make file order and numeric SID order agree, then fix references."""
+        self.set_output.sort(key=lambda s: s["_sort_key"])
+        remap = {s["sid"]: i for i, s in enumerate(self.set_output, 1)}
+        for s in self.set_output:
+            s["sid"] = remap[s["sid"]]
+        self.nsets = [s for s in self.set_output if s["kind"] == "node"]
+        self.esets = [s for s in self.set_output if s["kind"] == "element"]
+        self.segsets = [s for s in self.set_output if s["kind"] == "segment"]
+        for c in self.contacts:
+            for field, type_field in (("ssid", "sstyp"), ("msid", "mstyp")):
+                if c[type_field] in (0, 4) and c[field]:
+                    c[field] = remap[c[field]]
+        for b in self.spcs:
+            b["sid"] = remap[b["sid"]]
+        for rb in self.nrbs:
+            rb["nsid"] = remap[rb["nsid"]]
+        for mapping in (self._node_sid, self._seg_sid, self.global_nsets):
+            for name, sid in list(mapping.items()):
+                mapping[name] = remap[sid]
+        self._sid = len(self.set_output)
+
+    def assign_hourglasses(self):
+        """Each applicable PART receives its own HGID, equal to its PID."""
+        sections = {s["secid"]: s for s in self.sections}
+        mats = {m["mid"]: m for m in self.mats}
+        self.hourglasses = []
+        for p in self.parts:
+            p["hgid"] = 0
+            section = sections[p["secid"]]
+            kind, elform = section.get("kind"), section.get("elform")
+            shapes = self.part_subtypes.get(p["pid"], set())
+            rule = None
+            if kind == "shell" and shapes & {"quad4", "quad8"}:
+                if elform in (2, 16):
+                    rule = "shell_%d" % elform
+            elif (kind == "solid" and elform == 1
+                  and shapes & {"hex8", "hex20", "wedge6", "wedge15"}):
+                rule = "solid_1_" + mats[p["mid"]]["type"]
+            if rule not in HOURGLASS_DEFAULTS:
+                continue
+            ihq, qm, qb, qw = HOURGLASS_DEFAULTS[rule]
+            p["hgid"] = p["pid"]
+            self.hourglasses.append(dict(hgid=p["hgid"], ihq=ihq, qm=qm,
+                                         qb=qb, qw=qw, title="HG_" + p["title"], rule=rule))
+        if self.hourglasses:
+            self.log.ok("쉘/솔리드 PART %d개에 *HOURGLASS 및 HGID를 연결했습니다."
+                        % len(self.hourglasses))
+            self.log.info("Hourglass 기본값은 준정적·저속 구조해석용 초기값입니다. "
+                          "실제 해석의 hourglass 에너지와 강성 민감도를 확인하세요.")
+
     def emit_source_sets(self):
         """Emit first definitions in original interleaved order, including surfaces."""
-        for src in self.m.set_defs:
+        for source_index, src in enumerate(self.m.set_defs):
+            self._set_source_order = (1 if src["kind"] == "surface" else 0, source_index)
             if src["kind"] == "surface":
                 for ref, _ in self.surface_bindings(src["surface"]):
                     s = self.build_surf(ref)
@@ -1455,11 +1537,13 @@ class Converter:
                         key = (cat, title2)
                         if key in self._element_sid:
                             existing = self._element_sid[key]
+                            self.mark_source_set(existing)
                             existing["ids"] = ordered_unique(existing["ids"] + members)
                         else:
                             record = dict(cat=cat, name=title2, ids=members)
                             self.append_set("element", record)
                             self._element_sid[key] = record
+        self._set_source_order = None
 
     def element_set_groups(self, ids):
         if not HAVE_NUMPY:
@@ -1574,11 +1658,13 @@ class Converter:
                 if not self.section_hits.get(id(sec)):
                     self.log.warn('단면 "%s"에 매칭되는 요소가 없습니다. ELSET 참조/요소 종류를 확인하세요.' % sec["elset"])
         self.emit_source_sets()
+        self.assign_hourglasses()
 
         if self.opt["contact"]:
             self.do_interactions()
         if self.opt["bc"]:
             self.do_boundaries()
+        self.finalize_set_order()
 
         if m.unsupported:
             items = sorted(m.unsupported.items(), key=lambda kv: -kv[1])[:14]
@@ -1818,6 +1904,11 @@ class Converter:
                 pid_arr = _fill_zero(pid_arr, fb)
 
         # 접촉면용 연결 정보
+        if cat in ("solid", "shell"):
+            pids = (np.unique(pid_arr) if HAVE_NUMPY and isinstance(pid_arr, np.ndarray)
+                    else set(pid_arr))
+            for pid in pids:
+                self.part_subtypes.setdefault(int(pid), set()).add(sub)
         if seg_eids and cat in ("solid", "shell"):
             for k in range(n):
                 eid0 = int(ids[k])
@@ -2054,7 +2145,9 @@ class Converter:
     def seg_set_id(self, s):
         key = name_key(s["name"])
         if key in self._seg_sid:
-            return self._seg_sid[key]
+            sid = self._seg_sid[key]
+            self.mark_source_set(next(r for r in self.segsets if r["sid"] == sid))
+            return sid
         sid = self.append_set("segment", dict(name=s["name"], segs=s["segs"]))
         self._seg_sid[key] = sid
         return sid
@@ -2065,6 +2158,7 @@ class Converter:
         if key in self._node_sid:
             sid = self._node_sid[key]
             existing = next(s for s in self.nsets if s["sid"] == sid)
+            self.mark_source_set(existing)
             existing["ids"] = ordered_unique(existing["ids"] + ids)
             return sid
         sid = self.append_set("node", dict(name=name, ids=ids))
@@ -2487,7 +2581,16 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         put("$#                                                                         title")
         put(p["title"][:80])
         put("$#     pid     secid       mid     eosid      hgid      grav    adpopt      tmid")
-        put(i10(p["pid"]) + i10(p["secid"]) + i10(p["mid"]) + i10(0) * 5)
+        put(i10(p["pid"]) + i10(p["secid"]) + i10(p["mid"]) + i10(0)
+            + i10(p.get("hgid", 0)) + i10(0) * 3)
+
+    for hg in cv.hourglasses:
+        put("*HOURGLASS_TITLE")
+        put(hg["title"][:80])
+        put("$#    hgid       ihq        qm       ibq        q1        q2    qb/vdc        qw")
+        put(i10(hg["hgid"]) + i10(hg["ihq"]) + f10(hg["qm"]) + " " * 30
+            + (f10(hg["qb"]) if hg["qb"] is not None else " " * 10)
+            + (f10(hg["qw"]) if hg["qw"] is not None else " " * 10))
 
     for s in cv.sections:
         k = s.get("kind")
