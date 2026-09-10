@@ -3,7 +3,16 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.0
+현재 버전: v2.1
+최신 수정사항 — 혼합 SET 통합 및 SEGMENT 명명/순서 정리
+- Solid와 Shell이 함께 있는 ELSET은 원래 이름의 SET_PART_LIST 하나로 출력합니다.
+  참조 PART의 모든 요소가 포함되므로, 부분 요소 SET의 범위가 확대되면 경고합니다.
+- SEGMENT SET 이름에 _seg를 붙입니다. 이름 충돌 시 _2_seg 등의 번호를 붙입니다.
+- 일반 원본 SET -> SEGMENT SET -> NODE SURFACE/SURF_COUPLING -> 추가 구속 SET
+  순서로 배치하고 참조 ID를 함께 갱신합니다. 자동 SET의 고정 ID는 유지합니다.
+- TYPE=NODE 면 탐색 생략 등 v2.0의 동작은 유지합니다.
+
+v2.0 변경 이력:
 최신 수정사항 — NODE SURFACE의 불필요한 면 탐색 제거
 - TYPE=NODE SURFACE는 노드 목록을 그대로 SET_NODE_LIST로 보존합니다.
   SURF_COUPLING 등 커플링용 표면을 SEGMENT로 역추정하지 않습니다.
@@ -138,7 +147,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.0"
+VERSION = "2.1"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -1245,6 +1254,7 @@ class Converter:
         self.hourglasses = []
         self.contacts = []
         self.section_hits = {}
+        self._part_pid_blocks = {}
 
     # ---------- 임시 파일 ----------
     def _tmp(self, key):
@@ -1531,7 +1541,35 @@ class Converter:
 
     def finalize_set_order(self):
         """Make file order and numeric SID order agree, then fix references."""
-        self.set_output.sort(key=lambda s: s["_sort_key"])
+        used = {name_key(s["name"][:80]) for s in self.set_output if s["kind"] != "segment"}
+        for s in self.set_output:
+            if s["kind"] == "segment":
+                base = s.setdefault("_segment_base_name", s["name"])
+                if base.lower().endswith("_seg"):
+                    base = base[:-4]
+                number = 1
+                while True:
+                    suffix = "_seg" if number == 1 else "_%d_seg" % number
+                    title = base[:80-len(suffix)] + suffix
+                    if name_key(title) not in used:
+                        break
+                    number += 1
+                s["name"] = title
+                used.add(name_key(title))
+        def ordering(s):
+            old = s["_sort_key"]
+            if s.get("fixed_sid"):
+                group = 4
+            elif s["kind"] == "segment":
+                group = 1
+            elif s["kind"] == "node" and (old[0] == 1 or "SURF_COUPLING" in name_key(s["name"])):
+                group = 2
+            elif old[0] >= 2:
+                group = 3
+            else:
+                group = 0
+            return (group,) + old
+        self.set_output.sort(key=ordering)
         reserved = {200001, 200002, 900001} if self.opt.get("auto_sets", True) else set()
         remap = {}
         next_id = 0
@@ -1842,6 +1880,33 @@ class Converter:
                     self.global_nsets.setdefault(nm, sid)
                 else:
                     groups = self.element_set_groups(ids)
+                    if "solid" in groups and "shell" in groups:
+                        pids = self.part_ids_for_elements(ids)
+                        key = ("part", title)
+                        if key in self._element_sid:
+                            existing = self._element_sid[key]
+                            self.mark_source_set(existing)
+                            existing["ids"] = ordered_unique(existing["ids"] + pids)
+                        else:
+                            record = dict(name=title, ids=pids)
+                            self.append_set("part", record)
+                            self._element_sid[key] = record
+                        if not hasattr(self, "_part_element_counts"):
+                            counts = {}
+                            for values in self._part_pid_blocks.values():
+                                if HAVE_NUMPY:
+                                    keys, nums = np.unique(values, return_counts=True)
+                                    for p, n in zip(keys, nums):
+                                        counts[int(p)] = counts.get(int(p),0)+int(n)
+                                else:
+                                    for p in values:
+                                        counts[p] = counts.get(p,0)+1
+                            self._part_element_counts = counts
+                        total = sum(self._part_element_counts.get(p,0) for p in pids)
+                        selected = sum(len(v) for v in groups.values())
+                        if total > selected:
+                            self.log.warn('혼합 SET "%s": SET_PART 변환으로 선택 범위가 %d개에서 %d개 요소로 확대됩니다.' % (title,selected,total))
+                        continue
                     for cat, members in groups.items():
                         title2 = title + ("_" + cat.upper() if len(groups) > 1 else "")
                         key = (cat, title2)
@@ -1916,6 +1981,47 @@ class Converter:
             if cat:
                 groups.setdefault(names[cat],[]).append(eid)
         return groups
+
+    def part_ids_for_elements(self, ids):
+        if not HAVE_NUMPY:
+            found = []
+            for eid in ids:
+                loc = self.element_location(eid)
+                if loc:
+                    ctx, bi, row = loc
+                    arr = self._part_pid_blocks.get((ctx["eOff"], id(ctx["P"].eblocks[bi])))
+                    if arr is not None and arr[row]:
+                        found.append(int(arr[row]))
+            return ordered_unique(found)
+        src = np.asarray(ids,dtype=np.int64)
+        pids = np.zeros(len(src),dtype=np.int64)
+        owners = np.searchsorted(self._element_starts,src,side="right")-1
+        for owner in np.unique(owners):
+            if owner < 0:
+                continue
+            lo,hi,ctx,_ = self._element_ranges[int(owner)]
+            rows = np.flatnonzero((owners == owner) & (src <= hi))
+            idx = ctx["index"]
+            if not idx.np_mode:
+                for row in rows:
+                    loc = idx.one(int(src[row])-ctx["eOff"])
+                    if loc:
+                        bi,k = loc
+                        pids[row] = self._part_pid_blocks[(ctx["eOff"],id(ctx["P"].eblocks[bi]))][k]
+                continue
+            local = src[rows]-ctx["eOff"]
+            pos = np.searchsorted(idx.sorted,local)
+            valid = pos < idx.total
+            rows,local,pos = rows[valid],local[valid],pos[valid]
+            valid = idx.sorted[pos] == local
+            rows,pos = rows[valid],pos[valid]
+            flat = idx.order[pos]
+            blocks = np.searchsorted(idx.starts,flat,side="right")-1
+            for bi in np.unique(blocks):
+                mask = blocks == bi
+                arr = self._part_pid_blocks[(ctx["eOff"],id(ctx["P"].eblocks[int(bi)]))]
+                pids[rows[mask]] = np.asarray(arr)[flat[mask]-idx.starts[int(bi)]]
+        return ordered_unique(int(p) for p in pids if p)
 
     def element_location(self, eid):
         for ctx in self.contexts.values():
@@ -2385,6 +2491,8 @@ class Converter:
             if need_fb:
                 fb = self.fallback_pid(cat, fallback, sec_of_pid)
                 pid_arr = _fill_zero(pid_arr, fb)
+
+        self._part_pid_blocks[(e_off, id(blk))] = pid_arr
 
         # 접촉면용 연결 정보
         if (seg_eids or self.opt.get("auto_sets", True)) and cat in ("solid", "shell"):
@@ -3699,7 +3807,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K v2.0  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v2.1  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
