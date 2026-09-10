@@ -3,7 +3,20 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.2
+현재 버전: v2.3
+최신 수정사항 — GUI 간소화 / 전체 접촉 종류 선택 / 상세 설정·JSON 프리셋
+- GUI에서는 2차 사면체 유지·보 방향절점·자동 끝단 SET을 항상 ON,
+  단위계는 mm·ton·s로 고정합니다(입력 수치 자동 환산 아님).
+- ELSET_ALL(900001)을 참조하는 선택한 AUTOMATIC_SINGLE_SURFACE_ID 또는
+  ERODING_SINGLE_SURFACE_ID 접촉을 추가합니다.
+- 상세 설정: shell ELFORM(auto/2/16), solid ELFORM(auto/1/2), 접촉 FS/FD/VDC/
+  SST/MST/SOFT/SBOPT/DEPTH/BSORT, shell/solid별 IHQ/QM/IBQ/Q1/Q2/QB/QW.
+- 솔리드 지정은 육면체 전용 프로퍼티에 적용하며, 혼합·축약 요소는 기존
+  호환 공식을 유지합니다. 순수 C3D10의 ELFORM=16 유지 규칙도 보존합니다.
+- 접촉 공란은 기존 값을 유지합니다. SOFT/SBOPT/DEPTH/BSORT는 비-TIE 접촉에
+  적용하고, TIE의 기존 공란 필드는 유지합니다. 상세 설정 창에서 JSON 저장/불러오기를 지원합니다.
+
+이전 버전: v2.2
 최신 수정사항 — 중앙 하부 PART 자동 탐색 / 평면 각도 배열 계산 / 완료 버튼
 - 전체 구조 메시 XY 경계상자 중심의 수직선과 만나는 가장 낮은 면의 PART를
   자동 선택하여 RIGID_Z를 생성합니다. 이름/PID 입력은 필요하지 않습니다.
@@ -133,6 +146,7 @@ v1.7:
 import os
 import re
 import sys
+import json
 import math
 import time
 import shutil
@@ -157,7 +171,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.2"
+VERSION = "2.3"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -1897,6 +1911,11 @@ class Converter:
                                  title="HG_" + kind.upper(), rule=kind)
                             for hgid, kind in ((1, "shell"), (2, "solid"))
                             for values in [HOURGLASS_DEFAULTS[kind]]]
+        for hg in self.hourglasses:
+            for field in ("ihq", "qm", "ibq", "q1", "q2", "qb", "qw"):
+                value = self.opt.get("hg_" + hg["rule"] + "_" + field)
+                if value is not None:
+                    hg[field] = value
         n = 0
         for p in self.parts:
             p["hgid"] = {"shell": 1, "solid": 2}.get(sections[p["secid"]].get("kind"), 0)
@@ -2227,6 +2246,15 @@ class Converter:
         if self.opt.get("auto_sets", True):
             self.post_stage(80, "자동 SET 생성 시작")
             self.add_automatic_sets()
+        if any(s["sid"] == 900001 and s["kind"] == "part" for s in self.set_output):
+            if m.general_contact:
+                self.log.warn("원본 General Contact는 선택한 ELSET_ALL 접촉으로 대체합니다. 제외 조건은 옮기지 않습니다.")
+            self.contacts.append(dict(cid=max([c["cid"] for c in self.contacts] or [0])+1,
+                kind=self.opt.get("all_contact", "ERODING_SINGLE_SURFACE")+"_ID",
+                title="ELSET_ALL_CONTACT",
+                ssid=900001, msid=0, sstyp=2, mstyp=0,
+                fs=self.opt.get("mu", .2), fd=self.opt.get("mu", .2)))
+            self.log.ok("전체 접촉 추가: %s → ELSET_ALL (900001)" % self.contacts[-1]["kind"])
         self.finalize_nrb_ids()
 
         if m.unsupported:
@@ -2333,6 +2361,12 @@ class Converter:
             if self.opt["tet10"] and "tet10" in subs and not keep_tet10:
                 self.log.warn('프로퍼티 "%s": 다른 솔리드 형상과 공통 PART를 유지하기 위해 '
                               'C3D10을 코너 4절점으로 축약합니다.' % sec["elset"])
+        if cat == "solid" and self.opt.get("solid", "auto") != "auto":
+            if {c["sub"] for c in classes} <= {"hex8", "hex20"}:
+                S["elform"] = int(self.opt["solid"])
+            else:
+                self.log.info('프로퍼티 "%s": 요소 연결 호환성을 위해 ELFORM=%s 유지'
+                              % (sec["elset"], S["elform"]))
         if len({(c["sub"], c["red"]) for c in classes}) > 1:
             self.log.info('프로퍼티 "%s": 혼합 요소를 하나의 PART/SECTION(ELFORM=%s)에 연결합니다.'
                           % (sec["elset"], S.get("elform", "-")))
@@ -2984,7 +3018,7 @@ class Converter:
                         else "TIED_SURFACE_TO_SURFACE_OFFSET_ID")
                 self.add_contact(kind, tie["name"], S, M, 0.0)
 
-        if m.general_contact:
+        if m.general_contact and not opt.get("auto_sets", True):
             self.contacts.append(dict(cid=len(self.contacts) + 1,
                                       kind="AUTOMATIC_SINGLE_SURFACE_ID",
                                       title="GENERAL_CONTACT", ssid=0, msid=0,
@@ -3308,9 +3342,10 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         put("*HOURGLASS_TITLE")
         put(hg["title"][:80])
         put("$#    hgid       ihq        qm       ibq        q1        q2    qb/vdc        qw")
-        put(i10(hg["hgid"]) + i10(hg["ihq"]) + f10(hg["qm"]) + " " * 30
-            + (f10(hg["qb"]) if hg["qb"] is not None else " " * 10)
-            + (f10(hg["qw"]) if hg["qw"] is not None else " " * 10))
+        put(i10(hg["hgid"]) + "".join(
+            " " * 10 if hg.get(k) is None else
+            (i10(hg[k]) if k in ("ihq", "ibq") else f10(hg[k]))
+            for k in ("ihq", "qm", "ibq", "q1", "q2", "qb", "qw")))
 
     for s in cv.sections:
         k = s.get("kind")
@@ -3476,7 +3511,11 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         for nid, dof, coef in q["terms"]:
             put(i10(nid) + i10(dof) + f10(coef))
 
-    for c in getattr(cv, "contacts", []):
+    for original in getattr(cv, "contacts", []):
+        c = dict(original)
+        for k in ("fs", "fd", "vdc", "sst", "mst"):
+            if opt.get("contact_" + k) is not None:
+                c[k] = opt["contact_" + k]
         put("*CONTACT_" + c["kind"])
         put("$#     cid                                                               heading")
         put(i10(c["cid"]) + c["title"][:70])
@@ -3487,14 +3526,30 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         tied = c["kind"].startswith("TIED_")
         if tied:
             put(f10(c["fs"]) + f10(c["fd"]) + " " * 20
-                + f10(20) + i10(0) + " " * 20)
+                + f10(c.get("vdc", 20)) + i10(0) + " " * 20)
         else:
-            put(f10(c["fs"]) + f10(c["fd"]) + f10(0) * 2 + f10(20) + i10(0) + f10(0) + f10(1e20))
+            put(f10(c["fs"]) + f10(c["fd"]) + f10(0) * 2 + f10(c.get("vdc", 20)) + i10(0) + f10(0) + f10(1e20))
         put("$#     sfs       sfm       sst       mst      sfst      sfmt       fsf       vsf")
         if tied:
-            put(" " * 20 + f10(0) * 2 + " " * 40)
+            put(" " * 20 + f10(c.get("sst", 0)) + f10(c.get("mst", 0)) + " " * 40)
         else:
-            put(f10(1) * 2 + f10(0) * 2 + f10(1) * 4)
+            put(f10(1) * 2 + f10(c.get("sst", 0)) + f10(c.get("mst", 0)) + f10(1) * 4)
+        if c["kind"].startswith("ERODING_"):
+            # Required eroding card precedes optional contact card A.
+            # Layout: ansys/pydyna auto/contact/contact_eroding_single_surface.py.
+            put("$#    isym    erosop      iadj")
+            put(i10(0) * 3)
+        if not tied and any(opt.get("contact_"+k) is not None
+                            for k in ("soft", "sbopt", "depth", "bsort")):
+            put("$#    soft    sofscl    lcidab    maxpar     sbopt     depth     bsort    frcfrq")
+            put("".join(" " * 10 if value is None else
+                        (i10(value) if integer else f10(value))
+                        for value, integer in (
+                            (opt.get("contact_soft", 0), True), (.1, False),
+                            (0, True), (1.025, False),
+                            (opt.get("contact_sbopt", 2), True),
+                            (opt.get("contact_depth", 2), True),
+                            (opt.get("contact_bsort"), True), (1, True))))
 
     put("*END")
     size = W.tell()
@@ -3510,8 +3565,78 @@ def write_k(cv, opt, out_path, src_name, progress=None):
 # ============================================================
 # 전체 파이프라인
 # ============================================================
-DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=False, tet10=False,
-                   beamNode=True, contact=True, mu=0.2, shell="auto", unit="mmts", auto_sets=True)
+DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=False, tet10=True,
+                   beamNode=True, contact=True, mu=0.2, shell="auto", unit="mmts", auto_sets=True, solid="auto", all_contact="ERODING_SINGLE_SURFACE")
+
+
+def detail_defaults():
+    result = dict(solid="auto", shell="auto", all_contact="ERODING_SINGLE_SURFACE")
+    # Blank FS/FD preserves each source interaction's friction coefficient.
+    for k, value in dict(fs="", fd="", vdc=20, sst=0, mst=0,
+                         soft="", sbopt="", depth="", bsort="").items():
+        result["contact_"+k] = value
+    for kind, vals in HOURGLASS_DEFAULTS.items():
+        defaults = dict(zip(("ihq", "qm", "qb", "qw"), vals))
+        for k in ("ihq", "qm", "ibq", "q1", "q2", "qb", "qw"):
+            result["hg_"+kind+"_"+k] = defaults.get(k) if defaults.get(k) is not None else ""
+    return result
+
+
+def save_detail_settings(path, values):
+    values = parse_detail_settings(values)
+    # Validate before touching an existing preset.
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(dict(format="inp2k-settings", schema_version=1, settings=values),
+                  stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+
+
+def load_detail_settings(path):
+    with open(path, encoding="utf-8-sig") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict) or data.get("format") != "inp2k-settings" or data.get("schema_version") != 1:
+        raise ValueError("INP2K 설정 JSON 형식/버전이 아닙니다.")
+    return parse_detail_settings(data.get("settings"))
+
+
+def parse_detail_settings(raw):
+    """Validate before any output is opened. Blank fields preserve old behavior."""
+    if not isinstance(raw, dict):
+        raise ValueError("설정은 JSON 객체여야 합니다.")
+    allowed = set(detail_defaults())
+    if set(raw) - allowed:
+        raise ValueError("알 수 없는 설정: " + ", ".join(sorted(set(raw)-allowed)))
+    result = {}
+    for key, text in raw.items():
+        text = str(text).strip()
+        if not text:
+            continue
+        if key == "all_contact":
+            if text not in ("AUTOMATIC_SINGLE_SURFACE", "ERODING_SINGLE_SURFACE"):
+                raise ValueError("전체 접촉 종류를 확인하세요.")
+            result[key] = text
+            continue
+        if key in ("shell", "solid"):
+            choices = ("auto", "2", "16") if key == "shell" else ("auto", "1", "2")
+            if text not in choices:
+                raise ValueError(key + ": 지원하지 않는 ELFORM")
+            result[key] = text
+            continue
+        integer = key.rsplit("_", 1)[-1] in ("ihq", "ibq", "soft", "sbopt", "depth", "bsort")
+        try:
+            value = float(text)
+            if not math.isfinite(value) or (integer and value != int(value)):
+                raise ValueError()
+            if value < 0 and key != "contact_bsort":
+                raise ValueError()
+            if key == "contact_soft" and value not in (0, 1, 2):
+                raise ValueError()
+            if key.endswith("_ihq") and value not in range(0, 11):
+                raise ValueError()
+        except (ValueError, OverflowError):
+            raise ValueError(key.upper() + ": 유효한 " + ("정수" if integer else "숫자") + "를 입력하세요.")
+        result[key] = int(value) if integer else value
+    return result
 
 
 def convert_file(inp_path, out_path, opt, log, progress=None):
@@ -3880,7 +4005,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K v2.2  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v2.3  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
@@ -4000,10 +4125,7 @@ def run_gui():
     items = [("sets", "세트 출력", "SET_NODE_LIST / SET_SOLID"),
              ("mat", "재료·단면", "MAT / SECTION"),
              ("bc", "경계조건", "BOUNDARY_SPC_SET"),
-             ("contact", "접촉·구속", "CONTACT / CONSTRAINED"),
-             ("tet10", "2차 사면체 유지", "C3D10 전용 프로퍼티에 적용"),
-             ("beamNode", "보 방향절점", "단면 n1로 자동 생성"),
-             ("auto_sets", "자동 끝단 SET", "ELSET_ALL / RIGID_Y / RIGID_Z")]
+             ("contact", "접촉·구속", "원본 CONTACT / CONSTRAINED")]
     grid = tk.Frame(f2, bg=P["card"])
     grid.pack(fill="x")
     for i, (k, lab, sub) in enumerate(items):
@@ -4015,23 +4137,96 @@ def run_gui():
 
     r2 = tk.Frame(f2, bg=P["card"])
     r2.pack(fill="x", pady=(14, 0))
-    tk.Label(r2, text="쉘 formulation", bg=P["card"], fg=P["faint"],
-             font=F_SM).pack(side="left", padx=(0, 8))
-    seg_shell = Segmented(r2, [("auto", "자동"), ("2", "2 · BT"), ("16", "16 · 완전적분")],
-                          0, font=F_SM)
-    seg_shell.pack(side="left")
-    tk.Label(r2, text="단위계", bg=P["card"], fg=P["faint"],
-             font=F_SM).pack(side="left", padx=(20, 8))
-    seg_unit = Segmented(r2, [("mmts", "mm·ton·s"), ("mkgs", "m·kg·s"),
-                              ("mmkgms", "mm·kg·ms")], 0, font=F_SM)
-    seg_unit.pack(side="left")
-    tk.Label(r2, text="마찰계수", bg=P["card"], fg=P["faint"],
-             font=F_SM).pack(side="left", padx=(20, 8))
-    muvar = tk.StringVar(value="0.2")
-    tk.Entry(r2, textvariable=muvar, width=6, font=F_BODY, bg=P["card2"], fg=P["text"],
-             insertbackground=P["text"], relief="flat", bd=0, justify="center",
-             highlightthickness=1, highlightbackground=P["line"],
-             highlightcolor=P["accent"]).pack(side="left", ipady=5)
+    detail = parse_detail_settings(detail_defaults())
+
+    def show_details():
+        if state["busy"]:
+            return
+        win = tk.Toplevel(root)
+        win.title("상세 설정")
+        win.configure(bg=P["card"])
+        win.transient(root)
+        win.grab_set()
+        from tkinter import ttk, messagebox
+        style = ttk.Style(win)
+        style.configure("Details.TNotebook.Tab", font=F_SM)
+        book = ttk.Notebook(win, style="Details.TNotebook")
+        book.pack(fill="both", expand=True, padx=16, pady=16)
+        variables = {}
+        groups = [
+            ("Formulation", [("all_contact", "전체 접촉", "ERODING_SINGLE_SURFACE"),
+                             ("solid", "Solid ELFORM (육면체 전용)", "auto"),
+                             ("shell", "Shell ELFORM", "auto")]),
+            ("Contact", [("contact_"+k, k.upper() + (" (공란: 원본, 없으면 0.2)" if k in ("fs", "fd") else ""), detail_defaults()["contact_"+k])
+                         for k in ("fs", "fd", "vdc", "sst", "mst", "soft", "sbopt", "depth", "bsort")]),
+        ]
+        for kind in ("shell", "solid"):
+            defaults = dict(zip(("ihq", "qm", "qb", "qw"), HOURGLASS_DEFAULTS[kind]))
+            groups.append(("Hourglass " + kind, [("hg_"+kind+"_"+k, k.upper(),
+                           "" if defaults.get(k) is None else str(defaults[k]))
+                           for k in ("ihq", "qm", "ibq", "q1", "q2", "qb", "qw")]))
+        for title, fields in groups:
+            tab = tk.Frame(book, bg=P["card"])
+            book.add(tab, text=title)
+            for row, (key, label, default) in enumerate(fields):
+                tk.Label(tab, text=label, font=F_BODY, bg=P["card"], fg=P["text"]).grid(
+                    row=row, column=0, sticky="w", padx=14, pady=6)
+                var = tk.StringVar(value=str(detail.get(key, "")))
+                variables[key] = var
+                if key == "all_contact":
+                    entry = ttk.Combobox(tab, textvariable=var, state="readonly",
+                        values=("AUTOMATIC_SINGLE_SURFACE", "ERODING_SINGLE_SURFACE"), font=F_SM, width=30)
+                elif key in ("solid", "shell"):
+                    entry = ttk.Combobox(tab, textvariable=var, state="readonly",
+                        values=("auto", "1", "2") if key == "solid" else ("auto", "2", "16"),
+                        font=F_BODY, width=16)
+                else:
+                    entry = tk.Entry(tab, textvariable=var, font=F_BODY, width=18)
+                entry.grid(row=row, column=1, padx=14, pady=6)
+        tk.Label(win, text="공란: 기존값 유지 · FS/FD 등은 전체 접촉에 공통 적용\n"
+                 "SOFT/SBOPT/DEPTH/BSORT는 비-TIE 접촉에 적용\n"
+                 "General Contact = AUTOMATIC_SINGLE_SURFACE · 순수 C3D10은 ELFORM 16 유지",
+                 bg=P["card"], fg=P["faint"], font=F_SM).pack(padx=16, pady=6)
+        def save_json():
+            try:
+                values = parse_detail_settings({k: v.get() for k, v in variables.items()})
+                path = filedialog.asksaveasfilename(parent=win, defaultextension=".json",
+                    initialfile="inp2k-settings.json", filetypes=[("JSON", "*.json")])
+                if path:
+                    save_detail_settings(path, values)
+            except (ValueError, OSError) as exc:
+                messagebox.showerror("설정 저장 실패", str(exc), parent=win)
+        def load_json():
+            path = filedialog.askopenfilename(parent=win, filetypes=[("JSON", "*.json")])
+            if not path:
+                return
+            try:
+                values = load_detail_settings(path)
+            except (ValueError, OSError) as exc:
+                messagebox.showerror("설정 불러오기 실패", str(exc), parent=win)
+                return
+            for key, var in variables.items():
+                var.set(values.get(key, detail_defaults()[key] if key in ("shell", "solid", "all_contact") else ""))
+        def reset():
+            for key, value in detail_defaults().items():
+                variables[key].set(value)
+        def apply():
+            try:
+                values = parse_detail_settings({k: v.get() for k, v in variables.items()})
+            except ValueError as exc:
+                messagebox.showerror("설정 확인", str(exc), parent=win)
+                return
+            detail.clear()
+            detail.update(values)
+            win.destroy()
+        buttons = tk.Frame(win, bg=P["card"])
+        buttons.pack(pady=12)
+        RButton(buttons, "JSON 저장", save_json, kind="ghost", w=100, h=34, font=F_LB).pack(side="left", padx=4)
+        RButton(buttons, "불러오기", load_json, kind="ghost", w=100, h=34, font=F_LB).pack(side="left", padx=4)
+        RButton(buttons, "초기값", reset, kind="ghost", w=80, h=34, font=F_LB).pack(side="left", padx=4)
+        RButton(buttons, "적용", apply, kind="primary", w=90, h=34, font=F_LB).pack(side="left", padx=6)
+        RButton(buttons, "취소", win.destroy, kind="ghost", w=90, h=34, font=F_LB).pack(side="left", padx=6)
+    RButton(r2, "상세 설정", show_details, kind="ghost", w=120, h=34, font=F_LB).pack(side="left")
 
     # ---------- 실행 ----------
     c3, f3 = card(wrap, "", F_HD)
@@ -4119,12 +4314,8 @@ def run_gui():
         opt = dict(DEFAULT_OPT)
         for k, s_ in sw.items():
             opt[k] = s_.get()
-        opt["shell"] = seg_shell.get()
-        opt["unit"] = seg_unit.get()
-        try:
-            opt["mu"] = float(muvar.get())
-        except ValueError:
-            opt["mu"] = 0.2
+        opt.update(detail)
+        opt.update(tet10=True, beamNode=True, auto_sets=True, unit="mmts")
         txt.delete("1.0", "end")
         add_line("head", "▶  " + os.path.basename(state["path"]))
         state["busy"] = True
