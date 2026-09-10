@@ -3,7 +3,17 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.1
+현재 버전: v2.2
+최신 수정사항 — 중앙 하부 PART 자동 탐색 / 평면 각도 배열 계산 / 완료 버튼
+- 전체 구조 메시 XY 경계상자 중심의 수직선과 만나는 가장 낮은 면의 PART를
+  자동 선택하여 RIGID_Z를 생성합니다. 이름/PID 입력은 필요하지 않습니다.
+- 선택한 PART의 XY 평면 10도 이내 아랫면, 전체 모델의 XZ 평면 10도 이내
+  +Y 끝단면을 사용합니다. 중심선이 빈 곳을 지나면 RIGID_Z를 생략하고 경고합니다.
+- NumPy 사용 시 5만 요소씩 면을 추출하고 2만 면씩 평면 각도를 배열 계산하며
+  외곽면 결과를 재사용합니다. 평면 각도와 기존 축-법선 각도 조건은 동등합니다.
+- 변환 성공 후 활성화되는 완료 버튼을 누르면 창이 닫힙니다.
+
+v2.1 변경 이력:
 최신 수정사항 — 혼합 SET 통합 및 SEGMENT 명명/순서 정리
 - Solid와 Shell이 함께 있는 ELSET은 원래 이름의 SET_PART_LIST 하나로 출력합니다.
   참조 PART의 모든 요소가 포함되므로, 부분 요소 SET의 범위가 확대되면 경고합니다.
@@ -147,7 +157,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.1"
+VERSION = "2.2"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -1626,84 +1636,120 @@ class Converter:
                         (name, sid, len(ids), "PART" if kind == "part" else "NODE"))
 
         add("part", 900001, "ELSET_ALL", [p["pid"] for p in self.parts])
-        xyz = self.node_coord
         started = time.monotonic()
-        self.log.info("자동 SET: 외곽면 탐색 시작 (%s 요소, %s)" %
-                      (f"{len(self._auto_elem_info):,}", "NumPy 가속" if HAVE_NUMPY else "Python 경로"))
         if HAVE_NUMPY:
-            records, structural_nodes = self.automatic_exterior_numpy()
+            records,nodes = self.automatic_exterior_numpy()
         else:
-            records, structural_nodes = self.automatic_exterior_python()
-        self.post_stage(85, "자동 SET: 외곽면 법선 계산")
-        if any(n not in xyz for n in structural_nodes):
-            raise ValueError("자동 끝단 SET: 정의되지 않은 표면 절점이 있습니다.")
-        # Newell normal, calculated relative to one point for translation stability.
-        geometry = []
-        for ri, (face, center, members) in enumerate(records):
-            if ri % 10000 == 0:
-                self.post_stage(85 + ri/max(len(records),1), "자동 SET: 법선 %d/%d" % (ri,len(records)))
-            pts = [xyz[n] for n in face]
-            origin = pts[0]
-            pts = [tuple(p[j]-origin[j] for j in range(3)) for p in pts]
-            normal = [0.0, 0.0, 0.0]
-            for a, b in zip(pts, pts[1:] + pts[:1]):
-                normal[0] += a[1]*b[2]-a[2]*b[1]
-                normal[1] += a[2]*b[0]-a[0]*b[2]
-                normal[2] += a[0]*b[1]-a[1]*b[0]
-            norm = math.sqrt(sum(x*x for x in normal))
-            if not norm:
-                continue
-            normal = [x/norm for x in normal]
-            two_sided = center is True
-            if not two_sided:
-                fc = [sum(xyz[n][j] for n in face)/len(face) for j in range(3)]
-                if sum(normal[j]*(fc[j]-center[j]) for j in range(3)) < 0:
-                    normal = [-x for x in normal]
-            geometry.append((face, normal, two_sided, members))
-        cosine = math.cos(math.radians(10.0))
-        for axis, sign, sid, name in ((1, 1, 200001, "RIGID_Y"), (2, -1, 200002, "RIGID_Z")):
-            base_pct = 86 if axis == 1 else 88
-            self.post_stage(base_pct, name + ": 각도 필터 및 연결면 탐색")
-            if not structural_nodes:
-                add("node", sid, name, [])
-                continue
-            projections = [sign*xyz[n][axis] for n in structural_nodes]
-            extreme = max(projections)
-            tolerance = max((extreme-min(projections))*1e-8,
-                            max(abs(x) for x in projections)*2e-15, 1e-12)
-            candidates = []
-            edges = {}
-            seeds = []
-            for gi, (face, normal, two_sided, members) in enumerate(geometry):
-                if gi % 10000 == 0:
-                    self.post_stage(base_pct + .5*gi/max(len(geometry),1), name + ": 후보 면 %d/%d" % (gi,len(geometry)))
-                dot = normal[axis]*sign
-                if (abs(dot) if two_sided else dot) < cosine-1e-12:
-                    continue
-                i = len(candidates)
-                candidates.append((face, members))
-                if any(extreme-sign*xyz[n][axis] <= tolerance for n in face):
-                    seeds.append(i)
-                for a, b in zip(face, face[1:] + face[:1]):
-                    edges.setdefault(tuple(sorted((a,b))), []).append(i)
-            selected = set(seeds)
-            pending = list(seeds)
-            visited = 0
-            while pending:
-                face, _ = candidates[pending.pop()]
-                visited += 1
-                if visited % 10000 == 0:
-                    self.post_stage(base_pct+.5, name + ": 연결면 %d개 처리" % visited)
-                for a, b in zip(face, face[1:] + face[:1]):
-                    for neighbor in edges.pop(tuple(sorted((a,b))), []):
-                        if neighbor not in selected:
-                            selected.add(neighbor)
-                            pending.append(neighbor)
-            ids = sorted({n for i in selected for n in candidates[i][1]})
-            add("node", sid, name, ids)
-        self.post_stage(89.5, "자동 SET 생성 완료")
-        self.log.ok("자동 SET 완료: %.2f초" % (time.monotonic()-started))
+            records,nodes = self.automatic_exterior_python()
+        add("node",200001,"RIGID_Y",self.select_plane_end(records,nodes,1,1,"RIGID_Y"))
+        pid = self.center_bottom_part(records,nodes)
+        if pid is None:
+            self.log.warn("RIGID_Z: XY 중심선과 만나는 면이 없어 자동 선택을 생략합니다. 중앙 구멍/분리 형상을 확인하세요.")
+        else:
+            title = next((p["title"] for p in self.parts if p["pid"] == pid),str(pid))
+            self.log.info("RIGID_Z 중앙 최하단 PART 자동 선택: %s (PID=%d)" % (title,pid))
+            subset = [rec for rec,p in zip(records,self._exterior_pids) if p == pid]
+            selected_nodes = {n for face,_,_ in subset for n in face}
+            add("node",200002,"RIGID_Z",self.select_plane_end(subset,selected_nodes,2,-1,"RIGID_Z"))
         self._auto_elem_info.clear()
+        self.post_stage(89.5,"자동 SET 생성 완료")
+        self.log.ok("자동 SET 완료: %.2f초" % (time.monotonic()-started))
+
+    def center_bottom_part(self, records, nodes):
+        """Lowest face intersection of the vertical ray through structural XY center."""
+        if not nodes:
+            return None
+        xyz = self.node_coord
+        cx = (min(xyz[n][0] for n in nodes)+max(xyz[n][0] for n in nodes))/2
+        cy = (min(xyz[n][1] for n in nodes)+max(xyz[n][1] for n in nodes))/2
+        self.log.info("중앙 검색선: X=%.9g, Y=%.9g" % (cx,cy))
+        best = None
+        for i,(face,_,_) in enumerate(records):
+            points = [xyz[n] for n in face]
+            if not (min(p[0] for p in points)-1e-10 <= cx <= max(p[0] for p in points)+1e-10 and
+                    min(p[1] for p in points)-1e-10 <= cy <= max(p[1] for p in points)+1e-10):
+                continue
+            for j in range(1,len(points)-1):
+                a,b,c = points[0],points[j],points[j+1]
+                bx,by = b[0]-a[0],b[1]-a[1]
+                dx,dy = c[0]-a[0],c[1]-a[1]
+                det = bx*dy-by*dx
+                if abs(det) <= 1e-14*max(abs(bx*dy),abs(by*dx),1e-300):
+                    continue
+                px,py = cx-a[0],cy-a[1]
+                u,v = (px*dy-py*dx)/det,(bx*py-by*px)/det
+                if u >= -1e-9 and v >= -1e-9 and u+v <= 1+1e-9:
+                    z = a[2]+u*(b[2]-a[2])+v*(c[2]-a[2])
+                    candidate = (z,self._exterior_pids[i])
+                    if best is None or candidate < best:
+                        best = candidate
+        return best[1] if best else None
+
+    def select_plane_end(self, records, nodes, axis, sign, name):
+        """Plane-angle filtering in vectorized chunks, with boundary connectivity.
+        XY/10deg and XZ/10deg are the same geometric test as the respective
+        axis-normal angles. Selection still excludes disconnected recessed faces.
+        """
+        if not nodes:
+            return []
+        xyz = self.node_coord
+        projections = [sign*xyz[n][axis] for n in nodes]
+        extreme = max(projections)
+        tolerance = max((extreme-min(projections))*1e-8,
+                        max(abs(x) for x in projections)*2e-15,1e-12)
+        cosine = math.cos(math.radians(10))
+        candidates = []
+        for start in range(0,len(records),20000):
+            chunk = records[start:start+20000]
+            self.post_stage(85 if axis == 1 else 88,
+                            "%s 평면 각도: %d/%d 면" % (name,start,len(records)))
+            if HAVE_NUMPY:
+                pts = np.asarray([[xyz[n] for n in (list(face)+[face[-1]]*(4-len(face)))]
+                                  for face,_,_ in chunk],dtype=np.float64)
+                relative = pts-pts[:,0:1,:]
+                normal = np.cross(relative[:,1],relative[:,2])+np.cross(relative[:,2],relative[:,3])
+                length = np.linalg.norm(normal,axis=1)
+                centers = np.asarray([center if center is not True else (0,0,0)
+                                      for _,center,_ in chunk],dtype=np.float64)
+                two_sided = np.asarray([center is True for _,center,_ in chunk])
+                inward = np.sum(normal*(pts.mean(axis=1)-centers),axis=1) < 0
+                component = normal[:,axis]*sign
+                component = np.where(two_sided,np.abs(component),
+                                     np.where(inward,-component,component))
+                keep = np.flatnonzero((length > 0) & (component >= (cosine-1e-12)*length))
+            else:
+                keep = []
+                for i,(face,center,_) in enumerate(chunk):
+                    p = [xyz[n] for n in face]
+                    p += [p[-1]]*(4-len(p))
+                    a,b,c = [[p[k][j]-p[0][j] for j in range(3)] for k in (1,2,3)]
+                    cross = lambda u,v: (u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0])
+                    ab,bc = cross(a,b),cross(b,c)
+                    normal = [ab[j]+bc[j] for j in range(3)]
+                    length = math.sqrt(sum(v*v for v in normal))
+                    dot = normal[axis]*sign
+                    if center is True:
+                        dot = abs(dot)
+                    elif sum(normal[j]*(sum(v[j] for v in p)/4-center[j]) for j in range(3)) < 0:
+                        dot = -dot
+                    if length and dot >= (cosine-1e-12)*length:
+                        keep.append(i)
+            candidates.extend((chunk[i][0],chunk[i][2]) for i in keep)
+        edges,seeds = {},[]
+        for i,(face,_) in enumerate(candidates):
+            if any(extreme-sign*xyz[n][axis] <= tolerance for n in face):
+                seeds.append(i)
+            for a,b in zip(face,face[1:]+face[:1]):
+                edges.setdefault(tuple(sorted((a,b))),[]).append(i)
+        selected,pending = set(seeds),list(seeds)
+        while pending:
+            face,_ = candidates[pending.pop()]
+            for a,b in zip(face,face[1:]+face[:1]):
+                for neighbor in edges.pop(tuple(sorted((a,b))),[]):
+                    if neighbor not in selected:
+                        selected.add(neighbor)
+                        pending.append(neighbor)
+        return sorted({n for i in selected for n in candidates[i][1]})
 
     def post_stage(self, pct, label):
         pct = max(pct, getattr(self, "_last_post_pct", 0))
@@ -1725,28 +1771,51 @@ class Converter:
         local_ids = np.empty(capacity, dtype=np.uint8)
         nodes = set()
         shells = []
+        record_pids = []
         count = 0
         tables = {sub: list(table.values()) for sub, table in FACE.items()}
-        for owner, info in enumerate(infos):
-            if owner % 10000 == 0:
-                self.post_stage(80+2*owner/max(len(infos),1), "자동 SET: 면 추출 %d/%d" % (owner,len(infos)))
-            c = info['c']
-            if info['cat'] == 'shell':
-                face = tuple(ordered_unique(c[:4] if info['sub'].startswith('quad') else c[:3]))
-                shells.append((face, True, face))
+        groups = {}
+        for owner,info in enumerate(infos):
+            c = info["c"]
+            if info["cat"] == "shell":
+                face = tuple(ordered_unique(c[:4] if info["sub"].startswith("quad") else c[:3]))
+                shells.append((face,True,face))
+                record_pids.append(info.get("pid",0))
                 nodes.update(face)
-                continue
-            seen = set()
-            for fi, local in enumerate(tables.get(info['sub'], [])):
-                face = tuple(sorted(set(c[i] for i in local)))
-                nodes.update(face)
-                if len(face) < 3 or face in seen:
-                    continue
-                seen.add(face)
-                keys[count, :len(face)] = face
-                owners[count] = owner
-                local_ids[count] = fi
-                count += 1
+            elif info["sub"] in tables:
+                groups.setdefault(info["sub"],[]).append(owner)
+        processed = 0
+        for sub,group in groups.items():
+            table = tables[sub]
+            nn = max(i for f in table for i in f)+1
+            for start in range(0,len(group),50000):
+                own = np.asarray(group[start:start+50000],dtype=owners.dtype)
+                cn = np.asarray([infos[int(o)]["c"][:nn] for o in own],dtype=keys.dtype)
+                nodes.update(np.unique(cn).tolist())
+                ordered = np.sort(cn,axis=1)
+                repeated = np.any(ordered[:,1:] == ordered[:,:-1],axis=1)
+                regular = np.flatnonzero(~repeated)
+                for fi,local in enumerate(table):
+                    n = len(regular)
+                    face = np.sort(cn[regular][:,local],axis=1)
+                    keys[count:count+n,:len(local)] = face
+                    owners[count:count+n] = own[regular]
+                    local_ids[count:count+n] = fi
+                    count += n
+                for row in np.flatnonzero(repeated):
+                    seen = set()
+                    for fi,local in enumerate(table):
+                        face = tuple(sorted(set(int(cn[row,i]) for i in local)))
+                        if len(face)<3 or face in seen:
+                            continue
+                        seen.add(face)
+                        keys[count,:len(face)] = face
+                        owners[count] = own[row]
+                        local_ids[count] = fi
+                        count += 1
+                processed += len(own)
+                self.post_stage(80+2*processed/max(len(infos),1),
+                                "자동 SET: 배열 면 추출 %d/%d" % (processed,len(infos)))
         self.post_stage(82, "자동 SET: %s개 면 정렬/내부면 제거" % f"{count:,}")
         keys = keys[:count]
         order = np.lexsort((keys[:,3],keys[:,2],keys[:,1],keys[:,0]))
@@ -1775,6 +1844,8 @@ class Converter:
                     if c[a] in face and c[b] in face:
                         members.append(c[mid])
             records.append((face,center,tuple(ordered_unique(members))))
+            record_pids.append(info.get("pid",0))
+        self._exterior_pids = record_pids
         return records,nodes
 
     def automatic_exterior_python(self):
@@ -1788,7 +1859,7 @@ class Converter:
             c = info["c"]
             if info["cat"] == "shell":
                 face = tuple(ordered_unique(c[:4] if info["sub"].startswith("quad") else c[:3]))
-                shell_faces.append((face, True, face))
+                shell_faces.append((face, True, face, info.get("pid",0)))
                 structural_nodes.update(face)
                 continue
             local_faces = FACE.get(info["sub"], {})
@@ -1812,10 +1883,11 @@ class Converter:
                 if key in faces:
                     faces[key] = None  # Shared solid face is internal.
                 else:
-                    faces[key] = (face, center, tuple(ordered_unique(members)))
+                    faces[key] = (face, center, tuple(ordered_unique(members)), info.get("pid",0))
         records = [v for v in faces.values() if v is not None] + shell_faces
         del faces
-        return records, structural_nodes
+        self._exterior_pids = [r[3] for r in records]
+        return [r[:3] for r in records], structural_nodes
 
     def assign_hourglasses(self):
         """Keep two stable shared IDs, independent of part count and ordering."""
@@ -2502,6 +2574,7 @@ class Converter:
                     row = conn[k]
                     info = dict(
                         cat=cat, sub=sub,
+                        pid=int(_at(pid_arr,k)),
                         keep_tet10=(sub == "tet10" and self.opt["tet10"] and
                                     sec_of_pid[int(_at(pid_arr, k))]["elform"] == 16),
                         c=[int(x) + n_off for x in row])
@@ -3807,7 +3880,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K v2.1  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v2.2  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
@@ -3973,6 +4046,10 @@ def run_gui():
                        kind="ghost", w=104, h=40, font=F_LB)
     btn_open.pack(side="left", padx=(10, 0))
     btn_open.config(enabled=False)
+    btn_finish = RButton(r3, "완료", lambda: root.destroy() if not state["busy"] else None,
+                         kind="primary", w=76, h=40, font=F_LB)
+    btn_finish.pack(side="left", padx=(10,0))
+    btn_finish.config(enabled=False)
 
     stat_box = tk.Frame(r3, bg=P["card"])
     stat_box.pack(side="right")
@@ -4051,6 +4128,7 @@ def run_gui():
         txt.delete("1.0", "end")
         add_line("head", "▶  " + os.path.basename(state["path"]))
         state["busy"] = True
+        btn_finish.config(enabled=False)
         state["t0"] = time.time()
         btn_run.config(text="변환 중…", enabled=False)
         btn_open.config(enabled=False)
@@ -4105,6 +4183,7 @@ def run_gui():
                         pctvar.set("100%")
                         phasevar.set("완료  ·  %.1f초" % r["seconds"])
                         btn_open.config(enabled=True)
+                        btn_finish.config(enabled=True)
                         c = r["counts"]
                         add_line("head", "")
                         add_line("head", "   절점 %s      솔리드 %s      쉘 %s      보 %s"
