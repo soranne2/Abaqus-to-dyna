@@ -3,7 +3,12 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.9 — 중앙 구간 점 수 / 출력 폴더 / 6방향 일괄 저장
+현재 버전: v2.10 — 방향 적용 그래프 / DEATH=0 / 전체 점 수
+- 그래프와 속도 요약에 SFO를 적용하여 실제 가진 방향을 표시합니다.
+- Shock Motion의 DEATH를 0.0으로 출력합니다.
+- 입력 N은 전체 표 점 수입니다. 중앙 구간 N-2점 + 바깥 끝점 2개.
+
+이전 버전: v2.9 — 중앙 구간 점 수 / 출력 폴더 / 6방향 일괄 저장
 - 점 수는 T~2T 양 끝점 포함. 전후 선형 구간에는 추가 점 없이 0, 3T만 출력.
 - 출력 폴더 입력/선택 후 출력 실행. 선택 방향 또는 6방향 일괄 저장 지원.
 - 음수 방향 파일명 접두어/LCID=701, 양수 방향=702 (Motion 참조도 연동).
@@ -232,7 +237,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.9"
+VERSION = "2.10"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -4089,7 +4094,7 @@ SHOCK_GRAVITY = 9.80665  # m/s^2; export uses mm and seconds.
 SHOCK_LCID = 701
 SHOCK_MOTION_ID = 700
 SHOCK_SPC_ID = 702
-SHOCK_POINTS = 601  # Central pulse points, including T and 2T; total = N+2.
+SHOCK_POINTS = 601  # Total table points; central T..2T has N-2 points.
 SHOCK_WAVEFORMS = (("half-sine", "Half-sine"),
                    ("triangular", "Triangular"),
                    ("rectangular", "Rectangular"))
@@ -4121,8 +4126,8 @@ def build_shock_profile(g_value=25.0, duration_ms=15.0,
         points = int(str(point_count).strip())
     except (TypeError, ValueError, OverflowError):
         raise ValueError("데이터점 개수는 정수로 입력하세요.")
-    if not 3 <= points <= 100001:
-        raise ValueError("중앙 구간 데이터점 개수는 3~100001 사이의 정수로 입력하세요.")
+    if not 5 <= points <= 100001:
+        raise ValueError("전체 데이터점 개수는 5~100001 사이의 정수로 입력하세요.")
     if waveform not in dict(SHOCK_WAVEFORMS):
         raise ValueError("지원하지 않는 Shock 파형: %s" % waveform)
     directions = {item[0]: item for item in SHOCK_DIRECTIONS}
@@ -4135,9 +4140,9 @@ def build_shock_profile(g_value=25.0, duration_ms=15.0,
     ticks = round(tick_value)
     if ticks < 1 or abs(tick_value - ticks) > 1e-6:
         raise ValueError("시간 소수 5자리 출력을 위해 펄스 시간은 0.01 ms 단위로 입력하세요.")
-    if points > ticks + 1:
+    if points > ticks + 3:
         raise ValueError("시간 소수 5자리에서 중복 없이 가능한 최대 데이터점은 %d개입니다."
-                         % (ticks + 1))
+                         % (ticks + 3))
     duration_s = ticks / 100000.0
     amplitude = g_value * SHOCK_GRAVITY * 1000.0
     impulse = amplitude * duration_s
@@ -4148,7 +4153,9 @@ def build_shock_profile(g_value=25.0, duration_ms=15.0,
 
     # Only the central pulse is sampled. The solver linearly interpolates
     # the outer 0..T and 2T..3T segments from their endpoints.
-    grid = [0] + [ticks + round(i * ticks / (points - 1)) for i in range(points)] + [3 * ticks]
+    central_points = points - 2
+    grid = [0] + [ticks + round(i * ticks / (central_points - 1))
+                  for i in range(central_points)] + [3 * ticks]
     times, velocities, accelerations = [], [], []
     compensation_g = -v_peak / duration_s / (SHOCK_GRAVITY * 1000.0)
     for tick in grid:
@@ -4205,7 +4212,7 @@ def render_shock_keyword(profile):
              i10(SHOCK_MOTION_ID) + ("Shock_motion_" + p["direction"]),
              "$#    nsid       dof       vad      lcid        sf       vid     death     birth",
              i10(p["nsid"]) + i10(p["dof"]) + i10(0) + i10(p["lcid"]) +
-             f10(1.0) + i10(0) + f10(1.0e28) + f10(0.0),
+             f10(1.0) + i10(0) + f10(0.0) + f10(0.0),
              "*BOUNDARY_SPC_SET_ID",
              "$#      id heading",
              i10(SHOCK_SPC_ID) + ("Shock_spc_" + p["direction"]),
@@ -4604,7 +4611,7 @@ class ShockTab:
         row.pack(fill="x")
         for column, (label, variable) in enumerate((("Peak 가속도 (g)", self.g_var),
                                                     ("펄스 시간 T (ms)", self.ms_var),
-                                                    ("중앙 구간 점 개수", self.points_var))):
+                                                    ("전체 데이터점 개수", self.points_var))):
             cell = tk.Frame(row, bg=P["card"])
             cell.grid(row=0, column=column, sticky="ew", padx=(0, 18))
             row.grid_columnconfigure(column, weight=1, uniform="shock-fields")
@@ -4619,8 +4626,8 @@ class ShockTab:
         self._choices(form, "가속도 파형", self.wave_var, SHOCK_WAVEFORMS)
         self._choices(form, "가진 방향", self.direction_var,
                       [(item[0], item[1]) for item in SHOCK_DIRECTIONS])
-        tk.Label(form, text="표: 0 → −V (선형) → +V (가속도 적분) → 0 (선형)\n"
-                 "점 수: T~2T 양 끝점 포함 (파일 전체 N+2점) · 시간 입력 0.01 ms 단위",
+        tk.Label(form, text="그래프는 SFO 적용 후 실제 방향 표시 · 전후 선형, 중앙 가속도 적분\n"
+                 "점 수: 0~3T 전체 N점 (중앙 N−2점) · 시간 입력 0.01 ms 단위",
                  bg=P["card"], fg=P["dim"], font=self.small, anchor="w"
                  ).pack(fill="x", pady=(12, 0))
 
@@ -4718,10 +4725,10 @@ class ShockTab:
                     d, p["point_count"])["filename"] for d in ("mx", "my", "mz", "px", "py", "pz")))
         else:
             self.name_var.set(p["filename"])
-        self.summary_var.set("종료: %g ms (%.5f s)  ·  파일 전체: %d점 (중앙 + 2)\n"
-                             "표의 T/2T 속도: −%.2f / +%.2f mm/s  ·  최종: 0.00  ·  SFO: %+d" %
+        self.summary_var.set("종료: %g ms (%.5f s)  ·  파일 전체: %d점\n"
+                             "적용 T/2T 속도: %+.2f / %+.2f mm/s  ·  최종: 0.00  ·  SFO: %+d" %
                              (p["duration_ms"] * 3, p["end_s"], len(p["times"]),
-                              p["v_peak"], p["v_peak"], p["sfo"]))
+                              -p["sfo"] * p["v_peak"], p["sfo"] * p["v_peak"], p["sfo"]))
         self.save_button.config(enabled=True)
         self.status_var.set("출력 폴더를 확인하고 출력 실행을 누르세요.")
         self.draw()
@@ -4736,8 +4743,10 @@ class ShockTab:
         width = max(200, cv.winfo_width())
         left, right = 92, width - 24
         total = p["end_s"]
-        series = (("Acceleration (g), before SFO", p["accelerations_g"], P["ok"]),
-                  ("Velocity (mm/s), before SFO", p["velocities"], P["accent"]))
+        series = (("Acceleration (g), " + p["direction_label"],
+                   [p["sfo"] * a for a in p["accelerations_g"]], P["ok"]),
+                  ("Velocity (mm/s), " + p["direction_label"],
+                   [p["sfo"] * v for v in p["velocities"]], P["accent"]))
         for panel, (label, values, color) in enumerate(series):
             top, bottom = 27 + panel * 120, 95 + panel * 120
             limit = max(abs(value) for value in values)
@@ -4759,7 +4768,7 @@ class ShockTab:
             points = list(zip(p["times"], values))
             if panel == 0:
                 t = p["duration_s"]
-                comp = p["compensation_g"]
+                comp = p["sfo"] * p["compensation_g"]
                 middle = [(time, value) for time, value in points if t <= time <= 2*t]
                 points = [(0.0, comp), (t, comp)] + middle + [(2*t, comp), (total, comp)]
             coords = []
@@ -5480,7 +5489,7 @@ def main():
     ap.add_argument("--shock-ms", type=float, default=15.0, help="Shock 펄스 시간 (ms), 기본 15")
     ap.add_argument("--shock-waveform", choices=[v for v, _ in SHOCK_WAVEFORMS], default="half-sine")
     ap.add_argument("--shock-direction", choices=[v[0] for v in SHOCK_DIRECTIONS], default="mx")
-    ap.add_argument("--shock-points", type=int, default=SHOCK_POINTS, help="Shock 중앙 T~2T 데이터점 수 (양 끝점 포함, 파일 전체 N+2점)")
+    ap.add_argument("--shock-points", type=int, default=SHOCK_POINTS, help="Shock 전체 데이터점 수 (0과 3T 포함, 중앙 구간 N-2점)")
     args = ap.parse_args()
 
     if args.shock:
