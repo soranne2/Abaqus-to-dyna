@@ -64,6 +64,13 @@ v1.6:
   edges from the global directional extreme. Shell faces are two-sided.
   Disconnected recessed surfaces are excluded. No BC/CNRB is added.
 - No qualifying end face: warn and omit that NODE set, never write an empty one.
+
+v1.7:
+- Compact numeric face sorting removes internal faces before geometry work.
+- Automatic-set geometry is separate from contact lookup data, so auto sets
+  do not expand every existing surface/constraint search to the whole model.
+- Visible post-mesh phases, periodic elapsed-time heartbeat, and GUI/CLI
+  auto-set switch. Selection semantics, reserved IDs and original sets retained.
 """
 
 import os
@@ -92,7 +99,7 @@ except Exception:                                    # pragma: no cover
     pd = None
     HAVE_PANDAS = False
 
-VERSION = "1.6"
+VERSION = "1.7"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -1178,6 +1185,7 @@ class Converter:
         self.inst_maps = {}
         self.inst_part_of = {}
         self.elem_info = {}
+        self._auto_elem_info = {}
         self.node_coord = {}
         self.global_nsets = {}
 
@@ -1537,10 +1545,162 @@ class Converter:
 
         add("part", 900001, "ELSET_ALL", [p["pid"] for p in self.parts])
         xyz = self.node_coord
+        started = time.monotonic()
+        self.log.info("자동 SET: 외곽면 탐색 시작 (%s 요소, %s)" %
+                      (f"{len(self._auto_elem_info):,}", "NumPy 가속" if HAVE_NUMPY else "Python 경로"))
+        if HAVE_NUMPY:
+            records, structural_nodes = self.automatic_exterior_numpy()
+        else:
+            records, structural_nodes = self.automatic_exterior_python()
+        self.post_stage(85, "자동 SET: 외곽면 법선 계산")
+        if any(n not in xyz for n in structural_nodes):
+            raise ValueError("자동 끝단 SET: 정의되지 않은 표면 절점이 있습니다.")
+        # Newell normal, calculated relative to one point for translation stability.
+        geometry = []
+        for ri, (face, center, members) in enumerate(records):
+            if ri % 10000 == 0:
+                self.post_stage(85 + ri/max(len(records),1), "자동 SET: 법선 %d/%d" % (ri,len(records)))
+            pts = [xyz[n] for n in face]
+            origin = pts[0]
+            pts = [tuple(p[j]-origin[j] for j in range(3)) for p in pts]
+            normal = [0.0, 0.0, 0.0]
+            for a, b in zip(pts, pts[1:] + pts[:1]):
+                normal[0] += a[1]*b[2]-a[2]*b[1]
+                normal[1] += a[2]*b[0]-a[0]*b[2]
+                normal[2] += a[0]*b[1]-a[1]*b[0]
+            norm = math.sqrt(sum(x*x for x in normal))
+            if not norm:
+                continue
+            normal = [x/norm for x in normal]
+            two_sided = center is True
+            if not two_sided:
+                fc = [sum(xyz[n][j] for n in face)/len(face) for j in range(3)]
+                if sum(normal[j]*(fc[j]-center[j]) for j in range(3)) < 0:
+                    normal = [-x for x in normal]
+            geometry.append((face, normal, two_sided, members))
+        cosine = math.cos(math.radians(10.0))
+        for axis, sign, sid, name in ((1, 1, 200001, "RIGID_Y"), (2, -1, 200002, "RIGID_Z")):
+            base_pct = 86 if axis == 1 else 88
+            self.post_stage(base_pct, name + ": 각도 필터 및 연결면 탐색")
+            if not structural_nodes:
+                add("node", sid, name, [])
+                continue
+            projections = [sign*xyz[n][axis] for n in structural_nodes]
+            extreme = max(projections)
+            tolerance = max((extreme-min(projections))*1e-8,
+                            max(abs(x) for x in projections)*2e-15, 1e-12)
+            candidates = []
+            edges = {}
+            seeds = []
+            for gi, (face, normal, two_sided, members) in enumerate(geometry):
+                if gi % 10000 == 0:
+                    self.post_stage(base_pct + .5*gi/max(len(geometry),1), name + ": 후보 면 %d/%d" % (gi,len(geometry)))
+                dot = normal[axis]*sign
+                if (abs(dot) if two_sided else dot) < cosine-1e-12:
+                    continue
+                i = len(candidates)
+                candidates.append((face, members))
+                if any(extreme-sign*xyz[n][axis] <= tolerance for n in face):
+                    seeds.append(i)
+                for a, b in zip(face, face[1:] + face[:1]):
+                    edges.setdefault(tuple(sorted((a,b))), []).append(i)
+            selected = set(seeds)
+            pending = list(seeds)
+            visited = 0
+            while pending:
+                face, _ = candidates[pending.pop()]
+                visited += 1
+                if visited % 10000 == 0:
+                    self.post_stage(base_pct+.5, name + ": 연결면 %d개 처리" % visited)
+                for a, b in zip(face, face[1:] + face[:1]):
+                    for neighbor in edges.pop(tuple(sorted((a,b))), []):
+                        if neighbor not in selected:
+                            selected.add(neighbor)
+                            pending.append(neighbor)
+            ids = sorted({n for i in selected for n in candidates[i][1]})
+            add("node", sid, name, ids)
+        self.post_stage(89.5, "자동 SET 생성 완료")
+        self.log.ok("자동 SET 완료: %.2f초" % (time.monotonic()-started))
+        self._auto_elem_info.clear()
+
+    def post_stage(self, pct, label):
+        callback = getattr(self, "stage_progress", None)
+        if callback:
+            callback(pct, label)
+
+    def automatic_exterior_numpy(self):
+        """Compact int64 face keys; centers/members built ONLY for exterior faces.
+
+        No Python dictionary entry or center tuple is retained for each internal
+        face. Sort adjacency removes every occurrence of multiply-owned faces.
+        """
+        infos = list(self._auto_elem_info.values())
+        capacity = sum(len(FACE.get(v['sub'], {})) for v in infos if v['cat'] == 'solid')
+        keys = np.zeros((capacity, 4), dtype=np.int32 if self.max_node <= 2147483647 else np.int64)
+        owners = np.empty(capacity, dtype=np.int32 if len(infos) <= 2147483647 else np.int64)
+        local_ids = np.empty(capacity, dtype=np.uint8)
+        nodes = set()
+        shells = []
+        count = 0
+        tables = {sub: list(table.values()) for sub, table in FACE.items()}
+        for owner, info in enumerate(infos):
+            if owner % 10000 == 0:
+                self.post_stage(80+2*owner/max(len(infos),1), "자동 SET: 면 추출 %d/%d" % (owner,len(infos)))
+            c = info['c']
+            if info['cat'] == 'shell':
+                face = tuple(ordered_unique(c[:4] if info['sub'].startswith('quad') else c[:3]))
+                shells.append((face, True, face))
+                nodes.update(face)
+                continue
+            seen = set()
+            for fi, local in enumerate(tables.get(info['sub'], [])):
+                face = tuple(sorted(set(c[i] for i in local)))
+                nodes.update(face)
+                if len(face) < 3 or face in seen:
+                    continue
+                seen.add(face)
+                keys[count, :len(face)] = face
+                owners[count] = owner
+                local_ids[count] = fi
+                count += 1
+        self.post_stage(82, "자동 SET: %s개 면 정렬/내부면 제거" % f"{count:,}")
+        keys = keys[:count]
+        order = np.lexsort((keys[:,3],keys[:,2],keys[:,1],keys[:,0]))
+        sorted_keys = keys[order]
+        unique = np.ones(count, dtype=bool)
+        duplicate = np.all(sorted_keys[1:] == sorted_keys[:-1], axis=1)
+        unique[1:] &= ~duplicate
+        unique[:-1] &= ~duplicate
+        exterior = order[unique]
+        del keys, sorted_keys, order, unique, duplicate
+        self.post_stage(83, "자동 SET: 외곽면 %s개 구성" % f"{len(exterior):,}")
+        records = shells
+        xyz = self.node_coord
+        for j, row in enumerate(exterior):
+            if j % 10000 == 0:
+                self.post_stage(83+2*j/max(len(exterior),1), "자동 SET: 외곽면 %d/%d" % (j,len(exterior)))
+            info = infos[int(owners[row])]
+            c = info['c']
+            table = tables[info['sub']]
+            face = tuple(ordered_unique(c[i] for i in table[int(local_ids[row])]))
+            corners = ordered_unique(c[i] for f in table for i in f)
+            center = tuple(sum(xyz[n][a] for n in corners)/len(corners) for a in range(3))
+            members = list(face)
+            if info.get('keep_tet10'):
+                for a,b,mid in ((0,1,4),(1,2,5),(2,0,6),(0,3,7),(1,3,8),(2,3,9)):
+                    if c[a] in face and c[b] in face:
+                        members.append(c[mid])
+            records.append((face,center,tuple(ordered_unique(members))))
+        return records,nodes
+
+    def automatic_exterior_python(self):
+        xyz = self.node_coord
         faces = {}
         shell_faces = []
         structural_nodes = set()
-        for info in self.elem_info.values():
+        for ei, info in enumerate(self._auto_elem_info.values()):
+            if ei % 10000 == 0:
+                self.post_stage(80+5*ei/max(len(self._auto_elem_info),1), "자동 SET: Python 면 추출 %d/%d" % (ei,len(self._auto_elem_info)))
             c = info["c"]
             if info["cat"] == "shell":
                 face = tuple(ordered_unique(c[:4] if info["sub"].startswith("quad") else c[:3]))
@@ -1571,62 +1731,7 @@ class Converter:
                     faces[key] = (face, center, tuple(ordered_unique(members)))
         records = [v for v in faces.values() if v is not None] + shell_faces
         del faces
-        if any(n not in xyz for n in structural_nodes):
-            raise ValueError("자동 끝단 SET: 정의되지 않은 표면 절점이 있습니다.")
-        # Newell normal, calculated relative to one point for translation stability.
-        geometry = []
-        for face, center, members in records:
-            pts = [xyz[n] for n in face]
-            origin = pts[0]
-            pts = [tuple(p[j]-origin[j] for j in range(3)) for p in pts]
-            normal = [0.0, 0.0, 0.0]
-            for a, b in zip(pts, pts[1:] + pts[:1]):
-                normal[0] += a[1]*b[2]-a[2]*b[1]
-                normal[1] += a[2]*b[0]-a[0]*b[2]
-                normal[2] += a[0]*b[1]-a[1]*b[0]
-            norm = math.sqrt(sum(x*x for x in normal))
-            if not norm:
-                continue
-            normal = [x/norm for x in normal]
-            two_sided = center is True
-            if not two_sided:
-                fc = [sum(xyz[n][j] for n in face)/len(face) for j in range(3)]
-                if sum(normal[j]*(fc[j]-center[j]) for j in range(3)) < 0:
-                    normal = [-x for x in normal]
-            geometry.append((face, normal, two_sided, members))
-        cosine = math.cos(math.radians(10.0))
-        for axis, sign, sid, name in ((1, 1, 200001, "RIGID_Y"), (2, -1, 200002, "RIGID_Z")):
-            if not structural_nodes:
-                add("node", sid, name, [])
-                continue
-            projections = [sign*xyz[n][axis] for n in structural_nodes]
-            extreme = max(projections)
-            tolerance = max((extreme-min(projections))*1e-8,
-                            max(abs(x) for x in projections)*2e-15, 1e-12)
-            candidates = []
-            edges = {}
-            seeds = []
-            for face, normal, two_sided, members in geometry:
-                dot = normal[axis]*sign
-                if (abs(dot) if two_sided else dot) < cosine-1e-12:
-                    continue
-                i = len(candidates)
-                candidates.append((face, members))
-                if any(extreme-sign*xyz[n][axis] <= tolerance for n in face):
-                    seeds.append(i)
-                for a, b in zip(face, face[1:] + face[:1]):
-                    edges.setdefault(tuple(sorted((a,b))), []).append(i)
-            selected = set(seeds)
-            pending = list(seeds)
-            while pending:
-                face, _ = candidates[pending.pop()]
-                for a, b in zip(face, face[1:] + face[:1]):
-                    for neighbor in edges.pop(tuple(sorted((a,b))), []):
-                        if neighbor not in selected:
-                            selected.add(neighbor)
-                            pending.append(neighbor)
-            ids = sorted({n for i in selected for n in candidates[i][1]})
-            add("node", sid, name, ids)
+        return records, structural_nodes
 
     def assign_hourglasses(self):
         """Keep two stable shared IDs, independent of part count and ordering."""
@@ -1785,8 +1890,7 @@ class Converter:
         need_info = bool(m.surfaces or (self.opt["contact"] and m.rigid_bodies))
         need_coord = False
         if self.opt.get("auto_sets", True):
-            need_info = need_coord = True
-            self._need_all_surface_elements = True
+            need_coord = True
         if self.opt["beamNode"]:
             for t in m.el_types:
                 c = classify(t)
@@ -1811,15 +1915,18 @@ class Converter:
             for sec in P.sections:
                 if not self.section_hits.get(id(sec)):
                     self.log.warn('단면 "%s"에 매칭되는 요소가 없습니다. ELSET 참조/요소 종류를 확인하세요.' % sec["elset"])
+        self.post_stage(75, "기존 SET / SURFACE 변환")
         self.emit_source_sets()
         self.assign_hourglasses()
 
         if self.opt["contact"]:
+            self.post_stage(78, "접촉 / 구속 변환")
             self.do_interactions()
         if self.opt["bc"]:
             self.do_boundaries()
         self.finalize_set_order()
         if self.opt.get("auto_sets", True):
+            self.post_stage(80, "자동 SET 생성 시작")
             self.add_automatic_sets()
         self.finalize_nrb_ids()
 
@@ -2159,16 +2266,20 @@ class Converter:
                 pid_arr = _fill_zero(pid_arr, fb)
 
         # 접촉면용 연결 정보
-        if seg_eids and cat in ("solid", "shell"):
+        if (seg_eids or self.opt.get("auto_sets", True)) and cat in ("solid", "shell"):
             for k in range(n):
                 eid0 = int(ids[k])
-                if eid0 in seg_eids:
+                if eid0 in seg_eids or self.opt.get("auto_sets", True):
                     row = conn[k]
-                    self.elem_info[eid0 + e_off] = dict(
+                    info = dict(
                         cat=cat, sub=sub,
                         keep_tet10=(sub == "tet10" and self.opt["tet10"] and
                                     sec_of_pid[int(_at(pid_arr, k))]["elform"] == 16),
                         c=[int(x) + n_off for x in row])
+                    if eid0 in seg_eids:
+                        self.elem_info[eid0 + e_off] = info
+                    if self.opt.get("auto_sets", True):
+                        self._auto_elem_info[eid0 + e_off] = info
 
         eid = _add(ids, e_off)
         cn = _add(conn, n_off)
@@ -2967,7 +3078,11 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         for x, y in c["pts"]:
             put(f20(x) + f20(y))
 
+    mesh_bytes = sum(f.tell() for f in cv.tmp.values())
+    copied_bytes = 0
+
     def dump(key, header):
+        nonlocal copied_bytes
         f = cv.tmp.get(key)
         if not f:
             return
@@ -2977,7 +3092,15 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         for h in header:
             put(h)
         f.seek(0)
-        shutil.copyfileobj(f, W, 4 * 1024 * 1024)
+        while True:
+            chunk = f.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            W.write(chunk)
+            copied_bytes += len(chunk)
+            if progress:
+                progress("write", 90+8*copied_bytes/max(mesh_bytes,1),
+                         "메시 저장 %.1f / %.1f MB" % (copied_bytes/1048576,mesh_bytes/1048576))
 
     dump("node", ["*NODE",
                   "$#   nid               x               y               z      tc      rc"])
@@ -3089,10 +3212,24 @@ DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=False, tet10=False,
 def convert_file(inp_path, out_path, opt, log, progress=None):
     """progress(phase, pct, text) — pct 는 0~100 전체 진행률"""
     t0 = time.time()
+    progress_lock = threading.Lock()
+    latest = ["convert", 45.0, "", time.monotonic()]
 
     def emit(phase, pct, text=""):
         if progress:
-            progress(phase, pct, text)
+            with progress_lock:
+                latest[:] = [phase, pct, text, time.monotonic()]
+                progress(phase, pct, text)
+
+    stop_heartbeat = threading.Event()
+
+    def heartbeat():
+        while not stop_heartbeat.wait(1.0):
+            with progress_lock:
+                phase, pct, label, updated = latest
+                elapsed = time.monotonic()-updated
+                if progress and elapsed >= 1.0:
+                    progress(phase, pct, "%s · 처리 중 %.0f초" % (label, elapsed))
 
     emit("read", 0.0, "")
     parser = Parser(log)
@@ -3111,21 +3248,28 @@ def convert_file(inp_path, out_path, opt, log, progress=None):
     t1 = time.time()
     cv = Converter(model, opt, log,
                    lambda done, total, label: emit(
-                       "convert", 45.0 + 45.0 * done / max(total, 1), label))
+                       "convert", 45.0 + 30.0 * min(done / max(total, 1), 1.0), label))
+    cv.stage_progress = lambda pct, label: emit("convert", pct, label)
     pending_output = None
+    pulse = threading.Thread(target=heartbeat, daemon=True) if progress else None
+    if pulse:
+        pulse.start()
     try:
         cv.run()
         t_conv = time.time() - t1
-        emit("write", 90.0, "")
+        emit("write", 90.0, "결과 파일 저장")
         t2 = time.time()
         # An incomplete conversion must not overwrite a previously valid deck.
         out_dir = os.path.dirname(os.path.abspath(out_path))
         fd, pending_output = tempfile.mkstemp(prefix=".inp2k_", suffix=".tmp", dir=out_dir)
         os.close(fd)
-        size = write_k(cv, opt, pending_output, os.path.basename(inp_path), progress)
+        size = write_k(cv, opt, pending_output, os.path.basename(inp_path), emit)
         os.replace(pending_output, out_path)
         pending_output = None
     finally:
+        stop_heartbeat.set()
+        if pulse:
+            pulse.join()
         for f in cv.tmp.values():
             f.close()
         if pending_output is not None:
@@ -3394,7 +3538,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K v1.6  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v1.7  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
@@ -3516,7 +3660,8 @@ def run_gui():
              ("bc", "경계조건", "BOUNDARY_SPC_SET"),
              ("contact", "접촉·구속", "CONTACT / CONSTRAINED"),
              ("tet10", "2차 사면체 유지", "C3D10 전용 프로퍼티에 적용"),
-             ("beamNode", "보 방향절점", "단면 n1로 자동 생성")]
+             ("beamNode", "보 방향절점", "단면 n1로 자동 생성"),
+             ("auto_sets", "자동 끝단 SET", "ELSET_ALL / RIGID_Y / RIGID_Z")]
     grid = tk.Frame(f2, bg=P["card"])
     grid.pack(fill="x")
     for i, (k, lab, sub) in enumerate(items):
@@ -3831,6 +3976,7 @@ def main():
     ap.add_argument("input", nargs="?", help="Abaqus .inp 파일")
     ap.add_argument("-o", "--out", help="출력 .k 경로")
     ap.add_argument("--no-sets", action="store_true", help="세트 출력 안 함")
+    ap.add_argument("--no-auto-sets", action="store_true", help="자동 ELSET_ALL/RIGID_Y/RIGID_Z 생성 생략")
     ap.add_argument("--no-contact", action="store_true", help="접촉·구속 변환 안 함")
     ap.add_argument("--no-ctrl", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--tet10", action="store_true", help="C3D10 전용 프로퍼티에서 2차 사면체 유지 (혼합 프로퍼티는 코너 축약)")
@@ -3847,7 +3993,7 @@ def main():
         return run_gui() or 0
 
     opt = dict(DEFAULT_OPT)
-    opt.update(sets=not args.no_sets, contact=not args.no_contact,
+    opt.update(sets=not args.no_sets, contact=not args.no_contact, auto_sets=not args.no_auto_sets,
                ctrl=False, tet10=args.tet10,
                shell=args.shell, unit=args.unit, mu=args.mu)
     out = args.out or (os.path.splitext(args.input)[0] + ".k")
