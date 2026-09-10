@@ -3,7 +3,27 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.4
+현재 버전: v2.5 (by claude)
+최신 수정사항 — 상세 설정 창 크기 / SST·MST 음수 / PAD·TA·ADHESIVE ELFORM -1 / 마운팅 노드 → NSET_BC
+- 상세 설정 창을 키우고, 내용의 실제 요구 크기에 맞춰 창 크기를 정합니다
+  (화면보다 크면 화면 안으로 제한). 하단 버튼이 잘리지 않습니다.
+- 접촉 SST/MST에 음수를 입력할 수 있습니다(LS-DYNA: 음수는 두께 절댓값으로 사용).
+- Formulation 페이지에 "PAD / TA / ADHESIVE 이름 → Solid ELFORM -1" 체크박스를 추가.
+  켜면 PART 이름(인스턴스_ELSET)에 PAD, TA, ADHESIVE(복수형 S 포함)가 단어로
+  들어간 솔리드 프로퍼티를 ELFORM -1로 둡니다. 영문자와 붙은 경우(METAL, DATA,
+  PADDING 등)는 제외하고 _, -, 공백, 숫자 경계만 인정합니다. 육면체 전용
+  프로퍼티에만 적용하며 전역 Solid ELFORM 지정보다 우선합니다. JSON 키:
+  neg_elform_names (true/false), 기본 OFF. CLI: --neg-elform-names
+- 마운팅 노드 처리: 노드 1개짜리 NSET의 노드가 *COUPLING 기준절점 또는 *MPC
+  기준절점이고 *BOUNDARY로 고정되어 있으면(보통 SET_NODES_MOUNTING),
+  해당 COUPLING/MPC를 변환하지 않고 기준절점을 *NODE에서 삭제합니다.
+  그 커플링/MPC에 속했던 노드는 *SET_NODE_LIST_TITLE NSET_BC (SID 100001)로 묶고,
+  원래 1노드 SET에 걸린 *BOUNDARY는 NSET_BC의 *BOUNDARY_SPC_SET으로 옮깁니다.
+  1노드 SET 자체는 출력하지 않습니다. 기준절점이 요소·*EQUATION·*RIGID BODY에서
+  쓰이면 삭제하지 않고 경고 후 기존 변환을 유지합니다.
+- 고정 ID(fixed_sid) SET의 번호는 일반 SET 순번 배정에서 자동으로 예약합니다.
+
+이전 버전: v2.4
 최신 수정사항 — 상세 설정 GUI 스타일 통일 / 메인 옵션 2×2 정렬
 - 상세 설정에 메인 GUI의 다크 팔레트·글꼴·카드·버튼·입력 스타일을 적용합니다.
 - 4개 페이지를 상단 버튼으로 전환하며, JSON 저장/불러오기와 적용/취소는 하단 고정.
@@ -178,7 +198,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.4"
+VERSION = "2.5"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -196,6 +216,20 @@ HOURGLASS_DEFAULTS = {
 # IHQ 8 is specific to shell ELFORM 16. With one shared shell card, use IHQ 4
 # for reduced-integration shells; fully integrated shells do not need it.
 # HGID assignment does not force an inactive hourglass mode to become active.
+
+
+# v2.5: PAD / TA / ADHESIVE property names -> solid ELFORM -1 (opt-in).
+# A keyword must not touch another letter: THERMAL_PAD, TA-01, CELL TA2 match;
+# METAL, DATA, PADDING do not. An optional plural S is accepted.
+NEG_ELFORM_NAME_RE = re.compile(r"(?<![A-Z])(?:PAD|TA|ADHESIVE)S?(?![A-Z])")
+
+# v2.5: nodes of a coupling/MPC whose reference node is a lone mounting node.
+MOUNT_SET_ID = 100001
+MOUNT_SET_NAME = "NSET_BC"
+
+
+def neg_elform_name(title):
+    return bool(NEG_ELFORM_NAME_RE.search(str(title or "").upper()))
 
 
 def name_key(value):
@@ -1286,6 +1320,12 @@ class Converter:
         self.contacts = []
         self.section_hits = {}
         self._part_pid_blocks = {}
+        # v2.5 mounting node handling
+        self._mount_nodes = set()        # deleted reference node IDs (output IDs)
+        self._mount_couplings = set()    # id(coupling) not converted
+        self._mount_mpcs = set()         # id(mpc row) not converted
+        self._mount_sid = None
+        self._mount_bc_hits = 0
 
     # ---------- 임시 파일 ----------
     def _tmp(self, key):
@@ -1602,6 +1642,7 @@ class Converter:
             return (group,) + old
         self.set_output.sort(key=ordering)
         reserved = {200001, 200002, 900001} if self.opt.get("auto_sets", True) else set()
+        reserved |= {int(s["fixed_sid"]) for s in self.set_output if s.get("fixed_sid")}
         remap = {}
         next_id = 0
         for s in self.set_output:
@@ -1930,6 +1971,164 @@ class Converter:
         self.log.ok("공통 *HOURGLASS 2개 생성: 쉘 HGID=1, 솔리드 HGID=2 · PART %d개 연결" % n)
         self.log.info("Hourglass는 준정적·저속 해석용 초기값이며, 실제 작동 여부는 요소 적분 공식에 따릅니다.")
 
+    # ---------- v2.5 마운팅 노드 ----------
+    def source_set_bindings(self, src):
+        """(output title, instance prefix) pairs of one source NSET/ELSET."""
+        part, nm = src["part"], src["name"]
+        if part is None or (part is self.m.parts["__ROOT__"] and "" not in self.contexts):
+            return [(nm, None)]
+        return [((key + "_" if key else "") + nm, key)
+                for key, ctx in self.contexts.items()
+                if part is ctx["base"] or part is ctx["inst"]["part"]]
+
+    def without_mount_nodes(self, ids, title=None):
+        """Drop deleted mounting reference nodes from a node list."""
+        if not self._mount_nodes:
+            return ids
+        kept = [n for n in ids if int(n) not in self._mount_nodes]
+        if len(kept) != len(ids) and title is not None:
+            if kept:
+                self.log.warn('세트 "%s": 삭제한 마운팅 기준절점을 구성원에서 제외했습니다.' % title)
+            else:
+                self.log.info('세트 "%s": 마운팅 기준절점 1개뿐이라 출력하지 않습니다(→ %s).'
+                              % (title, MOUNT_SET_NAME))
+        return kept
+
+    def _nodes_in_elements(self, nodes):
+        """Subset of `nodes` referenced by any element connectivity."""
+        used = set()
+        if not nodes:
+            return used
+        for ctx in self.contexts.values():
+            off = ctx["nOff"]
+            for blk in ctx["P"].eblocks:
+                conn = blk["conn"]
+                if HAVE_NUMPY and isinstance(conn, np.ndarray):
+                    # Only a few candidates: one linear scan each, no sort.
+                    for n in nodes:
+                        if n not in used and conn.size and (conn == n - off).any():
+                            used.add(n)
+                else:
+                    for row in conn:
+                        for v in row:
+                            if int(v) + off in nodes:
+                                used.add(int(v) + off)
+        return used
+
+    def detect_mounting(self):
+        """Find a lone-node NSET that is the fixed reference node of a COUPLING/MPC.
+
+        Such a node only carries the mounting BC. The coupling/MPC is not
+        converted, the reference node is removed from *NODE, and the coupled
+        nodes become NSET_BC (SID 100001) carrying the original BC.
+        """
+        m = self.m
+        if not (m.couplings or m.mpcs):
+            return
+        refs = {}                                 # node -> [("coupling"|"mpc", record)]
+        for cp in m.couplings:
+            rn = self.node_ref(cp["ref"]) if cp["ref"] else None
+            if rn and len(set(rn)) == 1:
+                refs.setdefault(int(rn[0]), []).append(("coupling", cp))
+        for mp in m.mpcs:
+            if mp["type"] not in ("BEAM", "TIE", "PIN", "LINK"):
+                continue
+            mi = self.node_ref(mp["b"])
+            if mi and len(set(mi)) == 1:
+                refs.setdefault(int(mi[0]), []).append(("mpc", mp))
+        if not refs:
+            return
+        found = {}                                # node -> [set title]
+        for src in m.set_defs:
+            if src["kind"] != "nsets":
+                continue
+            for title, pref in self.source_set_bindings(src):
+                ids = set(int(n) for n in self.resolve_ids("nsets", src["name"], pref))
+                if len(ids) == 1:
+                    node = next(iter(ids))
+                    if node in refs:
+                        found.setdefault(node, []).append(title)
+        if not found:
+            return
+        # Mounting = a reference node that is actually fixed by a *BOUNDARY.
+        # Load / mass reference points without a BC keep their constraint.
+        fixed = set()
+        for b in m.boundaries:
+            ids = set(int(n) for n in self.resolve_ids("nsets", b["set"]))
+            if len(ids) == 1:
+                fixed |= ids & set(found)
+        for node in [n for n in found if n not in fixed]:
+            self.log.info('1노드 기준절점 세트 %s: 경계조건이 없어 마운팅으로 보지 않습니다.'
+                          % ", ".join(found.pop(node)))
+        if not found:
+            return
+        # Keep the node when anything else still needs it.
+        blocked = self._nodes_in_elements(set(found))
+        for eq in m.equations:
+            for term in eq["terms"]:
+                blocked.update(int(n) for n in (self.node_ref(term[0]) or []) if int(n) in found)
+        for rb in m.rigid_bodies:
+            if rb["ref"]:
+                blocked.update(int(n) for n in (self.node_ref(rb["ref"]) or []) if int(n) in found)
+        for node in sorted(blocked):
+            self.log.warn('마운팅 후보 절점 %d(세트 %s)이 요소/EQUATION/RIGID BODY에서 쓰여 '
+                          '삭제하지 않고 기존 변환을 유지합니다.' % (node, ", ".join(found[node])))
+            found.pop(node)
+        if not found:
+            return
+        for node, titles in found.items():
+            self._mount_nodes.add(node)
+            for kind, rec in refs[node]:
+                (self._mount_couplings if kind == "coupling" else self._mount_mpcs).add(id(rec))
+            self.log.info('마운팅 기준절점 %d (세트 %s): 연결된 COUPLING/MPC %d건을 변환하지 않고 '
+                          '절점을 삭제합니다.' % (node, ", ".join(titles), len(refs[node])))
+        if len(found) > 1:
+            self.log.warn("마운팅 1노드 세트가 %d개입니다. 모든 종속 절점을 %s 하나로 묶습니다."
+                          % (len(found), MOUNT_SET_NAME))
+
+    def build_mounting_set(self):
+        """Collect the coupled nodes of removed constraints into NSET_BC."""
+        if not self._mount_nodes:
+            return
+        m = self.m
+        ids = []
+        for cp in m.couplings:
+            if id(cp) not in self._mount_couplings:
+                continue
+            S = self.build_surf(cp["surf"])
+            members = self.surf_nodes(S)
+            if not members:
+                self.log.warn('*COUPLING "%s"의 표면 "%s"에서 절점을 찾지 못했습니다.'
+                              % (cp["name"], cp["surf"]))
+            ids.extend(members)
+            self.imap.append(("*COUPLING %s (mounting)" % cp["name"],
+                              "삭제 → %s (SID %d)" % (MOUNT_SET_NAME, MOUNT_SET_ID)))
+        n_mpc = 0
+        for mp in m.mpcs:
+            if id(mp) not in self._mount_mpcs:
+                continue
+            ids.extend(self.node_ref(mp["a"]) or [])
+            n_mpc += 1
+        if n_mpc:
+            self.imap.append(("*MPC mounting (%d행)" % n_mpc,
+                              "삭제 → %s (SID %d)" % (MOUNT_SET_NAME, MOUNT_SET_ID)))
+        ids = [int(n) for n in ordered_unique(int(v) for v in ids)
+               if int(n) not in self._mount_nodes and 0 < int(n) <= self.max_node]
+        if not ids:
+            self.log.warn("%s: 마운팅 COUPLING/MPC의 종속 절점이 없어 SET을 만들지 못했습니다."
+                          % MOUNT_SET_NAME)
+            return
+        if name_key(MOUNT_SET_NAME) in {name_key(s["name"]) for s in self.set_output}:
+            raise ValueError("SET 이름 %s가 원본에 이미 있습니다. 원본 이름을 변경하세요." % MOUNT_SET_NAME)
+        if any(s.get("fixed_sid") == MOUNT_SET_ID for s in self.set_output):
+            raise ValueError("SET ID %d가 이미 사용 중입니다." % MOUNT_SET_ID)
+        self._mount_sid = self.append_set("node", dict(name=MOUNT_SET_NAME, ids=ids,
+                                                       fixed_sid=MOUNT_SET_ID))
+        self._node_sid[name_key(MOUNT_SET_NAME)] = self._mount_sid
+        self.global_nsets[name_key(MOUNT_SET_NAME)] = self._mount_sid
+        self.log.ok("%s (SID %d): 마운팅 COUPLING/MPC의 종속 절점 %d개"
+                    % (MOUNT_SET_NAME, MOUNT_SET_ID, len(ids)))
+
     def emit_source_sets(self):
         """Emit first definitions in original interleaved order, including surfaces."""
         started = time.monotonic()
@@ -1951,7 +2150,9 @@ class Converter:
                     if s and s["type"] == "seg" and s["segs"]:
                         self.seg_set_id(s)
                     elif s and s["type"] == "node":
-                        self.node_set_id(ref, s["ids"])
+                        ids = self.without_mount_nodes(s["ids"], ref)
+                        if ids:
+                            self.node_set_id(ref, ids)
                     else:
                         self.log.warn('표면 "%s": 변환할 유효한 세그먼트가 없습니다.' % ref)
                 continue
@@ -1972,6 +2173,9 @@ class Converter:
                     self.log.warn('세트 "%s"의 구성원을 찾지 못했습니다.' % title)
                     continue
                 if kind == "nsets":
+                    ids = self.without_mount_nodes(ids, title)
+                    if not ids:
+                        continue
                     sid = self.node_set_id(title, ids)
                     alias = ((pref + ".") if pref else "") + nm
                     self.global_nsets[alias] = sid
@@ -2212,6 +2416,7 @@ class Converter:
             return
 
         self.prepare_contexts(instances)
+        self.detect_mounting()
         need_info = bool(m.surfaces or (self.opt["contact"] and m.rigid_bodies))
         need_coord = False
         if self.opt.get("auto_sets", True):
@@ -2242,6 +2447,7 @@ class Converter:
                     self.log.warn('단면 "%s"에 매칭되는 요소가 없습니다. ELSET 참조/요소 종류를 확인하세요.' % sec["elset"])
         self.post_stage(75, "기존 SET / SURFACE 변환")
         self.emit_source_sets()
+        self.build_mounting_set()
         self.assign_hourglasses()
 
         if self.opt["contact"]:
@@ -2283,8 +2489,7 @@ class Converter:
         for ids, xyz in P.nblocks:
             if tr is not None:
                 xyz = tr(xyz)
-            self.write_nodes(fnode, ids, xyz, n_off, need_coord)
-            self.counts["node"] += len(ids)
+            self.counts["node"] += self.write_nodes(fnode, ids, xyz, n_off, need_coord)
             self._tick(len(ids), "절점 %s" % f"{self.counts['node']:,}")
 
         # ----- 단면 -> PART (part / instance / assembly references) -----
@@ -2322,7 +2527,7 @@ class Converter:
                 secid, pid = self.sec_seq, self.pid_seq
                 mid = self.get_mid(sec["material"]) if opt["mat"] else self.get_mid("")
                 title = (inst["name"] + "_" if inst["name"] else "") + sec["elset"]
-                S = self.make_property_section(secid, classes, sec)
+                S = self.make_property_section(secid, classes, sec, title)
                 self.sections.append(S)
                 sec_of_pid[pid] = S
                 self.parts.append(dict(pid=pid, secid=secid, mid=mid, title=title))
@@ -2349,7 +2554,7 @@ class Converter:
                    + self.counts["beam"] + self.counts["mass"] + self.counts["disc"])
             self._tick(len(blk["ids"]), "요소 %s" % f"{tot:,}")
 
-    def make_property_section(self, secid, classes, sec):
+    def make_property_section(self, secid, classes, sec, title=None):
         """Select one compatible section for all shapes in a source property."""
         cat = classes[0]["cat"]
         cls = classes[0]
@@ -2374,6 +2579,16 @@ class Converter:
             else:
                 self.log.info('프로퍼티 "%s": 요소 연결 호환성을 위해 ELFORM=%s 유지'
                               % (sec["elset"], S["elform"]))
+        if (cat == "solid" and self.opt.get("neg_elform_names")
+                and neg_elform_name(title or sec["elset"])):
+            # Name rule overrides the global solid ELFORM choice (hexa only).
+            if {c["sub"] for c in classes} <= {"hex8", "hex20"}:
+                S["elform"] = -1
+                self.log.info('프로퍼티 "%s": PAD/TA/ADHESIVE 이름 규칙으로 ELFORM=-1'
+                              % (title or sec["elset"]))
+            else:
+                self.log.warn('프로퍼티 "%s": PAD/TA/ADHESIVE 이름이지만 육면체 외 요소가 있어 '
+                              'ELFORM=%s 유지' % (title or sec["elset"], S["elform"]))
         if len({(c["sub"], c["red"]) for c in classes}) > 1:
             self.log.info('프로퍼티 "%s": 혼합 요소를 하나의 PART/SECTION(ELFORM=%s)에 연결합니다.'
                           % (sec["elset"], S.get("elform", "-")))
@@ -2477,6 +2692,19 @@ class Converter:
 
     # ---------- 절점 쓰기 ----------
     def write_nodes(self, fh, ids, xyz, n_off, need_coord):
+        """Write one node block; deleted mounting reference nodes are skipped."""
+        if self._mount_nodes:
+            if HAVE_NUMPY and isinstance(ids, np.ndarray):
+                keep = ~np.isin(ids + n_off, np.fromiter(self._mount_nodes, np.int64))
+                if not keep.all():
+                    ids, xyz = ids[keep], np.asarray(xyz)[keep]
+            else:
+                keep = [k for k in range(len(ids)) if int(ids[k]) + n_off not in self._mount_nodes]
+                if len(keep) != len(ids):
+                    ids = [ids[k] for k in keep]
+                    xyz = [xyz[k] for k in keep]
+        if not len(ids):
+            return 0
         if HAVE_NUMPY and isinstance(ids, np.ndarray):
             nid = ids + n_off
             step = 400000
@@ -2503,6 +2731,7 @@ class Converter:
                 if need_coord:
                     self.node_coord[n] = (p[0], p[1], p[2])
             fh.write(("\n".join(out) + "\n").encode("latin-1"))
+        return len(ids)
 
     def normalize_solid_conn(self, blk):
         """Normalize only recognizable collapsed-brick padding, before offsets.
@@ -3039,6 +3268,8 @@ class Converter:
         if m.mpcs:
             groups = {}
             for mp in m.mpcs:
+                if id(mp) in self._mount_mpcs:
+                    continue
                 if mp["type"] not in ("BEAM", "TIE", "PIN", "LINK"):
                     self.log.warn("*MPC %s 형식은 변환하지 않았습니다." % mp["type"])
                     continue
@@ -3062,11 +3293,13 @@ class Converter:
                         self.log.warn("*MPC %s는 병진만 구속하지만 강체 구속으로 바뀌어 "
                                       "회전까지 묶입니다." % g["type"])
             if n:
-                self.imap.append(("*MPC (%d행)" % len(m.mpcs),
+                self.imap.append(("*MPC (%d행)" % (len(m.mpcs) - len(self._mount_mpcs)),
                                   "*CONSTRAINED_NODAL_RIGID_BODY"))
 
         # COUPLING
         for cp in m.couplings:
+            if id(cp) in self._mount_couplings:
+                continue
             rn = self.node_ref(cp["ref"])
             S = self.build_surf(cp["surf"])
             ids = self.surf_nodes(S)
@@ -3147,9 +3380,26 @@ class Converter:
         agg = {}
         for b in self.m.boundaries:
             ids = self.resolve_ids("nsets", b["set"])
-            sid = self.global_nsets.get(b["set"])
-            if not sid and ids:
-                sid = self.node_set_id(b["set"], ids)
+            sid = None
+            if self._mount_nodes and any(int(n) in self._mount_nodes for n in ids):
+                rest = [n for n in ids if int(n) not in self._mount_nodes]
+                if not rest:
+                    # Lone mounting reference node: its BC moves to NSET_BC.
+                    if not self._mount_sid:
+                        self.log.warn('경계조건 "%s": 마운팅 절점을 삭제했지만 %s가 없어 '
+                                      '건너뜁니다.' % (b["set"], MOUNT_SET_NAME))
+                        continue
+                    sid = self._mount_sid
+                    self._mount_bc_hits += 1
+                    self.log.info('경계조건 "%s" → %s (SID %d)로 옮겼습니다.'
+                                  % (b["set"], MOUNT_SET_NAME, MOUNT_SET_ID))
+                else:
+                    self.log.warn('경계조건 "%s": 삭제한 마운팅 기준절점은 제외합니다.' % b["set"])
+                    ids = rest
+            if sid is None:
+                sid = self.global_nsets.get(b["set"])
+                if not sid and ids:
+                    sid = self.node_set_id(b["set"], ids)
             if not sid:
                 self.log.warn('경계조건이 참조한 절점집합 "%s"을 세트 목록에서 '
                               '찾지 못했습니다.' % b["set"])
@@ -3179,6 +3429,9 @@ class Converter:
             agg[sid] = dof
         for sid, dof in agg.items():
             self.spcs.append(dict(sid=sid, dof=dof))
+        if self._mount_sid and not self._mount_bc_hits:
+            self.log.warn("%s (SID %d): 옮길 마운팅 경계조건이 없어 SPC 없이 SET만 출력합니다."
+                          % (MOUNT_SET_NAME, MOUNT_SET_ID))
         if self.spcs:
             self.log.ok("경계조건 %d건을 *BOUNDARY_SPC_SET으로 변환했습니다." % len(self.spcs))
 
@@ -3572,12 +3825,23 @@ def write_k(cv, opt, out_path, src_name, progress=None):
 # ============================================================
 # 전체 파이프라인
 # ============================================================
-DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=False, tet10=True,
+DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=False, tet10=True, neg_elform_names=False,
                    beamNode=True, contact=True, mu=0.2, shell="auto", unit="mmts", auto_sets=True, solid="auto", all_contact="ERODING_SINGLE_SURFACE")
 
 
+BOOL_DETAIL_KEYS = ("neg_elform_names",)
+
+
+def bool_text(value):
+    """Checkbutton variable text for a boolean detail setting."""
+    return "1" if (value is True or str(value).strip().lower() in ("1", "true", "on", "yes")) else "0"
+# SST/MST < 0: LS-DYNA uses |value| as the contact thickness itself.
+NEGATIVE_DETAIL_KEYS = ("contact_bsort", "contact_sst", "contact_mst")
+
+
 def detail_defaults():
-    result = dict(solid="auto", shell="auto", all_contact="ERODING_SINGLE_SURFACE")
+    result = dict(solid="auto", shell="auto", all_contact="ERODING_SINGLE_SURFACE",
+                  neg_elform_names=False)
     # Blank FS/FD preserves each source interaction's friction coefficient.
     for k, value in dict(fs="", fd="", vdc=20, sst=0, mst=0,
                          soft="", sbopt="", depth="", bsort="").items():
@@ -3615,6 +3879,18 @@ def parse_detail_settings(raw):
         raise ValueError("알 수 없는 설정: " + ", ".join(sorted(set(raw)-allowed)))
     result = {}
     for key, text in raw.items():
+        if key in BOOL_DETAIL_KEYS:
+            if isinstance(text, bool):
+                result[key] = text
+                continue
+            flag = str(text).strip().lower()
+            if flag in ("1", "true", "on", "yes"):
+                result[key] = True
+            elif flag in ("", "0", "false", "off", "no"):
+                result[key] = False
+            else:
+                raise ValueError(key + ": true/false 값을 입력하세요.")
+            continue
         text = str(text).strip()
         if not text:
             continue
@@ -3634,7 +3910,7 @@ def parse_detail_settings(raw):
             value = float(text)
             if not math.isfinite(value) or (integer and value != int(value)):
                 raise ValueError()
-            if value < 0 and key != "contact_bsort":
+            if value < 0 and key not in NEGATIVE_DETAIL_KEYS:
                 raise ValueError()
             if key == "contact_soft" and value not in (0, 1, 2):
                 raise ValueError()
@@ -4012,7 +4288,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K v2.4  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v%s (by claude)  ·  Abaqus → LS-DYNA" % VERSION)
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
@@ -4150,16 +4426,10 @@ def run_gui():
         if state["busy"]:
             return
         win = tk.Toplevel(root)
+        win.withdraw()                     # v2.5: size after the content is built
         win.title("상세 설정")
         win.configure(bg=P["bg"])
         win.transient(root)
-        win.geometry("780x610")
-        win.minsize(760, 580)
-        win.update_idletasks()
-        x = max(0, root.winfo_rootx() + (root.winfo_width()-780)//2)
-        y = max(0, root.winfo_rooty() + (root.winfo_height()-610)//2)
-        win.geometry("+%d+%d" % (x, y))
-        win.grab_set()
         from tkinter import messagebox
         shell = tk.Frame(win, bg=P["bg"], padx=24, pady=22)
         shell.pack(fill="both", expand=True)
@@ -4169,6 +4439,12 @@ def run_gui():
                  bg=P["bg"], fg=P["dim"], font=F_BODY, anchor="w").pack(fill="x", pady=(6, 18))
         nav = tk.Frame(shell, bg=P["bg"])
         nav.pack(fill="x", pady=(0, 14))
+        # v2.5: reserve the bottom rows first; a short window shrinks the
+        # page card instead of clipping the buttons.
+        buttons = tk.Frame(shell, bg=P["bg"])
+        buttons.pack(side="bottom", fill="x")
+        tk.Label(shell, text="공란은 기존값 유지 · 불러온 설정은 [적용] 후 변환에 반영됩니다.",
+                 bg=P["bg"], fg=P["dim"], font=F_SM, anchor="w").pack(side="bottom", fill="x", pady=(12, 12))
         book, page_host = card(shell, "", F_HD)
         book.pack(fill="both", expand=True)
         page_host.grid_columnconfigure(0, weight=1)
@@ -4195,7 +4471,7 @@ def run_gui():
         titles = ("요소 · 전체 접촉", "접촉 계수", "쉘 Hourglass", "솔리드 Hourglass")
         notes = (
             "전체 접촉은 ELSET_ALL(900001)에 적용합니다.\n순수 C3D10은 ELFORM 16 유지 · Solid 지정은 육면체 전용",
-            "FS·FD 공란: 원본 유지, 원본 값이 없으면 0.2\nSOFT · SBOPT · DEPTH · BSORT는 비-TIE 접촉에 적용",
+            "FS·FD 공란: 원본 유지, 원본 값이 없으면 0.2 · SST·MST 음수 입력 가능(두께 절댓값)\nSOFT · SBOPT · DEPTH · BSORT는 비-TIE 접촉에 적용",
             "쉘 PART가 공유하는 HGID 1의 설정입니다. 공란은 기존 처리를 유지합니다.",
             "솔리드 PART가 공유하는 HGID 2의 설정입니다. 공란은 기존 처리를 유지합니다.")
         for index, (title, fields) in enumerate(groups):
@@ -4245,9 +4521,21 @@ def run_gui():
                         relief="flat", bd=0, highlightthickness=1,
                         highlightbackground=P["line"], highlightcolor=P["accent"])
                     entry.pack(fill="x", ipady=7)
+            if index == 0:
+                # v2.5: PAD / TA / ADHESIVE property names -> solid ELFORM -1
+                var = tk.StringVar(value=bool_text(detail.get("neg_elform_names")))
+                variables["neg_elform_names"] = var
+                tk.Checkbutton(tab, text="PAD / TA / ADHESIVE 이름의 솔리드 프로퍼티 → ELFORM -1",
+                    variable=var, onvalue="1", offvalue="0", font=F_BODY,
+                    bg=P["card"], fg=P["text"], activebackground=P["card"],
+                    activeforeground=P["text"], selectcolor=P["card2"],
+                    highlightthickness=0, bd=0, anchor="w", cursor="hand2"
+                    ).pack(fill="x", pady=(2, 2))
+                tk.Label(tab, text="이름에 PAD·TA·ADHESIVE가 단어로 들어간 경우만 (METAL·DATA 등 제외) · "
+                                   "육면체 전용 프로퍼티에 적용 · Solid ELFORM 지정보다 우선",
+                         font=F_SM, bg=P["card"], fg=P["dim"], anchor="w", justify="left",
+                         wraplength=680).pack(fill="x", padx=(26, 0), pady=(0, 6))
         select_page(0)
-        tk.Label(shell, text="공란은 기존값 유지 · 불러온 설정은 [적용] 후 변환에 반영됩니다.",
-                 bg=P["bg"], fg=P["dim"], font=F_SM, anchor="w").pack(fill="x", pady=(12, 12))
         def save_json():
             try:
                 values = parse_detail_settings({k: v.get() for k, v in variables.items()})
@@ -4267,10 +4555,13 @@ def run_gui():
                 messagebox.showerror("설정 불러오기 실패", str(exc), parent=win)
                 return
             for key, var in variables.items():
+                if key in BOOL_DETAIL_KEYS:
+                    var.set(bool_text(values.get(key, False)))
+                    continue
                 var.set(values.get(key, detail_defaults()[key] if key in ("shell", "solid", "all_contact") else ""))
         def reset():
             for key, value in detail_defaults().items():
-                variables[key].set(value)
+                variables[key].set(bool_text(value) if key in BOOL_DETAIL_KEYS else value)
         def apply():
             try:
                 values = parse_detail_settings({k: v.get() for k, v in variables.items()})
@@ -4280,14 +4571,30 @@ def run_gui():
             detail.clear()
             detail.update(values)
             win.destroy()
-        buttons = tk.Frame(shell, bg=P["bg"])
-        buttons.pack(fill="x")
         RButton(buttons, "JSON 저장", save_json, kind="ghost", w=100, h=34, font=F_LB).pack(side="left", padx=4)
         RButton(buttons, "불러오기", load_json, kind="ghost", w=100, h=34, font=F_LB).pack(side="left", padx=4)
         RButton(buttons, "초기값", reset, kind="ghost", w=80, h=34, font=F_LB).pack(side="left", padx=4)
         RButton(buttons, "적용", apply, kind="primary", w=90, h=34, font=F_LB).pack(side="right", padx=(8, 0))
         RButton(buttons, "취소", win.destroy, kind="ghost", w=80, h=34, font=F_LB).pack(side="right")
         win.bind("<Escape>", lambda event: win.destroy())
+        # v2.5: fit the real content (all pages share one grid cell) so the
+        # bottom buttons are never clipped; keep the window on screen.
+        win.update_idletasks()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        width = min(max(860, win.winfo_reqwidth() + 20), sw - 40)
+        height = min(max(720, win.winfo_reqheight() + 20), sh - 80)
+        win.minsize(min(820, width), min(680, height))
+        x = root.winfo_rootx() + (root.winfo_width() - width) // 2
+        y = root.winfo_rooty() + (root.winfo_height() - height) // 2
+        x = min(max(0, x), max(0, sw - width))
+        y = min(max(0, y), max(0, sh - height - 40))
+        win.geometry("%dx%d+%d+%d" % (width, height, x, y))
+        win.deiconify()
+        win.lift()
+        try:
+            win.grab_set()
+        except tk.TclError:
+            win.after(100, lambda: win.winfo_exists() and win.grab_set())
     RButton(r2, "상세 설정", show_details, kind="ghost", w=120, h=34, font=F_LB).pack(side="left")
 
     # ---------- 실행 ----------
@@ -4589,6 +4896,8 @@ def main():
     ap.add_argument("--shell", default="auto", choices=["auto", "2", "16"])
     ap.add_argument("--unit", default="mmts", choices=list(UNIT_DEFAULT))
     ap.add_argument("--mu", type=float, default=0.2, help="기본 마찰계수")
+    ap.add_argument("--neg-elform-names", action="store_true",
+                    help="PAD/TA/ADHESIVE 이름의 육면체 솔리드 프로퍼티를 ELFORM -1로")
     ap.add_argument("--check", action="store_true",
                     help="환경 진단 및 자체 시험 (실행이 안 될 때)")
     args = ap.parse_args()
@@ -4601,7 +4910,8 @@ def main():
     opt = dict(DEFAULT_OPT)
     opt.update(sets=not args.no_sets, contact=not args.no_contact, auto_sets=not args.no_auto_sets,
                ctrl=False, tet10=args.tet10,
-               shell=args.shell, unit=args.unit, mu=args.mu)
+               shell=args.shell, unit=args.unit, mu=args.mu,
+               neg_elform_names=args.neg_elform_names)
     out = args.out or (os.path.splitext(args.input)[0] + ".k")
 
     def sink(lv, m):
