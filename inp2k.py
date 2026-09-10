@@ -56,6 +56,14 @@ v1.5:
 - Allocate CNRB PIDs after all output entities are known, starting above every
   emitted node/element/PART/SECTION/MAT/curve/SET/HG/contact/constraint ID.
   Recheck at write time; retain PART IDs, node-set links and source SET order.
+
+v1.6:
+- Append ELSET_ALL (900001, PART list), RIGID_Y (200001) and RIGID_Z
+  (200002, NODE lists). These names/IDs are reserved when auto_sets is enabled.
+- Global-coordinate exterior faces within 10 degrees are grown across shared
+  edges from the global directional extreme. Shell faces are two-sided.
+  Disconnected recessed surfaces are excluded. No BC/CNRB is added.
+- No qualifying end face: warn and omit that NODE set, never write an empty one.
 """
 
 import os
@@ -84,7 +92,7 @@ except Exception:                                    # pragma: no cover
     pd = None
     HAVE_PANDAS = False
 
-VERSION = "1.5"
+VERSION = "1.6"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -1473,7 +1481,17 @@ class Converter:
     def finalize_set_order(self):
         """Make file order and numeric SID order agree, then fix references."""
         self.set_output.sort(key=lambda s: s["_sort_key"])
-        remap = {s["sid"]: i for i, s in enumerate(self.set_output, 1)}
+        reserved = {200001, 200002, 900001} if self.opt.get("auto_sets", True) else set()
+        remap = {}
+        next_id = 0
+        for s in self.set_output:
+            if s.get("fixed_sid"):
+                remap[s["sid"]] = s["fixed_sid"]
+                continue
+            next_id += 1
+            while next_id in reserved:
+                next_id += 1
+            remap[s["sid"]] = next_id
         for s in self.set_output:
             s["sid"] = remap[s["sid"]]
         self.nsets = [s for s in self.set_output if s["kind"] == "node"]
@@ -1490,7 +1508,125 @@ class Converter:
         for mapping in (self._node_sid, self._seg_sid, self.global_nsets):
             for name, sid in list(mapping.items()):
                 mapping[name] = remap[sid]
-        self._sid = len(self.set_output)
+        self._sid = next_id
+
+    def add_automatic_sets(self):
+        """Append fixed-ID selection sets after all existing set references settle.
+
+        A PART set covers mixed element families without mislabelling shell IDs
+        as solid IDs. Only face-bearing structural elements define the extrema;
+        reference nodes, point masses and generated beam nodes are excluded.
+        """
+        names = {"ELSET_ALL", "RIGID_Y", "RIGID_Z"}
+        if any(name_key(s["name"]) in names for s in self.set_output):
+            raise ValueError("자동 SET 이름 ELSET_ALL/RIGID_Y/RIGID_Z가 기존 SET과 겹칩니다. 기존 이름을 변경하세요.")
+
+        def add(kind, sid, name, ids):
+            if not ids:
+                self.log.warn("자동 SET %s: 조건에 맞는 대상이 없어 출력하지 않습니다." % name)
+                return
+            if any(s["sid"] == sid for s in self.set_output):
+                raise ValueError("자동 SET ID 충돌: %d" % sid)
+            rec = dict(kind=kind, sid=sid, fixed_sid=sid, name=name, ids=ids,
+                       _sort_key=(3, len(self.set_output), sid))
+            self.set_output.append(rec)
+            if kind == "node":
+                self.nsets.append(rec)
+            self.log.ok("자동 SET %s (ID=%d): %d개 %s" %
+                        (name, sid, len(ids), "PART" if kind == "part" else "NODE"))
+
+        add("part", 900001, "ELSET_ALL", [p["pid"] for p in self.parts])
+        xyz = self.node_coord
+        faces = {}
+        shell_faces = []
+        structural_nodes = set()
+        for info in self.elem_info.values():
+            c = info["c"]
+            if info["cat"] == "shell":
+                face = tuple(ordered_unique(c[:4] if info["sub"].startswith("quad") else c[:3]))
+                shell_faces.append((face, True, face))
+                structural_nodes.update(face)
+                continue
+            local_faces = FACE.get(info["sub"], {})
+            corner_ids = ordered_unique(c[i] for f in local_faces.values() for i in f)
+            if not corner_ids:
+                continue
+            structural_nodes.update(corner_ids)
+            center = tuple(sum(xyz[n][j] for n in corner_ids) / len(corner_ids) for j in range(3))
+            seen = set()
+            for local in local_faces.values():
+                face = tuple(ordered_unique(c[i] for i in local))
+                key = tuple(sorted(face))
+                if len(face) < 3 or key in seen:
+                    continue
+                seen.add(key)
+                members = list(face)
+                if info.get("keep_tet10"):
+                    for a, b, mid in ((0,1,4),(1,2,5),(2,0,6),(0,3,7),(1,3,8),(2,3,9)):
+                        if c[a] in face and c[b] in face:
+                            members.append(c[mid])
+                if key in faces:
+                    faces[key] = None  # Shared solid face is internal.
+                else:
+                    faces[key] = (face, center, tuple(ordered_unique(members)))
+        records = [v for v in faces.values() if v is not None] + shell_faces
+        del faces
+        if any(n not in xyz for n in structural_nodes):
+            raise ValueError("자동 끝단 SET: 정의되지 않은 표면 절점이 있습니다.")
+        # Newell normal, calculated relative to one point for translation stability.
+        geometry = []
+        for face, center, members in records:
+            pts = [xyz[n] for n in face]
+            origin = pts[0]
+            pts = [tuple(p[j]-origin[j] for j in range(3)) for p in pts]
+            normal = [0.0, 0.0, 0.0]
+            for a, b in zip(pts, pts[1:] + pts[:1]):
+                normal[0] += a[1]*b[2]-a[2]*b[1]
+                normal[1] += a[2]*b[0]-a[0]*b[2]
+                normal[2] += a[0]*b[1]-a[1]*b[0]
+            norm = math.sqrt(sum(x*x for x in normal))
+            if not norm:
+                continue
+            normal = [x/norm for x in normal]
+            two_sided = center is True
+            if not two_sided:
+                fc = [sum(xyz[n][j] for n in face)/len(face) for j in range(3)]
+                if sum(normal[j]*(fc[j]-center[j]) for j in range(3)) < 0:
+                    normal = [-x for x in normal]
+            geometry.append((face, normal, two_sided, members))
+        cosine = math.cos(math.radians(10.0))
+        for axis, sign, sid, name in ((1, 1, 200001, "RIGID_Y"), (2, -1, 200002, "RIGID_Z")):
+            if not structural_nodes:
+                add("node", sid, name, [])
+                continue
+            projections = [sign*xyz[n][axis] for n in structural_nodes]
+            extreme = max(projections)
+            tolerance = max((extreme-min(projections))*1e-8,
+                            max(abs(x) for x in projections)*2e-15, 1e-12)
+            candidates = []
+            edges = {}
+            seeds = []
+            for face, normal, two_sided, members in geometry:
+                dot = normal[axis]*sign
+                if (abs(dot) if two_sided else dot) < cosine-1e-12:
+                    continue
+                i = len(candidates)
+                candidates.append((face, members))
+                if any(extreme-sign*xyz[n][axis] <= tolerance for n in face):
+                    seeds.append(i)
+                for a, b in zip(face, face[1:] + face[:1]):
+                    edges.setdefault(tuple(sorted((a,b))), []).append(i)
+            selected = set(seeds)
+            pending = list(seeds)
+            while pending:
+                face, _ = candidates[pending.pop()]
+                for a, b in zip(face, face[1:] + face[:1]):
+                    for neighbor in edges.pop(tuple(sorted((a,b))), []):
+                        if neighbor not in selected:
+                            selected.add(neighbor)
+                            pending.append(neighbor)
+            ids = sorted({n for i in selected for n in candidates[i][1]})
+            add("node", sid, name, ids)
 
     def assign_hourglasses(self):
         """Keep two stable shared IDs, independent of part count and ordering."""
@@ -1648,6 +1784,9 @@ class Converter:
         self.prepare_contexts(instances)
         need_info = bool(m.surfaces or (self.opt["contact"] and m.rigid_bodies))
         need_coord = False
+        if self.opt.get("auto_sets", True):
+            need_info = need_coord = True
+            self._need_all_surface_elements = True
         if self.opt["beamNode"]:
             for t in m.el_types:
                 c = classify(t)
@@ -1680,6 +1819,8 @@ class Converter:
         if self.opt["bc"]:
             self.do_boundaries()
         self.finalize_set_order()
+        if self.opt.get("auto_sets", True):
+            self.add_automatic_sets()
         self.finalize_nrb_ids()
 
         if m.unsupported:
@@ -2025,6 +2166,8 @@ class Converter:
                     row = conn[k]
                     self.elem_info[eid0 + e_off] = dict(
                         cat=cat, sub=sub,
+                        keep_tet10=(sub == "tet10" and self.opt["tet10"] and
+                                    sec_of_pid[int(_at(pid_arr, k))]["elform"] == 16),
                         c=[int(x) + n_off for x in row])
 
         eid = _add(ids, e_off)
@@ -2373,7 +2516,7 @@ class Converter:
         for records, key in ((self.parts, "pid"), (self.sections, "secid"),
                              (self.mats, "mid"), (self.curves, "lcid"),
                              (self.nsets, "sid"), (self.esets, "sid"),
-                             (self.segsets, "sid"), (self.hourglasses, "hgid"),
+                             (self.segsets, "sid"), (self.set_output, "sid"), (self.hourglasses, "hgid"),
                              (self.contacts, "cid"), (self.interps, "icid"),
                              (self.lineq, "lcid")):
             highest = max(highest, max((int(r[key]) for r in records), default=0))
@@ -2855,6 +2998,13 @@ def write_k(cv, opt, out_path, src_name, progress=None):
 
     # One source-ordered stream: do not regroup NSET/ELSET/SURFACE by type.
     for s in cv.set_output:
+        if s["kind"] == "part":
+            put("*SET_PART_LIST_TITLE")
+            put(s["name"][:80])
+            put("$#     sid")
+            put(i10(s["sid"]))
+            chunk_ids(s["ids"])
+            continue
         if s["kind"] == "node":
             kw = "*SET_NODE_LIST_TITLE"
         elif s["kind"] == "segment":
@@ -2933,7 +3083,7 @@ def write_k(cv, opt, out_path, src_name, progress=None):
 # 전체 파이프라인
 # ============================================================
 DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=False, tet10=False,
-                   beamNode=True, contact=True, mu=0.2, shell="auto", unit="mmts")
+                   beamNode=True, contact=True, mu=0.2, shell="auto", unit="mmts", auto_sets=True)
 
 
 def convert_file(inp_path, out_path, opt, log, progress=None):
@@ -3244,7 +3394,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v1.6  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
