@@ -3,7 +3,20 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.5 (by claude)
+현재 버전: v2.6 (by claude)
+최신 수정사항 — 마운팅 판정에서 경계조건 조건 제거 / 체크박스 문구 축약 / 전체 접촉 별도 계수
+- 마운팅: 노드 1개짜리 NSET이 *COUPLING 또는 *MPC의 기준절점이면 *BOUNDARY 유무와
+  관계없이 마운팅으로 봅니다. 해당 COUPLING/MPC는 변환하지 않고 기준절점을 삭제하며,
+  종속 절점으로 NSET_BC (SID 100001)를 만듭니다. BC가 있으면 NSET_BC로 옮기고,
+  없으면 SET만 출력합니다. 후보가 여러 개이면 이름에 MOUNT가 들어간 SET만 쓰고,
+  그런 SET이 없으면 모든 후보를 NSET_BC 하나로 묶고 경고합니다.
+- 상세 설정의 PAD/TA/ADHESIVE 체크박스를 한 줄로 줄이고 부가 설명을 없앴습니다.
+- 상세 설정에 "전체 접촉" 페이지를 추가해 ELSET_ALL 전체 접촉(ELSET_ALL_CONTACT,
+  자동 SET OFF 시 GENERAL_CONTACT)의 FS/FD/VDC/SST/MST/SOFT/SBOPT/DEPTH/BSORT를
+  따로 지정합니다. 공란이면 "개별 접촉" 값 → 기존 값 순서로 따릅니다.
+  JSON 키: all_contact_fs 등 (schema_version 1 유지, 이전 JSON도 그대로 불러옴).
+
+이전 버전: v2.5 (by claude)
 최신 수정사항 — 상세 설정 창 크기 / SST·MST 음수 / PAD·TA·ADHESIVE ELFORM -1 / 마운팅 노드 → NSET_BC
 - 상세 설정 창을 키우고, 내용의 실제 요구 크기에 맞춰 창 크기를 정합니다
   (화면보다 크면 화면 안으로 제한). 하단 버튼이 잘리지 않습니다.
@@ -198,7 +211,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.5"
+VERSION = "2.6"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -2016,7 +2029,7 @@ class Converter:
         return used
 
     def detect_mounting(self):
-        """Find a lone-node NSET that is the fixed reference node of a COUPLING/MPC.
+        """Find a lone-node NSET that is the reference node of a COUPLING/MPC.
 
         Such a node only carries the mounting BC. The coupling/MPC is not
         converted, the reference node is removed from *NODE, and the coupled
@@ -2050,18 +2063,16 @@ class Converter:
                         found.setdefault(node, []).append(title)
         if not found:
             return
-        # Mounting = a reference node that is actually fixed by a *BOUNDARY.
-        # Load / mass reference points without a BC keep their constraint.
-        fixed = set()
-        for b in m.boundaries:
-            ids = set(int(n) for n in self.resolve_ids("nsets", b["set"]))
-            if len(ids) == 1:
-                fixed |= ids & set(found)
-        for node in [n for n in found if n not in fixed]:
-            self.log.info('1노드 기준절점 세트 %s: 경계조건이 없어 마운팅으로 보지 않습니다.'
-                          % ", ".join(found.pop(node)))
-        if not found:
-            return
+        # A BC is not required: a lone-node reference set is a mounting.
+        # Several candidates -> prefer names containing MOUNT (v2.6).
+        if len(found) > 1:
+            named = {n: v for n, v in found.items()
+                     if any("MOUNT" in name_key(x) for x in v)}
+            if named:
+                for node in [n for n in found if n not in named]:
+                    self.log.info('1노드 기준절점 세트 %s: 이름에 MOUNT가 없어 마운팅에서 제외합니다.'
+                                  % ", ".join(found[node]))
+                found = named
         # Keep the node when anything else still needs it.
         blocked = self._nodes_in_elements(set(found))
         for eq in m.equations:
@@ -2464,7 +2475,7 @@ class Converter:
                 self.log.warn("원본 General Contact는 선택한 ELSET_ALL 접촉으로 대체합니다. 제외 조건은 옮기지 않습니다.")
             self.contacts.append(dict(cid=max([c["cid"] for c in self.contacts] or [0])+1,
                 kind=self.opt.get("all_contact", "ERODING_SINGLE_SURFACE")+"_ID",
-                title="ELSET_ALL_CONTACT",
+                title="ELSET_ALL_CONTACT", whole=True,
                 ssid=900001, msid=0, sstyp=2, mstyp=0,
                 fs=self.opt.get("mu", .2), fd=self.opt.get("mu", .2)))
             self.log.ok("전체 접촉 추가: %s → ELSET_ALL (900001)" % self.contacts[-1]["kind"])
@@ -3257,7 +3268,7 @@ class Converter:
         if m.general_contact and not opt.get("auto_sets", True):
             self.contacts.append(dict(cid=len(self.contacts) + 1,
                                       kind="AUTOMATIC_SINGLE_SURFACE_ID",
-                                      title="GENERAL_CONTACT", ssid=0, msid=0,
+                                      title="GENERAL_CONTACT", whole=True, ssid=0, msid=0,
                                       sstyp=2, mstyp=0, fs=opt["mu"], fd=opt["mu"]))
             self.imap.append(("*CONTACT (general contact)",
                               "*CONTACT_AUTOMATIC_SINGLE_SURFACE"))
@@ -3430,7 +3441,7 @@ class Converter:
         for sid, dof in agg.items():
             self.spcs.append(dict(sid=sid, dof=dof))
         if self._mount_sid and not self._mount_bc_hits:
-            self.log.warn("%s (SID %d): 옮길 마운팅 경계조건이 없어 SPC 없이 SET만 출력합니다."
+            self.log.info("%s (SID %d): 마운팅 경계조건이 없어 SPC 없이 SET만 출력합니다."
                           % (MOUNT_SET_NAME, MOUNT_SET_ID))
         if self.spcs:
             self.log.ok("경계조건 %d건을 *BOUNDARY_SPC_SET으로 변환했습니다." % len(self.spcs))
@@ -3771,11 +3782,17 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         for nid, dof, coef in q["terms"]:
             put(i10(nid) + i10(dof) + f10(coef))
 
+    def contact_opt(c, k):
+        """Whole-model contact: its own value first, then the per-contact value."""
+        if c.get("whole") and opt.get("all_contact_" + k) is not None:
+            return opt["all_contact_" + k]
+        return opt.get("contact_" + k)
+
     for original in getattr(cv, "contacts", []):
         c = dict(original)
         for k in ("fs", "fd", "vdc", "sst", "mst"):
-            if opt.get("contact_" + k) is not None:
-                c[k] = opt["contact_" + k]
+            if contact_opt(c, k) is not None:
+                c[k] = contact_opt(c, k)
         put("*CONTACT_" + c["kind"])
         put("$#     cid                                                               heading")
         put(i10(c["cid"]) + c["title"][:70])
@@ -3799,17 +3816,17 @@ def write_k(cv, opt, out_path, src_name, progress=None):
             # Layout: ansys/pydyna auto/contact/contact_eroding_single_surface.py.
             put("$#    isym    erosop      iadj")
             put(i10(0) * 3)
-        if not tied and any(opt.get("contact_"+k) is not None
+        if not tied and any(contact_opt(c, k) is not None
                             for k in ("soft", "sbopt", "depth", "bsort")):
             put("$#    soft    sofscl    lcidab    maxpar     sbopt     depth     bsort    frcfrq")
             put("".join(" " * 10 if value is None else
                         (i10(value) if integer else f10(value))
                         for value, integer in (
-                            (opt.get("contact_soft", 0), True), (.1, False),
-                            (0, True), (1.025, False),
-                            (opt.get("contact_sbopt", 2), True),
-                            (opt.get("contact_depth", 2), True),
-                            (opt.get("contact_bsort"), True), (1, True))))
+                            (contact_opt(c, "soft") if contact_opt(c, "soft") is not None else 0, True),
+                            (.1, False), (0, True), (1.025, False),
+                            (contact_opt(c, "sbopt") if contact_opt(c, "sbopt") is not None else 2, True),
+                            (contact_opt(c, "depth") if contact_opt(c, "depth") is not None else 2, True),
+                            (contact_opt(c, "bsort"), True), (1, True))))
 
     put("*END")
     size = W.tell()
@@ -3836,7 +3853,9 @@ def bool_text(value):
     """Checkbutton variable text for a boolean detail setting."""
     return "1" if (value is True or str(value).strip().lower() in ("1", "true", "on", "yes")) else "0"
 # SST/MST < 0: LS-DYNA uses |value| as the contact thickness itself.
-NEGATIVE_DETAIL_KEYS = ("contact_bsort", "contact_sst", "contact_mst")
+NEGATIVE_DETAIL_KEYS = ("contact_bsort", "contact_sst", "contact_mst",
+                        "all_contact_bsort", "all_contact_sst", "all_contact_mst")
+CONTACT_FIELDS = ("fs", "fd", "vdc", "sst", "mst", "soft", "sbopt", "depth", "bsort")
 
 
 def detail_defaults():
@@ -3846,6 +3865,9 @@ def detail_defaults():
     for k, value in dict(fs="", fd="", vdc=20, sst=0, mst=0,
                          soft="", sbopt="", depth="", bsort="").items():
         result["contact_"+k] = value
+    # v2.6: whole-model contact; blank follows the per-contact value.
+    for k in CONTACT_FIELDS:
+        result["all_contact_"+k] = ""
     for kind, vals in HOURGLASS_DEFAULTS.items():
         defaults = dict(zip(("ihq", "qm", "qb", "qw"), vals))
         for k in ("ihq", "qm", "ibq", "q1", "q2", "qb", "qw"):
@@ -3912,7 +3934,7 @@ def parse_detail_settings(raw):
                 raise ValueError()
             if value < 0 and key not in NEGATIVE_DETAIL_KEYS:
                 raise ValueError()
-            if key == "contact_soft" and value not in (0, 1, 2):
+            if key.endswith("contact_soft") and value not in (0, 1, 2):
                 raise ValueError()
             if key.endswith("_ihq") and value not in range(0, 11):
                 raise ValueError()
@@ -4461,17 +4483,19 @@ def run_gui():
                              ("solid", "Solid ELFORM (육면체 전용)", "auto"),
                              ("shell", "Shell ELFORM", "auto")]),
             ("Contact", [("contact_"+k, k.upper() + (" (공란: 원본, 없으면 0.2)" if k in ("fs", "fd") else ""), detail_defaults()["contact_"+k])
-                         for k in ("fs", "fd", "vdc", "sst", "mst", "soft", "sbopt", "depth", "bsort")]),
+                         for k in CONTACT_FIELDS]),
+            ("Whole contact", [("all_contact_"+k, k.upper(), "") for k in CONTACT_FIELDS]),
         ]
         for kind in ("shell", "solid"):
             defaults = dict(zip(("ihq", "qm", "qb", "qw"), HOURGLASS_DEFAULTS[kind]))
             groups.append(("Hourglass " + kind, [("hg_"+kind+"_"+k, k.upper(),
                            "" if defaults.get(k) is None else str(defaults[k]))
                            for k in ("ihq", "qm", "ibq", "q1", "q2", "qb", "qw")]))
-        titles = ("요소 · 전체 접촉", "접촉 계수", "쉘 Hourglass", "솔리드 Hourglass")
+        titles = ("요소 · 전체 접촉", "개별 접촉 계수", "전체 접촉 계수", "쉘 Hourglass", "솔리드 Hourglass")
         notes = (
             "전체 접촉은 ELSET_ALL(900001)에 적용합니다.\n순수 C3D10은 ELFORM 16 유지 · Solid 지정은 육면체 전용",
             "FS·FD 공란: 원본 유지, 원본 값이 없으면 0.2 · SST·MST 음수 입력 가능(두께 절댓값)\nSOFT · SBOPT · DEPTH · BSORT는 비-TIE 접촉에 적용",
+            "ELSET_ALL 전체 접촉에만 적용합니다. 공란은 개별 접촉 계수 값을 따릅니다.\nSST·MST 음수 입력 가능(두께 절댓값)",
             "쉘 PART가 공유하는 HGID 1의 설정입니다. 공란은 기존 처리를 유지합니다.",
             "솔리드 PART가 공유하는 HGID 2의 설정입니다. 공란은 기존 처리를 유지합니다.")
         for index, (title, fields) in enumerate(groups):
@@ -4479,7 +4503,7 @@ def run_gui():
             tab.grid(row=0, column=0, sticky="nsew")
             pages.append(tab)
             button = RButton(nav, titles[index], lambda i=index: select_page(i),
-                             kind="ghost", w=166, h=36, font=F_BODY)
+                             kind="ghost", w=150, h=36, font=F_BODY)
             button.pack(side="left", padx=(0, 8))
             tabs.append(button)
             tk.Label(tab, text=titles[index], font=F_LB, bg=P["card"], fg=P["text"],
@@ -4495,7 +4519,7 @@ def run_gui():
                 cell = tk.Frame(form, bg=P["card"])
                 cell.grid(row=position//columns, column=position%columns,
                           sticky="ew", padx=(0, 16 if columns > 1 else 0), pady=(0, 12))
-                short_label = label.split(" (")[0] if key.startswith("contact_") else label
+                short_label = label.split(" (")[0] if "contact_" in key else label
                 tk.Label(cell, text=short_label, font=F_SM, bg=P["card"], fg=P["dim"],
                          anchor="w").pack(fill="x", pady=(0, 5))
                 var = tk.StringVar(value=str(detail.get(key, "")))
@@ -4525,16 +4549,12 @@ def run_gui():
                 # v2.5: PAD / TA / ADHESIVE property names -> solid ELFORM -1
                 var = tk.StringVar(value=bool_text(detail.get("neg_elform_names")))
                 variables["neg_elform_names"] = var
-                tk.Checkbutton(tab, text="PAD / TA / ADHESIVE 이름의 솔리드 프로퍼티 → ELFORM -1",
+                tk.Checkbutton(tab, text="PAD · TA · ADHESIVE → ELFORM -1",
                     variable=var, onvalue="1", offvalue="0", font=F_BODY,
                     bg=P["card"], fg=P["text"], activebackground=P["card"],
                     activeforeground=P["text"], selectcolor=P["card2"],
                     highlightthickness=0, bd=0, anchor="w", cursor="hand2"
-                    ).pack(fill="x", pady=(2, 2))
-                tk.Label(tab, text="이름에 PAD·TA·ADHESIVE가 단어로 들어간 경우만 (METAL·DATA 등 제외) · "
-                                   "육면체 전용 프로퍼티에 적용 · Solid ELFORM 지정보다 우선",
-                         font=F_SM, bg=P["card"], fg=P["dim"], anchor="w", justify="left",
-                         wraplength=680).pack(fill="x", padx=(26, 0), pady=(0, 6))
+                    ).pack(fill="x", pady=(2, 6))
         select_page(0)
         def save_json():
             try:
