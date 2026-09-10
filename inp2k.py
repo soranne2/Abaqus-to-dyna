@@ -3,8 +3,20 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v1.8
-최신 수정사항 — 기존 SET/SURFACE 변환(75% 구간) 최적화
+현재 버전: v1.9
+최신 수정사항 — 자동 끝단 SET OFF 상태의 75% 지연 대응
+- ELSET 분류 시 전체 요소를 복사/정렬하던 v1.8 전역 색인 생성을 제거하고,
+  이미 만들어진 인스턴스별 검색 정보를 재사용합니다.
+- NODE SURFACE의 전체 외곽면 사전 생성을 제거하고, NumPy 경로에서는
+  5만 요소씩 선택 노드에 닿는 후보를 검사합니다. 동일한 최근 선택은 재사용합니다.
+- GUI 진행 통지를 제한하고 이벤트 처리를 시간/개수 단위로 나눠
+  진행 메시지가 많아도 화면이 다시 그려질 수 있도록 합니다.
+- SET/SURFACE 처리 이름과 경과 시간을 로그에 남기며,
+  출력 경로 + .conversion.log 파일에 실행 기록과 오류를 실시간으로 추가합니다.
+- 기존 SET 구성원/순서 및 자동 끝단 SET ON/OFF 동작을 유지합니다.
+  실제 사용자 INP에서의 지연 원인은 미확정이며 진단 기록으로 추적할 수 있습니다.
+
+v1.8 변경 이력 — 기존 SET/SURFACE 변환(75% 구간) 최적화
 - NODE SURFACE: 전체 요소의 면을 세트마다 다시 검사하지 않고,
   공통 외곽면 색인을 한 번 생성한 뒤 재사용합니다.
 - ELSET: 모든 인스턴스를 매번 순회하는 대신 전역 요소 종류 색인으로
@@ -17,7 +29,6 @@ Abaqus INP -> LS-DYNA keyword (.k) 변환기
 - 검증: 회귀 테스트 63개 통과. 합성 모델의 2만 요소/100 NODE SURFACE
   조회에서 v1.7 10.65초 -> v1.8 0.35초, 선택된 면과 순서 일치.
   위 시간은 해당 조회 예제 기준이며 실제 모델 전체의 성능을 보장하지 않습니다.
-- 이번 재전달은 변경 이력 설명만 추가했습니다. 실행 코드와 버전은 동일합니다.
 
 GUI:  python inp2k.py
 CLI:  python inp2k.py model.inp -o model.k --no-sets
@@ -116,7 +127,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "1.8"
+VERSION = "1.9"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -1774,7 +1785,16 @@ class Converter:
 
     def emit_source_sets(self):
         """Emit first definitions in original interleaved order, including surfaces."""
+        started = time.monotonic()
+        last_report = started-5
+        self.log.info("기존 SET/SURFACE 시작: %d개 정의 · 자동 끝단 SET %s" %
+                      (len(self.m.set_defs), "ON" if self.opt.get("auto_sets", True) else "OFF"))
         for source_index, src in enumerate(self.m.set_defs):
+            self._source_description = "%d/%d %s" % (source_index+1,len(self.m.set_defs),src["name"])
+            now = time.monotonic()
+            if now-last_report >= 2:
+                self.log.info("SET/SURFACE 처리: %s · 누적 %.1f초" % (self._source_description,now-started))
+                last_report = now
             self.post_stage(75+2*source_index/max(len(self.m.set_defs),1),
                             "SET/SURFACE %d/%d: %s" % (source_index+1,len(self.m.set_defs),src["name"]))
             self._set_source_order = (1 if src["kind"] == "surface" else 0, source_index)
@@ -1828,43 +1848,67 @@ class Converter:
                             self.append_set("element", record)
                             self._element_sid[key] = record
         self._set_source_order = None
+        self._source_description = ""
+        self.log.ok("기존 SET/SURFACE 완료: %.2f초" % (time.monotonic()-started))
 
     def element_set_groups(self, ids):
-        # Build the global category index once; do not search every instance
-        # again for each ELSET. Input membership and first-category order stay.
-        codes = {"solid": 1, "shell": 2, "beam": 3}
-        if not hasattr(self, "_category_index"):
-            if HAVE_NUMPY:
-                blocks, categories = [], []
-                for ctx in self.contexts.values():
-                    for b in ctx["P"].eblocks:
-                        code = codes.get((classify(b["type"]) or {}).get("cat"), 0)
-                        blocks.append(np.asarray(b["ids"], dtype=np.int64) + ctx["eOff"])
-                        categories.append(np.full(len(b["ids"]), code, dtype=np.uint8))
-                all_ids = np.concatenate(blocks) if blocks else np.empty(0, np.int64)
-                all_cats = np.concatenate(categories) if categories else np.empty(0, np.uint8)
-                order = np.argsort(all_ids, kind="stable")
-                self._category_index = (all_ids[order], all_cats[order])
-            else:
-                self._category_index = {
-                    int(e)+ctx["eOff"]: codes.get((classify(b["type"]) or {}).get("cat"), 0)
-                    for ctx in self.contexts.values() for b in ctx["P"].eblocks for e in b["ids"]}
-        names = {1: "solid", 2: "shell", 3: "beam"}
+        # Reuse the already-built per-instance EidIndex. No full-model copy,
+        # concatenation, or global sort when the first ELSET is encountered.
+        import bisect
+        if not hasattr(self, "_element_ranges"):
+            ranges = []
+            for ctx in self.contexts.values():
+                idx = ctx["index"]
+                if not idx.total:
+                    continue
+                lo = int(idx.sorted[0]) if idx.np_mode else min(idx.d)
+                hi = int(idx.sorted[-1]) if idx.np_mode else max(idx.d)
+                codes = [{"solid":1,"shell":2,"beam":3}.get(
+                    (classify(b["type"]) or {}).get("cat"),0) for b in ctx["P"].eblocks]
+                ranges.append((lo+ctx["eOff"],hi+ctx["eOff"],ctx,codes))
+            self._element_ranges = sorted(ranges,key=lambda r:r[0])
+            self._element_starts = [r[0] for r in self._element_ranges]
+        ranges = self._element_ranges
+        names = {1:"solid",2:"shell",3:"beam"}
         if HAVE_NUMPY:
-            src = np.asarray(ids, dtype=np.int64)
-            all_ids, all_cats = self._category_index
-            pos = np.searchsorted(all_ids, src)
-            rows = np.flatnonzero(pos < len(all_ids))
-            rows = rows[all_ids[pos[rows]] == src[rows]]
-            cats = np.zeros(len(src), dtype=np.uint8)
-            cats[rows] = all_cats[pos[rows]]
-            return {names[c]: src[cats == c].tolist()
-                    for c in ordered_unique(cats.tolist()) if c}
+            src = np.asarray(ids,dtype=np.int64)
+            cats = np.zeros(len(src),dtype=np.uint8)
+            owners = np.searchsorted(self._element_starts,src,side="right")-1
+            for owner in np.unique(owners):
+                if owner < 0:
+                    continue
+                lo,hi,ctx,codes = ranges[int(owner)]
+                rows = np.flatnonzero((owners == owner) & (src <= hi))
+                if not len(rows):
+                    continue
+                idx = ctx["index"]
+                if not idx.np_mode:
+                    for row in rows:
+                        loc = idx.one(int(src[row])-ctx["eOff"])
+                        if loc is not None:
+                            cats[row] = codes[loc[0]]
+                    continue
+                local = src[rows]-ctx["eOff"]
+                pos = np.searchsorted(idx.sorted,local)
+                valid = pos < idx.total
+                rows,local,pos = rows[valid],local[valid],pos[valid]
+                valid = idx.sorted[pos] == local
+                rows,pos = rows[valid],pos[valid]
+                block = np.searchsorted(idx.starts,idx.order[pos],side="right")-1
+                cats[rows] = np.asarray(codes,dtype=np.uint8)[block]
+            return {names[c]:src[cats==c].tolist() for c in ordered_unique(cats.tolist()) if c}
         groups = {}
         for eid in ids:
-            cat = self._category_index.get(eid, 0)
+            owner = bisect.bisect_right(self._element_starts,eid)-1
+            if owner < 0:
+                continue
+            lo,hi,ctx,codes = ranges[owner]
+            if eid > hi:
+                continue
+            loc = ctx["index"].one(eid-ctx["eOff"])
+            cat = codes[loc[0]] if loc is not None else 0
             if cat:
-                groups.setdefault(names[cat], []).append(eid)
+                groups.setdefault(names[cat],[]).append(eid)
         return groups
 
     def element_location(self, eid):
@@ -1875,36 +1919,58 @@ class Converter:
         return None
 
     def faces_for_nodes(self, ids):
-        # Identical node membership selects both copies of a shared face or
-        # neither. Exterior filtering can therefore be done ONCE globally,
-        # without changing the former per-surface filtering semantics.
-        if not hasattr(self, "_node_face_anchors"):
-            self.log.info("NODE SURFACE: 공통 외곽면 색인 생성 시작")
-            faces = {}
-            ordinal = 0
-            for i, (eid, info) in enumerate(self.elem_info.items()):
-                if i % 10000 == 0:
-                    self.post_stage(75, "NODE SURFACE 색인: 요소 %d/%d" % (i,len(self.elem_info)))
-                labels = ("SPOS",) if info["cat"] == "shell" else FACE.get(info["sub"], {})
-                for label in labels:
-                    face = self.seg_of(eid, label)
-                    if not face:
-                        continue
-                    key = tuple(sorted(set(face)))
-                    faces[key] = None if key in faces else (ordinal, face)
-                    ordinal += 1
-            anchors = {}
-            for key, record in faces.items():
-                if record is not None:
-                    anchors.setdefault(key[0], []).append(record)
-            self._node_face_anchors = anchors
-            self.log.ok("NODE SURFACE: 외곽면 색인 생성 완료")
+        # Inspect only elements containing >=3 selected corner slots, in bounded
+        # chunks. Do not construct the entire mesh's exterior face dictionary.
         selected = set(ids)
-        matches = [record for node in selected
-                   for record in self._node_face_anchors.get(node, ())
-                   if all(n in selected for n in record[1])]
-        matches.sort(key=lambda record: record[0])
-        return [record[1] for record in matches]
+        if len(selected) < 3:
+            return []
+        previous = getattr(self, "_last_node_surface", None)
+        if previous is not None and previous[0] == selected:
+            return [face[:] for face in previous[1]]
+        candidates = []
+        def collect(eid):
+            info = self.elem_info.get(eid)
+            if info is None:
+                return
+            labels = ("SPOS",) if info["cat"] == "shell" else FACE.get(info["sub"], {})
+            for label in labels:
+                face = self.seg_of(eid,label)
+                if face and all(n in selected for n in face):
+                    candidates.append(face)
+
+        if HAVE_NUMPY and self.contexts:
+            selected_array = np.asarray(sorted(selected),dtype=np.int64)
+            checked = 0
+            for ctx in self.contexts.values():
+                local_nodes = selected_array-ctx["nOff"]
+                for blk in ctx["P"].eblocks:
+                    cls = classify(blk["type"])
+                    if not cls or cls["cat"] not in ("solid","shell"):
+                        continue
+                    corners = {"hex8":8,"hex20":8,"wedge6":6,"wedge15":6,
+                               "pyramid5":5,"tet4":4,"tet10":4,
+                               "quad4":4,"quad8":4,"tri3":3,"tri6":3}[cls["sub"]]
+                    for start in range(0,len(blk["ids"]),50000):
+                        conn = np.asarray(blk["conn"][start:start+50000],dtype=np.int64)[:,:corners]
+                        pos = np.searchsorted(local_nodes,conn)
+                        np.minimum(pos,len(local_nodes)-1,out=pos)
+                        hits = (local_nodes[pos] == conn).sum(axis=1) >= 3
+                        for row in np.flatnonzero(hits):
+                            collect(int(blk["ids"][start+row])+ctx["eOff"])
+                        checked += len(conn)
+                        self.post_stage(getattr(self,"_last_post_pct",75),
+                                        "NODE SURFACE: %d개 요소 검사 / 후보면 %d개" % (checked,len(candidates)))
+        else:
+            for i,(eid,info) in enumerate(self.elem_info.items()):
+                if sum(n in selected for n in info["c"]) >= 3:
+                    collect(eid)
+                if i % 50000 == 0:
+                    self.post_stage(getattr(self,"_last_post_pct",75),
+                                    "NODE SURFACE: %d/%d 요소 검사" % (i,len(self.elem_info)))
+        result = self.exterior_faces(candidates)
+        # Only one cached selection, bounded by one query, not number of surfaces.
+        self._last_node_surface = (selected,result)
+        return [face[:] for face in result]
 
     @staticmethod
     def exterior_faces(candidates):
@@ -3262,26 +3328,63 @@ DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=False, tet10=False,
 
 
 def convert_file(inp_path, out_path, opt, log, progress=None):
+    """Keep diagnostic output independent of GUI repaint and preserve old decks."""
+    path = os.path.abspath(out_path) + ".conversion.log"
+    original_sink = log.sink
+    try:
+        diagnostic = open(path, "a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        log.warn("진단 로그를 저장할 수 없습니다: %s" % exc)
+        return _convert_file_impl(inp_path,out_path,opt,log,progress)
+    lock = threading.Lock()
+    def sink(level, message):
+        with lock:
+            diagnostic.write("%s [%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),level,message))
+        if original_sink:
+            original_sink(level,message)
+    log.sink = sink
+    try:
+        log.info("INP2K v%s 실행 · 자동 끝단 SET %s · 진단 로그: %s" %
+                 (VERSION,"ON" if opt.get("auto_sets",True) else "OFF",path))
+        return _convert_file_impl(inp_path,out_path,opt,log,progress)
+    except Exception:
+        import traceback
+        log.err(traceback.format_exc())
+        raise
+    finally:
+        log.sink = original_sink
+        diagnostic.close()
+
+def _convert_file_impl(inp_path, out_path, opt, log, progress=None):
     """progress(phase, pct, text) — pct 는 0~100 전체 진행률"""
     t0 = time.time()
     progress_lock = threading.Lock()
     latest = ["convert", 45.0, "", time.monotonic()]
+    published = [0.0, None]
 
     def emit(phase, pct, text=""):
-        if progress:
-            with progress_lock:
-                latest[:] = [phase, pct, text, time.monotonic()]
+        with progress_lock:
+            now = time.monotonic()
+            latest[:] = [phase, pct, text, now]
+            if progress and (now-published[0] >= .15 or phase != published[1] or phase == "done"):
+                published[:] = [now,phase]
                 progress(phase, pct, text)
 
     stop_heartbeat = threading.Event()
 
     def heartbeat():
+        last_log = time.monotonic()
         while not stop_heartbeat.wait(1.0):
             with progress_lock:
                 phase, pct, label, updated = latest
                 elapsed = time.monotonic()-updated
                 if progress and elapsed >= 1.0:
                     progress(phase, pct, "%s · 처리 중 %.0f초" % (label, elapsed))
+            if time.monotonic()-last_log >= 5:
+                source = getattr(cv,"_source_description","")
+                log.info("처리 중 %.1f%% · %s · %s · 변환 경과 %.0f초" %
+                         (pct,source,label,time.time()-t1))
+                last_log = time.monotonic()
 
     emit("read", 0.0, "")
     parser = Parser(log)
@@ -3303,7 +3406,7 @@ def convert_file(inp_path, out_path, opt, log, progress=None):
                        "convert", 45.0 + 30.0 * min(done / max(total, 1), 1.0), label))
     cv.stage_progress = lambda pct, label: emit("convert", pct, label)
     pending_output = None
-    pulse = threading.Thread(target=heartbeat, daemon=True) if progress else None
+    pulse = threading.Thread(target=heartbeat, daemon=True)
     if pulse:
         pulse.start()
     try:
@@ -3590,7 +3693,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K v1.8  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v1.9  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
@@ -3789,6 +3892,8 @@ def run_gui():
 
     def add_line(lv, m):
         txt.insert("end", m + "\n", lv)
+        if int(txt.index("end-1c").split(".")[0]) > 3000:
+            txt.delete("1.0", "501.0")  # Complete records remain in conversion.log.
         txt.see("end")
 
     def open_folder(pth):
@@ -3845,8 +3950,11 @@ def run_gui():
           "done": "마무리"}
 
     def poll():
+        deadline = time.monotonic()+.015
         try:
-            while True:
+            for _ in range(80):
+                if time.monotonic() >= deadline:
+                    break
                 it = q.get_nowait()
                 if it[0] == "log":
                     add_line(it[1], it[2])
