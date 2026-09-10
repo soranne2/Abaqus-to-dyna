@@ -3,7 +3,18 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v1.9
+현재 버전: v2.0
+최신 수정사항 — NODE SURFACE의 불필요한 면 탐색 제거
+- TYPE=NODE SURFACE는 노드 목록을 그대로 SET_NODE_LIST로 보존합니다.
+  SURF_COUPLING 등 커플링용 표면을 SEGMENT로 역추정하지 않습니다.
+- NODE SURFACE가 있다는 이유로 전체 요소의 연결 정보를 수집하지 않습니다.
+- KINEMATIC 커플링은 기존처럼 참여 노드와 기준 노드를 CNRB에 전달합니다.
+  기존 구속 변환의 자유도 처리 규칙을 새로 변경하지는 않습니다.
+- TYPE=ELEMENT SURFACE의 SEGMENT 변환, SET 순서, ID 중복 방지,
+  자동 끝단 SET 옵션과 진단 로그 기능은 유지합니다.
+- 자동 끝단 SET을 켠 경우 그 기능에 필요한 형상 탐색은 별도로 실행됩니다.
+
+v1.9 변경 이력:
 최신 수정사항 — 자동 끝단 SET OFF 상태의 75% 지연 대응
 - ELSET 분류 시 전체 요소를 복사/정렬하던 v1.8 전역 색인 생성을 제거하고,
   이미 만들어진 인스턴스별 검색 정보를 재사용합니다.
@@ -127,7 +138,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "1.9"
+VERSION = "2.0"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -1413,7 +1424,7 @@ class Converter:
             for ref, pref in self.surface_bindings(surf):
                 self._surface_defs[ref] = (surf, pref)
         self._needed_elements = set()
-        self._need_all_surface_elements = any(s["stype"] == "NODE" for s in self.m.surfaces)
+        self._need_all_surface_elements = False
         for ref, (surf, pref) in self._surface_defs.items():
             if surf["stype"] == "ELEMENT":
                 for row, _ in surf["rows"]:
@@ -1804,12 +1815,7 @@ class Converter:
                     if s and s["type"] == "seg" and s["segs"]:
                         self.seg_set_id(s)
                     elif s and s["type"] == "node":
-                        segs = self.faces_for_nodes(s["ids"])
-                        if segs:
-                            self.seg_set_id(dict(name=ref, segs=segs))
-                        else:
-                            self.log.warn('절점 표면 "%s": 모든 코너 절점이 포함된 외부 면이 없어 SEGMENT를 만들지 못했습니다.' % ref)
-                            self.node_set_id(ref, s["ids"])
+                        self.node_set_id(ref, s["ids"])
                     else:
                         self.log.warn('표면 "%s": 변환할 유효한 세그먼트가 없습니다.' % ref)
                 continue
@@ -3693,7 +3699,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K v1.9  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v2.0  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
