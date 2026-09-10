@@ -3,7 +3,14 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.3
+현재 버전: v2.4
+최신 수정사항 — 상세 설정 GUI 스타일 통일 / 메인 옵션 2×2 정렬
+- 상세 설정에 메인 GUI의 다크 팔레트·글꼴·카드·버튼·입력 스타일을 적용합니다.
+- 4개 페이지를 상단 버튼으로 전환하며, JSON 저장/불러오기와 적용/취소는 하단 고정.
+- 메인 옵션 4개를 동일 너비의 2열 × 2행으로 배치합니다.
+- 변환 규칙과 설정 JSON 형식은 v2.3과 동일합니다.
+
+이전 버전: v2.3
 최신 수정사항 — GUI 간소화 / 전체 접촉 종류 선택 / 상세 설정·JSON 프리셋
 - GUI에서는 2차 사면체 유지·보 방향절점·자동 끝단 SET을 항상 ON,
   단위계는 mm·ton·s로 고정합니다(입력 수치 자동 환산 아님).
@@ -171,7 +178,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.3"
+VERSION = "2.4"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -4005,7 +4012,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K v2.3  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v2.4  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
@@ -4130,10 +4137,10 @@ def run_gui():
     grid.pack(fill="x")
     for i, (k, lab, sub) in enumerate(items):
         s_ = Switch(grid, lab, DEFAULT_OPT[k], font=F_LB, sub=sub, subfont=F_SM)
-        s_.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 30), pady=7)
+        s_.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 24), pady=9)
         sw[k] = s_
-    for cix in range(3):
-        grid.grid_columnconfigure(cix, weight=1)
+    for cix in range(2):
+        grid.grid_columnconfigure(cix, weight=1, uniform="options")
 
     r2 = tk.Frame(f2, bg=P["card"])
     r2.pack(fill="x", pady=(14, 0))
@@ -4144,14 +4151,34 @@ def run_gui():
             return
         win = tk.Toplevel(root)
         win.title("상세 설정")
-        win.configure(bg=P["card"])
+        win.configure(bg=P["bg"])
         win.transient(root)
+        win.geometry("780x610")
+        win.minsize(760, 580)
+        win.update_idletasks()
+        x = max(0, root.winfo_rootx() + (root.winfo_width()-780)//2)
+        y = max(0, root.winfo_rooty() + (root.winfo_height()-610)//2)
+        win.geometry("+%d+%d" % (x, y))
         win.grab_set()
-        from tkinter import ttk, messagebox
-        style = ttk.Style(win)
-        style.configure("Details.TNotebook.Tab", font=F_SM)
-        book = ttk.Notebook(win, style="Details.TNotebook")
-        book.pack(fill="both", expand=True, padx=16, pady=16)
+        from tkinter import messagebox
+        shell = tk.Frame(win, bg=P["bg"], padx=24, pady=22)
+        shell.pack(fill="both", expand=True)
+        tk.Label(shell, text="상세 설정", bg=P["bg"], fg=P["text"],
+                 font=F_H1, anchor="w").pack(fill="x")
+        tk.Label(shell, text="필요한 항목만 조정하고, 자주 쓰는 값은 JSON으로 저장하세요.",
+                 bg=P["bg"], fg=P["dim"], font=F_BODY, anchor="w").pack(fill="x", pady=(6, 18))
+        nav = tk.Frame(shell, bg=P["bg"])
+        nav.pack(fill="x", pady=(0, 14))
+        book, page_host = card(shell, "", F_HD)
+        book.pack(fill="both", expand=True)
+        page_host.grid_columnconfigure(0, weight=1)
+        page_host.grid_rowconfigure(0, weight=1)
+        pages, tabs = [], []
+        def select_page(index):
+            pages[index].tkraise()
+            for i, button in enumerate(tabs):
+                button.kind = "primary" if i == index else "ghost"
+                button._paint(False)
         variables = {}
         groups = [
             ("Formulation", [("all_contact", "전체 접촉", "ERODING_SINGLE_SURFACE"),
@@ -4165,28 +4192,62 @@ def run_gui():
             groups.append(("Hourglass " + kind, [("hg_"+kind+"_"+k, k.upper(),
                            "" if defaults.get(k) is None else str(defaults[k]))
                            for k in ("ihq", "qm", "ibq", "q1", "q2", "qb", "qw")]))
-        for title, fields in groups:
-            tab = tk.Frame(book, bg=P["card"])
-            book.add(tab, text=title)
-            for row, (key, label, default) in enumerate(fields):
-                tk.Label(tab, text=label, font=F_BODY, bg=P["card"], fg=P["text"]).grid(
-                    row=row, column=0, sticky="w", padx=14, pady=6)
+        titles = ("요소 · 전체 접촉", "접촉 계수", "쉘 Hourglass", "솔리드 Hourglass")
+        notes = (
+            "전체 접촉은 ELSET_ALL(900001)에 적용합니다.\n순수 C3D10은 ELFORM 16 유지 · Solid 지정은 육면체 전용",
+            "FS·FD 공란: 원본 유지, 원본 값이 없으면 0.2\nSOFT · SBOPT · DEPTH · BSORT는 비-TIE 접촉에 적용",
+            "쉘 PART가 공유하는 HGID 1의 설정입니다. 공란은 기존 처리를 유지합니다.",
+            "솔리드 PART가 공유하는 HGID 2의 설정입니다. 공란은 기존 처리를 유지합니다.")
+        for index, (title, fields) in enumerate(groups):
+            tab = tk.Frame(page_host, bg=P["card"])
+            tab.grid(row=0, column=0, sticky="nsew")
+            pages.append(tab)
+            button = RButton(nav, titles[index], lambda i=index: select_page(i),
+                             kind="ghost", w=166, h=36, font=F_BODY)
+            button.pack(side="left", padx=(0, 8))
+            tabs.append(button)
+            tk.Label(tab, text=titles[index], font=F_LB, bg=P["card"], fg=P["text"],
+                     anchor="w").pack(fill="x", pady=(8, 6))
+            tk.Label(tab, text=notes[index], font=F_SM, bg=P["card"], fg=P["dim"],
+                     anchor="w", justify="left", wraplength=650).pack(fill="x", pady=(0, 14))
+            form = tk.Frame(tab, bg=P["card"])
+            form.pack(fill="x")
+            columns = 1 if index == 0 else 3
+            for col in range(columns):
+                form.grid_columnconfigure(col, weight=1, uniform="fields")
+            for position, (key, label, default) in enumerate(fields):
+                cell = tk.Frame(form, bg=P["card"])
+                cell.grid(row=position//columns, column=position%columns,
+                          sticky="ew", padx=(0, 16 if columns > 1 else 0), pady=(0, 12))
+                short_label = label.split(" (")[0] if key.startswith("contact_") else label
+                tk.Label(cell, text=short_label, font=F_SM, bg=P["card"], fg=P["dim"],
+                         anchor="w").pack(fill="x", pady=(0, 5))
                 var = tk.StringVar(value=str(detail.get(key, "")))
                 variables[key] = var
-                if key == "all_contact":
-                    entry = ttk.Combobox(tab, textvariable=var, state="readonly",
-                        values=("AUTOMATIC_SINGLE_SURFACE", "ERODING_SINGLE_SURFACE"), font=F_SM, width=30)
-                elif key in ("solid", "shell"):
-                    entry = ttk.Combobox(tab, textvariable=var, state="readonly",
-                        values=("auto", "1", "2") if key == "solid" else ("auto", "2", "16"),
-                        font=F_BODY, width=16)
+                if key in ("all_contact", "solid", "shell"):
+                    choices = (("AUTOMATIC_SINGLE_SURFACE", "ERODING_SINGLE_SURFACE")
+                               if key == "all_contact" else
+                               ("auto", "1", "2") if key == "solid" else ("auto", "2", "16"))
+                    entry = tk.OptionMenu(cell, var, *choices)
+                    entry.configure(font=F_BODY, bg=P["card2"], fg=P["text"],
+                        activebackground=P["accent_dim"], activeforeground=P["text"],
+                        relief="flat", bd=0, highlightthickness=1,
+                        highlightbackground=P["line"], highlightcolor=P["accent"],
+                        anchor="w", padx=10, pady=6, cursor="hand2", takefocus=True)
+                    entry["menu"].configure(font=F_BODY, bg=P["card2"], fg=P["text"],
+                        activebackground=P["accent_dim"], activeforeground=P["text"],
+                        relief="flat", bd=0)
+                    entry.pack(fill="x")
                 else:
-                    entry = tk.Entry(tab, textvariable=var, font=F_BODY, width=18)
-                entry.grid(row=row, column=1, padx=14, pady=6)
-        tk.Label(win, text="공란: 기존값 유지 · FS/FD 등은 전체 접촉에 공통 적용\n"
-                 "SOFT/SBOPT/DEPTH/BSORT는 비-TIE 접촉에 적용\n"
-                 "General Contact = AUTOMATIC_SINGLE_SURFACE · 순수 C3D10은 ELFORM 16 유지",
-                 bg=P["card"], fg=P["faint"], font=F_SM).pack(padx=16, pady=6)
+                    entry = tk.Entry(cell, textvariable=var, font=F_BODY, width=12,
+                        bg=P["card2"], fg=P["text"], insertbackground=P["text"],
+                        selectbackground=P["accent_dim"], selectforeground=P["text"],
+                        relief="flat", bd=0, highlightthickness=1,
+                        highlightbackground=P["line"], highlightcolor=P["accent"])
+                    entry.pack(fill="x", ipady=7)
+        select_page(0)
+        tk.Label(shell, text="공란은 기존값 유지 · 불러온 설정은 [적용] 후 변환에 반영됩니다.",
+                 bg=P["bg"], fg=P["dim"], font=F_SM, anchor="w").pack(fill="x", pady=(12, 12))
         def save_json():
             try:
                 values = parse_detail_settings({k: v.get() for k, v in variables.items()})
@@ -4219,13 +4280,14 @@ def run_gui():
             detail.clear()
             detail.update(values)
             win.destroy()
-        buttons = tk.Frame(win, bg=P["card"])
-        buttons.pack(pady=12)
+        buttons = tk.Frame(shell, bg=P["bg"])
+        buttons.pack(fill="x")
         RButton(buttons, "JSON 저장", save_json, kind="ghost", w=100, h=34, font=F_LB).pack(side="left", padx=4)
         RButton(buttons, "불러오기", load_json, kind="ghost", w=100, h=34, font=F_LB).pack(side="left", padx=4)
         RButton(buttons, "초기값", reset, kind="ghost", w=80, h=34, font=F_LB).pack(side="left", padx=4)
-        RButton(buttons, "적용", apply, kind="primary", w=90, h=34, font=F_LB).pack(side="left", padx=6)
-        RButton(buttons, "취소", win.destroy, kind="ghost", w=90, h=34, font=F_LB).pack(side="left", padx=6)
+        RButton(buttons, "적용", apply, kind="primary", w=90, h=34, font=F_LB).pack(side="right", padx=(8, 0))
+        RButton(buttons, "취소", win.destroy, kind="ghost", w=80, h=34, font=F_LB).pack(side="right")
+        win.bind("<Escape>", lambda event: win.destroy())
     RButton(r2, "상세 설정", show_details, kind="ghost", w=120, h=34, font=F_LB).pack(side="left")
 
     # ---------- 실행 ----------
