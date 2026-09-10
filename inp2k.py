@@ -3,7 +3,12 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.8 — Dark UI / 점 수 / 소수점 표기 / 보상 Shock
+현재 버전: v2.9 — 중앙 구간 점 수 / 출력 폴더 / 6방향 일괄 저장
+- 점 수는 T~2T 양 끝점 포함. 전후 선형 구간에는 추가 점 없이 0, 3T만 출력.
+- 출력 폴더 입력/선택 후 출력 실행. 선택 방향 또는 6방향 일괄 저장 지원.
+- 음수 방향 파일명 접두어/LCID=701, 양수 방향=702 (Motion 참조도 연동).
+
+이전 버전: v2.8 — Dark UI / 점 수 / 소수점 표기 / 보상 Shock
 - 검은색 커스텀 탭과 스크롤바, 전체 데이터점 개수 입력 추가.
 - Shock 표: 시간 소수 5자리(s), 속도 소수 2자리(mm/s).
 - 0~T 선형 0→-V, T~2T 가속도 적분 -V→+V, 2T~3T 선형 +V→0.
@@ -227,7 +232,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.8"
+VERSION = "2.9"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -4084,7 +4089,7 @@ SHOCK_GRAVITY = 9.80665  # m/s^2; export uses mm and seconds.
 SHOCK_LCID = 701
 SHOCK_MOTION_ID = 700
 SHOCK_SPC_ID = 702
-SHOCK_POINTS = 601  # Total, including 0, T, 2T and 3T.
+SHOCK_POINTS = 601  # Central pulse points, including T and 2T; total = N+2.
 SHOCK_WAVEFORMS = (("half-sine", "Half-sine"),
                    ("triangular", "Triangular"),
                    ("rectangular", "Rectangular"))
@@ -4116,8 +4121,8 @@ def build_shock_profile(g_value=25.0, duration_ms=15.0,
         points = int(str(point_count).strip())
     except (TypeError, ValueError, OverflowError):
         raise ValueError("데이터점 개수는 정수로 입력하세요.")
-    if not 7 <= points <= 100001:
-        raise ValueError("데이터점 개수는 7~100001 사이의 정수로 입력하세요.")
+    if not 3 <= points <= 100001:
+        raise ValueError("중앙 구간 데이터점 개수는 3~100001 사이의 정수로 입력하세요.")
     if waveform not in dict(SHOCK_WAVEFORMS):
         raise ValueError("지원하지 않는 Shock 파형: %s" % waveform)
     directions = {item[0]: item for item in SHOCK_DIRECTIONS}
@@ -4130,9 +4135,9 @@ def build_shock_profile(g_value=25.0, duration_ms=15.0,
     ticks = round(tick_value)
     if ticks < 1 or abs(tick_value - ticks) > 1e-6:
         raise ValueError("시간 소수 5자리 출력을 위해 펄스 시간은 0.01 ms 단위로 입력하세요.")
-    if points > 3 * ticks + 1:
+    if points > ticks + 1:
         raise ValueError("시간 소수 5자리에서 중복 없이 가능한 최대 데이터점은 %d개입니다."
-                         % (3 * ticks + 1))
+                         % (ticks + 1))
     duration_s = ticks / 100000.0
     amplitude = g_value * SHOCK_GRAVITY * 1000.0
     impulse = amplitude * duration_s
@@ -4141,13 +4146,9 @@ def build_shock_profile(g_value=25.0, duration_ms=15.0,
     if not math.isfinite(v_peak) or v_peak < 0.005 or v_peak >= 1e16:
         raise ValueError("속도가 소수 2자리/20칸 출력 범위를 벗어났습니다. 가속도와 시간을 확인하세요.")
 
-    # Distribute the exact requested count across three segments, retaining
-    # both internal junctions even when N-1 is not a multiple of three.
-    count, remainder = divmod(points - 1, 3)
-    intervals = [count + (i < remainder) for i in range(3)]
-    grid = [0]
-    for segment, n in enumerate(intervals):
-        grid.extend(segment * ticks + round(i * ticks / n) for i in range(1, n + 1))
+    # Only the central pulse is sampled. The solver linearly interpolates
+    # the outer 0..T and 2T..3T segments from their endpoints.
+    grid = [0] + [ticks + round(i * ticks / (points - 1)) for i in range(points)] + [3 * ticks]
     times, velocities, accelerations = [], [], []
     compensation_g = -v_peak / duration_s / (SHOCK_GRAVITY * 1000.0)
     for tick in grid:
@@ -4182,10 +4183,10 @@ def build_shock_profile(g_value=25.0, duration_ms=15.0,
     return dict(g=g_value, duration_ms=duration_ms, duration_s=duration_s,
                 end_s=times[-1], waveform=waveform, direction=direction,
                 direction_label=direction_label, dof=dof, sfo=sfo, spc=spc,
-                nsid=MOUNT_SET_ID, lcid=SHOCK_LCID, point_count=points,
+                nsid=MOUNT_SET_ID, lcid=(701 if sfo < 0 else 702), point_count=points,
                 v_peak=v_peak, compensation_g=compensation_g,
                 times=times, velocities=velocities, accelerations_g=accelerations,
-                filename="700_" + stem + "_" + direction + ".k",
+                filename=str(701 if sfo < 0 else 702) + "_" + stem + "_" + direction + ".k",
                 title=stem + ("_minus" if sfo < 0 else "_plus"))
 
 
@@ -4247,6 +4248,36 @@ def write_shock_k(out_path, g_value=25.0, duration_ms=15.0,
             os.unlink(temporary)
     profile["out"] = out_path
     return profile
+
+
+def write_shock_files(output_dir, g_value=25.0, duration_ms=15.0,
+                       waveform="half-sine", direction="mx", point_count=SHOCK_POINTS,
+                       all_directions=False, overwrite=False):
+    """Preflight every target; return per-file results for any write failures."""
+    directory = os.path.expanduser(os.fspath(output_dir).strip())
+    if not directory:
+        raise ValueError("출력 폴더를 입력하거나 선택하세요.")
+    directory = os.path.abspath(directory)
+    directions = ("mx", "my", "mz", "px", "py", "pz") if all_directions else (direction,)
+    profiles = [build_shock_profile(g_value, duration_ms, waveform, d, point_count) for d in directions]
+    for profile in profiles:
+        render_shock_keyword(profile)  # Validate formatting before writing anything.
+    paths = [os.path.join(directory, profile["filename"]) for profile in profiles]
+    conflicts = [path for path in paths if os.path.lexists(path)]
+    if not overwrite and conflicts:
+        raise FileExistsError("같은 이름의 파일이 있습니다. 다른 폴더를 지정하거나 덮어쓰기를 선택하세요: "
+                              + ", ".join(os.path.basename(path) for path in conflicts))
+    if any(os.path.isdir(path) for path in conflicts):
+        raise IsADirectoryError("출력 파일과 같은 이름의 폴더가 있습니다.")
+    os.makedirs(directory, exist_ok=True)
+    written, failed = [], []
+    for path, profile in zip(paths, profiles):
+        try:
+            written.append(write_shock_k(path, g_value, duration_ms, waveform,
+                                        profile["direction"], point_count))
+        except OSError as exc:
+            failed.append(dict(path=path, error=str(exc)))
+    return dict(written=written, failed=failed, directory=directory)
 
 
 # ============================================================
@@ -4535,13 +4566,17 @@ class ShockTab:
         self.points_var = tk.StringVar(parent, value=str(SHOCK_POINTS))
         self.wave_var = tk.StringVar(parent, value="half-sine")
         self.direction_var = tk.StringVar(parent, value="mx")
+        self.output_dir_var = tk.StringVar(parent, value=(initial_dir() if initial_dir else None)
+                                           or os.path.dirname(os.path.abspath(__file__)))
+        self.all_var = tk.BooleanVar(parent, value=False)
+        self.overwrite_var = tk.BooleanVar(parent, value=False)
         self.name_var = tk.StringVar(parent)
         self.summary_var = tk.StringVar(parent)
-        self.status_var = tk.StringVar(parent, value="조건을 확인하고 .k 파일을 저장하세요.")
+        self.status_var = tk.StringVar(parent, value="출력 폴더를 확인하고 출력 실행을 누르세요.")
 
         footer = tk.Frame(parent, bg=P["bg"])
         footer.pack(side="bottom", fill="x", pady=(12, 0))
-        self.save_button = RButton(footer, "Shock .k 저장", self.save,
+        self.save_button = RButton(footer, "출력 실행", self.save,
                                   w=160, h=40, font=(ui_font, 11, "bold"))
         self.save_button.pack(side="left")
         tk.Label(footer, textvariable=self.status_var, bg=P["bg"], fg=P["dim"],
@@ -4569,7 +4604,7 @@ class ShockTab:
         row.pack(fill="x")
         for column, (label, variable) in enumerate((("Peak 가속도 (g)", self.g_var),
                                                     ("펄스 시간 T (ms)", self.ms_var),
-                                                    ("전체 데이터점 개수", self.points_var))):
+                                                    ("중앙 구간 점 개수", self.points_var))):
             cell = tk.Frame(row, bg=P["card"])
             cell.grid(row=0, column=column, sticky="ew", padx=(0, 18))
             row.grid_columnconfigure(column, weight=1, uniform="shock-fields")
@@ -4585,7 +4620,7 @@ class ShockTab:
         self._choices(form, "가진 방향", self.direction_var,
                       [(item[0], item[1]) for item in SHOCK_DIRECTIONS])
         tk.Label(form, text="표: 0 → −V (선형) → +V (가속도 적분) → 0 (선형)\n"
-                 "점 수는 양 끝점 포함 · 시간 입력 0.01 ms 단위 · 실제 방향은 Curve SFO 적용",
+                 "점 수: T~2T 양 끝점 포함 (파일 전체 N+2점) · 시간 입력 0.01 ms 단위",
                  bg=P["card"], fg=P["dim"], font=self.small, anchor="w"
                  ).pack(fill="x", pady=(12, 0))
 
@@ -4601,13 +4636,29 @@ class ShockTab:
 
         c3, output = card(content, "출력", (ui_font, 9, "bold"))
         c3.pack(fill="x", pady=(12, 0))
+        path_row = tk.Frame(output, bg=P["card"])
+        path_row.pack(fill="x", pady=(0, 10))
+        tk.Label(path_row, text="출력 폴더", bg=P["card"], fg=P["dim"],
+                 font=self.small).pack(side="left", padx=(0, 8))
+        tk.Entry(path_row, textvariable=self.output_dir_var, bg=P["card2"], fg=P["text"],
+                 insertbackground=P["text"], relief="flat", font=self.font,
+                 highlightthickness=1, highlightbackground=P["line"], highlightcolor=P["accent"]
+                 ).pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 8))
+        RButton(path_row, "폴더 선택", self.pick_directory, kind="ghost", w=100,
+                h=34, font=self.font).pack(side="left")
+        for text, var in (("6방향 모두 저장 (mx, my, mz, px, py, pz)", self.all_var),
+                          ("같은 이름의 파일 덮어쓰기", self.overwrite_var)):
+            tk.Checkbutton(output, text=text, variable=var, bg=P["card"], fg=P["text"],
+                           activebackground=P["card"], activeforeground=P["text"],
+                           selectcolor=P["card2"], font=self.font, bd=0,
+                           highlightthickness=0).pack(anchor="w", pady=(0, 6))
         tk.Label(output, textvariable=self.name_var, bg=P["card"], fg=P["accent"],
                  font=self.font, anchor="w", wraplength=650, justify="left"
                  ).pack(fill="x")
         tk.Label(output, text="입력 시간: ms  /  파일 시간: s  /  속도: mm/s  /  1g = 9.80665 m/s²\n"
-                 "NSID 100001 (NSET_BC) · LCID 701 · VAD 0 · Motion SF 1.0\n"
+                 "NSID 100001 · LCID 음수 방향 701 / 양수 방향 702 · VAD 0 · Motion SF 1.0\n"
                  "기존 모델의 NSET_BC를 사용합니다. 가진축의 기존 SPC는 해제해야 합니다.\n"
-                 "한 해석에는 한 방향 파일만 INCLUDE하고, LCID 701 중복을 피하세요.\n"
+                 "한 해석에는 한 방향 파일만 INCLUDE하고, LCID 701/702 중복을 피하세요.\n"
                  "해석 종료시간은 메인 덱에서 설정합니다. 이 파일에는 경계조건과 곡선만 생성합니다.",
                  bg=P["card"], fg=P["dim"], font=self.small, justify="left",
                  anchor="w", wraplength=680).pack(fill="x", pady=(10, 0))
@@ -4631,7 +4682,7 @@ class ShockTab:
             for child in widget.winfo_children():
                 bind_wheel(child)
         bind_wheel(scroller)
-        for variable in (self.g_var, self.ms_var, self.points_var, self.wave_var, self.direction_var):
+        for variable in (self.g_var, self.ms_var, self.points_var, self.wave_var, self.direction_var, self.all_var):
             variable.trace_add("write", self.refresh)
         self.refresh()
 
@@ -4661,13 +4712,18 @@ class ShockTab:
             self.draw()
             return
         self.profile = p
-        self.name_var.set(p["filename"])
-        self.summary_var.set("종료: %g ms (%.5f s)  ·  표: %d점\n"
+        if self.all_var.get():
+            self.name_var.set("6개 파일 저장 · 미리보기 방향: " + p["direction"] + "\n" +
+                "\n".join(build_shock_profile(p["g"], p["duration_ms"], p["waveform"],
+                    d, p["point_count"])["filename"] for d in ("mx", "my", "mz", "px", "py", "pz")))
+        else:
+            self.name_var.set(p["filename"])
+        self.summary_var.set("종료: %g ms (%.5f s)  ·  파일 전체: %d점 (중앙 + 2)\n"
                              "표의 T/2T 속도: −%.2f / +%.2f mm/s  ·  최종: 0.00  ·  SFO: %+d" %
                              (p["duration_ms"] * 3, p["end_s"], len(p["times"]),
                               p["v_peak"], p["v_peak"], p["sfo"]))
         self.save_button.config(enabled=True)
-        self.status_var.set("조건을 확인하고 .k 파일을 저장하세요.")
+        self.status_var.set("출력 폴더를 확인하고 출력 실행을 누르세요.")
         self.draw()
 
     def draw(self):
@@ -4713,30 +4769,37 @@ class ShockTab:
             cv.create_line(*coords, fill=color, width=2)
         cv.create_text(right, 242, text="Time (ms)", anchor="se", fill=P["dim"], font=self.small)
 
+    def pick_directory(self):
+        from tkinter import filedialog
+        current = os.path.expanduser(self.output_dir_var.get().strip())
+        options = dict(parent=self.parent, title="Shock 출력 폴더 선택")
+        if os.path.isdir(current):
+            options["initialdir"] = current
+        path = filedialog.askdirectory(**options)
+        if path:
+            self.output_dir_var.set(path)
+
     def save(self):
-        from tkinter import filedialog, messagebox
+        from tkinter import messagebox
         self.refresh()
         if self.profile is None:
             return
         p = self.profile
-        options = dict(parent=self.parent, title="Shock 파일 저장", defaultextension=".k",
-                       initialfile=p["filename"], filetypes=[("LS-DYNA keyword", "*.k")],
-                       confirmoverwrite=True)
-        if self.initial_dir:
-            directory = self.initial_dir()
-            if directory and os.path.isdir(directory):
-                options["initialdir"] = directory
-        path = filedialog.asksaveasfilename(**options)
-        if not path:
-            return
         try:
-            result = write_shock_k(path, p["g"], p["duration_ms"], p["waveform"],
-                                   p["direction"], p["point_count"])
+            result = write_shock_files(self.output_dir_var.get(), p["g"], p["duration_ms"],
+                                       p["waveform"], p["direction"], p["point_count"],
+                                       self.all_var.get(), self.overwrite_var.get())
         except (OSError, ValueError) as exc:
             self.status_var.set("저장 실패: %s" % exc)
-            messagebox.showerror("Shock 파일 저장 실패", str(exc), parent=self.parent)
+            messagebox.showerror("Shock 출력 실패", str(exc), parent=self.parent)
             return
-        self.status_var.set("저장 완료 · %s" % os.path.basename(result["out"]))
+        if result["failed"]:
+            details = "\n".join(os.path.basename(f["path"]) + ": " + f["error"] for f in result["failed"])
+            self.status_var.set("%d개 저장 / %d개 실패" % (len(result["written"]), len(result["failed"])))
+            messagebox.showerror("Shock 일부 출력 실패", self.status_var.get() + "\n" + details,
+                                 parent=self.parent)
+        else:
+            self.status_var.set("%d개 파일 저장 완료 · %s" % (len(result["written"]), result["directory"]))
 
 
 def run_gui():
@@ -5417,7 +5480,7 @@ def main():
     ap.add_argument("--shock-ms", type=float, default=15.0, help="Shock 펄스 시간 (ms), 기본 15")
     ap.add_argument("--shock-waveform", choices=[v for v, _ in SHOCK_WAVEFORMS], default="half-sine")
     ap.add_argument("--shock-direction", choices=[v[0] for v in SHOCK_DIRECTIONS], default="mx")
-    ap.add_argument("--shock-points", type=int, default=SHOCK_POINTS, help="Shock 전체 데이터점 수 (끝점 포함)")
+    ap.add_argument("--shock-points", type=int, default=SHOCK_POINTS, help="Shock 중앙 T~2T 데이터점 수 (양 끝점 포함, 파일 전체 N+2점)")
     args = ap.parse_args()
 
     if args.shock:
