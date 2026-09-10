@@ -99,7 +99,8 @@ except Exception:                                    # pragma: no cover
     pd = None
     HAVE_PANDAS = False
 
-VERSION = "1.7"
+# v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
+VERSION = "1.8"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -1201,6 +1202,7 @@ class Converter:
         self._element_sid = {}
         self._sid = 0
         self.set_output = []
+        self._sets_by_sid = {}
         self._set_source_order = None
         self.hourglasses = []
         self.contacts = []
@@ -1445,7 +1447,9 @@ class Converter:
                     else:
                         values.extend(self.resolve_ids(kind, v, owner, active))
         else:
-            prefix = next((key for key in sorted(self.contexts, key=len, reverse=True)
+            if not hasattr(self, "_context_prefixes"):
+                self._context_prefixes = sorted(self.contexts, key=len, reverse=True)
+            prefix = next((key for key in self._context_prefixes
                            if key and R.startswith(key + ".")), None)
             if prefix is not None:
                 values = self.resolve_ids(kind, R[len(prefix) + 1:], prefix, active)
@@ -1478,6 +1482,7 @@ class Converter:
         record["kind"] = kind
         record["_sort_key"] = (self._set_source_order or (2, 0)) + (self._sid,)
         self.set_output.append(record)
+        self._sets_by_sid[record["sid"]] = record
         (self.nsets if kind == "node" else self.segsets if kind == "segment" else self.esets).append(record)
         return record["sid"]
 
@@ -1517,6 +1522,7 @@ class Converter:
             for name, sid in list(mapping.items()):
                 mapping[name] = remap[sid]
         self._sid = next_id
+        self._sets_by_sid = {s["sid"]: s for s in self.set_output}
 
     def add_automatic_sets(self):
         """Append fixed-ID selection sets after all existing set references settle.
@@ -1624,6 +1630,8 @@ class Converter:
         self._auto_elem_info.clear()
 
     def post_stage(self, pct, label):
+        pct = max(pct, getattr(self, "_last_post_pct", 0))
+        self._last_post_pct = pct
         callback = getattr(self, "stage_progress", None)
         if callback:
             callback(pct, label)
@@ -1751,6 +1759,8 @@ class Converter:
     def emit_source_sets(self):
         """Emit first definitions in original interleaved order, including surfaces."""
         for source_index, src in enumerate(self.m.set_defs):
+            self.post_stage(75+2*source_index/max(len(self.m.set_defs),1),
+                            "SET/SURFACE %d/%d: %s" % (source_index+1,len(self.m.set_defs),src["name"]))
             self._set_source_order = (1 if src["kind"] == "surface" else 0, source_index)
             if src["kind"] == "surface":
                 for ref, _ in self.surface_bindings(src["surface"]):
@@ -1777,6 +1787,8 @@ class Converter:
                             for key, ctx in self.contexts.items()
                             if part is ctx["base"] or part is ctx["inst"]["part"]]
             for title, pref in bindings:
+                self.post_stage(75+2*source_index/max(len(self.m.set_defs),1),
+                                "SET %d/%d: %s" % (source_index+1,len(self.m.set_defs),title))
                 ids = self.resolve_ids(kind, nm, pref)
                 if not ids:
                     self.log.warn('세트 "%s"의 구성원을 찾지 못했습니다.' % title)
@@ -1802,38 +1814,42 @@ class Converter:
         self._set_source_order = None
 
     def element_set_groups(self, ids):
-        if not HAVE_NUMPY:
-            groups = {}
-            for eid in ids:
-                info = self.element_location(eid)
-                if info:
-                    ctx, bi, _ = info
-                    cls = classify(ctx["P"].eblocks[bi]["type"])
-                    if cls and cls["cat"] in ("solid", "shell", "beam"):
-                        groups.setdefault(cls["cat"], []).append(eid)
-            return groups
-        src = np.asarray(ids, dtype=np.int64)
-        cats = np.zeros(len(src), dtype=np.uint8)
+        # Build the global category index once; do not search every instance
+        # again for each ELSET. Input membership and first-category order stay.
         codes = {"solid": 1, "shell": 2, "beam": 3}
-        for ctx in self.contexts.values():
-            idx = ctx["index"]
-            if not idx.total:
-                continue
-            local = src - ctx["eOff"]
-            pos = np.searchsorted(idx.sorted, local)
-            valid = pos < idx.total
-            rows = np.flatnonzero(valid)
-            rows = rows[idx.sorted[pos[rows]] == local[rows]]
-            if not len(rows):
-                continue
-            global_pos = idx.order[pos[rows]]
-            blocks = np.searchsorted(np.asarray(idx.starts), global_pos, side="right") - 1
-            block_codes = np.asarray([codes.get((classify(b["type"]) or {}).get("cat"), 0)
-                                      for b in ctx["P"].eblocks], dtype=np.uint8)
-            cats[rows] = block_codes[blocks]
-        names = {v: k for k, v in codes.items()}
-        return {names[int(c)]: src[cats == c].tolist()
-                for c in ordered_unique(cats.tolist()) if c}
+        if not hasattr(self, "_category_index"):
+            if HAVE_NUMPY:
+                blocks, categories = [], []
+                for ctx in self.contexts.values():
+                    for b in ctx["P"].eblocks:
+                        code = codes.get((classify(b["type"]) or {}).get("cat"), 0)
+                        blocks.append(np.asarray(b["ids"], dtype=np.int64) + ctx["eOff"])
+                        categories.append(np.full(len(b["ids"]), code, dtype=np.uint8))
+                all_ids = np.concatenate(blocks) if blocks else np.empty(0, np.int64)
+                all_cats = np.concatenate(categories) if categories else np.empty(0, np.uint8)
+                order = np.argsort(all_ids, kind="stable")
+                self._category_index = (all_ids[order], all_cats[order])
+            else:
+                self._category_index = {
+                    int(e)+ctx["eOff"]: codes.get((classify(b["type"]) or {}).get("cat"), 0)
+                    for ctx in self.contexts.values() for b in ctx["P"].eblocks for e in b["ids"]}
+        names = {1: "solid", 2: "shell", 3: "beam"}
+        if HAVE_NUMPY:
+            src = np.asarray(ids, dtype=np.int64)
+            all_ids, all_cats = self._category_index
+            pos = np.searchsorted(all_ids, src)
+            rows = np.flatnonzero(pos < len(all_ids))
+            rows = rows[all_ids[pos[rows]] == src[rows]]
+            cats = np.zeros(len(src), dtype=np.uint8)
+            cats[rows] = all_cats[pos[rows]]
+            return {names[c]: src[cats == c].tolist()
+                    for c in ordered_unique(cats.tolist()) if c}
+        groups = {}
+        for eid in ids:
+            cat = self._category_index.get(eid, 0)
+            if cat:
+                groups.setdefault(names[cat], []).append(eid)
+        return groups
 
     def element_location(self, eid):
         for ctx in self.contexts.values():
@@ -1843,19 +1859,36 @@ class Converter:
         return None
 
     def faces_for_nodes(self, ids):
+        # Identical node membership selects both copies of a shared face or
+        # neither. Exterior filtering can therefore be done ONCE globally,
+        # without changing the former per-surface filtering semantics.
+        if not hasattr(self, "_node_face_anchors"):
+            self.log.info("NODE SURFACE: 공통 외곽면 색인 생성 시작")
+            faces = {}
+            ordinal = 0
+            for i, (eid, info) in enumerate(self.elem_info.items()):
+                if i % 10000 == 0:
+                    self.post_stage(75, "NODE SURFACE 색인: 요소 %d/%d" % (i,len(self.elem_info)))
+                labels = ("SPOS",) if info["cat"] == "shell" else FACE.get(info["sub"], {})
+                for label in labels:
+                    face = self.seg_of(eid, label)
+                    if not face:
+                        continue
+                    key = tuple(sorted(set(face)))
+                    faces[key] = None if key in faces else (ordinal, face)
+                    ordinal += 1
+            anchors = {}
+            for key, record in faces.items():
+                if record is not None:
+                    anchors.setdefault(key[0], []).append(record)
+            self._node_face_anchors = anchors
+            self.log.ok("NODE SURFACE: 외곽면 색인 생성 완료")
         selected = set(ids)
-        candidates = []
-        for eid, info in self.elem_info.items():
-            if info["cat"] == "shell":
-                s = self.seg_of(eid, "SPOS")
-                if s and set(s) <= selected:
-                    candidates.append(s)
-            else:
-                for face in FACE.get(info["sub"], {}):
-                    s = self.seg_of(eid, face)
-                    if s and set(s) <= selected:
-                        candidates.append(s)
-        return self.exterior_faces(candidates)
+        matches = [record for node in selected
+                   for record in self._node_face_anchors.get(node, ())
+                   if all(n in selected for n in record[1])]
+        matches.sort(key=lambda record: record[0])
+        return [record[1] for record in matches]
 
     @staticmethod
     def exterior_faces(candidates):
@@ -2485,7 +2518,10 @@ class Converter:
             result = dict(type="node", ids=ordered_unique(ids), name=canonical)
         elif d["stype"] == "ELEMENT":
             segs, automatic = [], []
-            for row, face in d["rows"]:
+            for row_index, (row, face) in enumerate(d["rows"]):
+                if row_index % 10000 == 0:
+                    self.post_stage(getattr(self, "_last_post_pct", 75),
+                                    "SURFACE %s: 행 %d/%d" % (canonical,row_index,len(d["rows"])))
                 es = self.resolve_ids("elsets", row, pref)
                 if es:
                     missing = 0
@@ -2528,7 +2564,7 @@ class Converter:
         key = name_key(s["name"])
         if key in self._seg_sid:
             sid = self._seg_sid[key]
-            self.mark_source_set(next(r for r in self.segsets if r["sid"] == sid))
+            self.mark_source_set(self._sets_by_sid[sid])
             return sid
         sid = self.append_set("segment", dict(name=s["name"], segs=s["segs"]))
         self._seg_sid[key] = sid
@@ -2539,7 +2575,7 @@ class Converter:
         ids = ordered_unique(ids)
         if key in self._node_sid:
             sid = self._node_sid[key]
-            existing = next(s for s in self.nsets if s["sid"] == sid)
+            existing = self._sets_by_sid[sid]
             self.mark_source_set(existing)
             existing["ids"] = ordered_unique(existing["ids"] + ids)
             return sid
@@ -3538,7 +3574,7 @@ def run_gui():
     F_BODY = (ui, 10)
     F_BT = (ui, 11, "bold")
 
-    root.title("INP2K v1.7  ·  Abaqus → LS-DYNA")
+    root.title("INP2K v1.8  ·  Abaqus → LS-DYNA")
     root.geometry("980x800")
     root.minsize(820, 640)
     root.configure(bg=P["bg"])
