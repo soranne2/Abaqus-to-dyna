@@ -3,7 +3,14 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.7 — Shock input 생성 탭 추가
+현재 버전: v2.8 — Dark UI / 점 수 / 소수점 표기 / 보상 Shock
+- 검은색 커스텀 탭과 스크롤바, 전체 데이터점 개수 입력 추가.
+- Shock 표: 시간 소수 5자리(s), 속도 소수 2자리(mm/s).
+- 0~T 선형 0→-V, T~2T 가속도 적분 -V→+V, 2T~3T 선형 +V→0.
+  V는 선택 파형의 속도 증분 절반. 표에 SFO를 곱해 실제 방향을 적용.
+- Shock 파일 상단 생성기 주석 삭제. 기존 INP 변환 로직 유지.
+
+이전 버전: v2.7 — Shock input 생성 탭 추가
 - v2.6 변환 로직을 유지하고 별도 Shock 탭을 추가했습니다. INP 없이 사용 가능.
 - 가속도(g), 펄스 시간(ms), 파형(Half-sine / Triangular / Rectangular),
   방향(±X/±Y/±Z)을 선택하면 속도 경계조건 include 파일을 생성합니다.
@@ -220,7 +227,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.7"
+VERSION = "2.8"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -4077,7 +4084,7 @@ SHOCK_GRAVITY = 9.80665  # m/s^2; export uses mm and seconds.
 SHOCK_LCID = 701
 SHOCK_MOTION_ID = 700
 SHOCK_SPC_ID = 702
-SHOCK_INTERVALS = 200  # Per pulse: 0..3T contains 601 table points.
+SHOCK_POINTS = 601  # Total, including 0, T, 2T and 3T.
 SHOCK_WAVEFORMS = (("half-sine", "Half-sine"),
                    ("triangular", "Triangular"),
                    ("rectangular", "Rectangular"))
@@ -4087,12 +4094,12 @@ SHOCK_DIRECTIONS = (("mx", "−X", 1, -1), ("px", "+X", 1, 1),
 
 
 def build_shock_profile(g_value=25.0, duration_ms=15.0,
-                        waveform="half-sine", direction="mx"):
-    """Integrate one positive acceleration pulse from rest, then hold velocity.
+                        waveform="half-sine", direction="mx", point_count=SHOCK_POINTS):
+    """Base table: 0 -> -V -> +V -> 0, with the shock pulse over T..2T.
 
-    Returned table ordinates are unsigned mm/s. Apply ``sfo`` once for the
-    selected direction. The abscissae are seconds, including exactly T and 3T.
-    No return-to-rest pulse, initial velocity, or control cards are inferred.
+    V = half the pulse integral. Pre/post segments are linear in velocity.
+    SFO is applied separately. Times lie on the 0.00001 s export grid so
+    five-decimal output cannot create duplicate time records.
     """
     def positive(value, label):
         try:
@@ -4105,40 +4112,68 @@ def build_shock_profile(g_value=25.0, duration_ms=15.0,
 
     g_value = positive(g_value, "가속도 (g)")
     duration_ms = positive(duration_ms, "펄스 시간 (ms)")
+    try:
+        points = int(str(point_count).strip())
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("데이터점 개수는 정수로 입력하세요.")
+    if not 7 <= points <= 100001:
+        raise ValueError("데이터점 개수는 7~100001 사이의 정수로 입력하세요.")
     if waveform not in dict(SHOCK_WAVEFORMS):
         raise ValueError("지원하지 않는 Shock 파형: %s" % waveform)
     directions = {item[0]: item for item in SHOCK_DIRECTIONS}
     if direction not in directions:
         raise ValueError("Shock 방향은 mx, px, my, py, mz, pz 중 선택하세요.")
     _, direction_label, dof, sfo = directions[direction]
-    duration_s = duration_ms / 1000.0
+    if duration_ms > 1e12:
+        raise ValueError("펄스 시간이 출력 가능한 범위를 벗어났습니다.")
+    tick_value = duration_ms * 100.0
+    ticks = round(tick_value)
+    if ticks < 1 or abs(tick_value - ticks) > 1e-6:
+        raise ValueError("시간 소수 5자리 출력을 위해 펄스 시간은 0.01 ms 단위로 입력하세요.")
+    if points > 3 * ticks + 1:
+        raise ValueError("시간 소수 5자리에서 중복 없이 가능한 최대 데이터점은 %d개입니다."
+                         % (3 * ticks + 1))
+    duration_s = ticks / 100000.0
     amplitude = g_value * SHOCK_GRAVITY * 1000.0
     impulse = amplitude * duration_s
-    if (not all(math.isfinite(v) and v > 0 for v in
-                (amplitude, impulse, duration_s / SHOCK_INTERVALS,
-                 duration_s * 3.0, duration_ms * 3.0))):
-        raise ValueError("가속도 또는 시간이 계산 가능한 숫자 범위를 벗어났습니다.")
+    factor = {"half-sine": 2.0 / math.pi, "triangular": 0.5, "rectangular": 1.0}[waveform]
+    v_peak = impulse * (factor / 2.0)
+    if not math.isfinite(v_peak) or v_peak < 0.005 or v_peak >= 1e16:
+        raise ValueError("속도가 소수 2자리/20칸 출력 범위를 벗어났습니다. 가속도와 시간을 확인하세요.")
 
+    # Distribute the exact requested count across three segments, retaining
+    # both internal junctions even when N-1 is not a multiple of three.
+    count, remainder = divmod(points - 1, 3)
+    intervals = [count + (i < remainder) for i in range(3)]
+    grid = [0]
+    for segment, n in enumerate(intervals):
+        grid.extend(segment * ticks + round(i * ticks / n) for i in range(1, n + 1))
     times, velocities, accelerations = [], [], []
-    for index in range(3 * SHOCK_INTERVALS + 1):
-        ratio = min(index / float(SHOCK_INTERVALS), 1.0)
-        if waveform == "half-sine":
-            # 2*sin(x/2)^2 avoids cancellation in 1-cos(x) near t=0.
-            velocity = (impulse / math.pi) * 2.0 * math.sin(math.pi * ratio / 2.0) ** 2
-            accel_g = g_value * math.sin(math.pi * ratio) if index < SHOCK_INTERVALS else 0.0
-        elif waveform == "triangular":
-            fraction = ratio ** 2 if ratio <= 0.5 else 0.5 - (1.0 - ratio) ** 2
-            velocity = impulse * fraction
-            accel_g = g_value * 2.0 * min(ratio, 1.0 - ratio)
+    compensation_g = -v_peak / duration_s / (SHOCK_GRAVITY * 1000.0)
+    for tick in grid:
+        if tick < ticks:
+            velocity = -v_peak * tick / ticks
+            accel_g = compensation_g
+        elif tick <= 2 * ticks:
+            ratio = (tick - ticks) / ticks
+            if waveform == "half-sine":
+                velocity = -v_peak * math.cos(math.pi * ratio)
+                accel_g = g_value * math.sin(math.pi * ratio)
+            elif waveform == "triangular":
+                fraction = ratio ** 2 if ratio <= 0.5 else 0.5 - (1 - ratio) ** 2
+                velocity = -v_peak + impulse * fraction
+                accel_g = g_value * 2 * min(ratio, 1 - ratio)
+            else:
+                velocity = -v_peak + impulse * ratio
+                accel_g = g_value
         else:
-            velocity = impulse * ratio
-            accel_g = g_value if index < SHOCK_INTERVALS else 0.0
-        times.append(duration_s * (index / float(SHOCK_INTERVALS)))
-        velocities.append(velocity)
+            velocity = v_peak * (3 * ticks - tick) / ticks
+            accel_g = compensation_g
+        times.append(tick / 100000.0)
+        velocities.append(0.0 if abs(velocity) < 1e-12 else velocity)
         accelerations.append(accel_g)
-    if not all(math.isfinite(v) for v in velocities) or velocities[-1] <= 0:
-        raise ValueError("속도 값이 계산 가능한 숫자 범위를 벗어났습니다.")
-
+    # Exact endpoint values, independent of trigonometric roundoff.
+    velocities[0] = velocities[-1] = 0.0
     condition = "%sg%sms" % (format(g_value, ".12g"), format(duration_ms, ".12g"))
     wave_suffix = "" if waveform == "half-sine" else "_" + waveform
     stem = "Velo_shock_profile_" + condition + wave_suffix
@@ -4147,7 +4182,8 @@ def build_shock_profile(g_value=25.0, duration_ms=15.0,
     return dict(g=g_value, duration_ms=duration_ms, duration_s=duration_s,
                 end_s=times[-1], waveform=waveform, direction=direction,
                 direction_label=direction_label, dof=dof, sfo=sfo, spc=spc,
-                nsid=MOUNT_SET_ID, lcid=SHOCK_LCID,
+                nsid=MOUNT_SET_ID, lcid=SHOCK_LCID, point_count=points,
+                v_peak=v_peak, compensation_g=compensation_g,
                 times=times, velocities=velocities, accelerations_g=accelerations,
                 filename="700_" + stem + "_" + direction + ".k",
                 title=stem + ("_minus" if sfo < 0 else "_plus"))
@@ -4163,18 +4199,6 @@ def render_shock_keyword(profile):
     """
     p = profile
     lines = ["*KEYWORD",
-             "$ INP2K v%s - Shock boundary/velocity include" % VERSION,
-             "$ Units: time=s, length=mm, velocity=mm/s; g0=9.80665 m/s^2",
-             "$ Pulse: %s; peak=%s g; duration=%s ms; direction=%s" %
-             (p["waveform"], format(p["g"], ".12g"),
-              format(p["duration_ms"], ".12g"), p["direction"]),
-             "$ v(0)=0; integrate acceleration over 0..T; hold v(T) over T..3T.",
-             "$ Curve end=%s s. Set the parent deck termination time separately." %
-             format(p["end_s"], ".12g"),
-             "$ Parent deck must define NSET_BC (NSID=100001).",
-             "$ Remove existing SPC on the driven DOF (including overlapping sets).",
-             "$ Use one Shock include per load case; reserve LCID=701 and BC IDs=700,702.",
-             "$ Direction sign is applied ONLY by curve SFO; table velocities are positive.",
              "*BOUNDARY_PRESCRIBED_MOTION_SET_ID",
              "$#      id heading",
              i10(SHOCK_MOTION_ID) + ("Shock_motion_" + p["direction"]),
@@ -4192,17 +4216,21 @@ def render_shock_keyword(profile):
              i10(p["lcid"]) + i10(0) + f10(1.0) + f10(p["sfo"]) +
              f10(0.0) + f10(0.0) + i10(0) + i10(0),
              "$#          time (s)     velocity (mm/s)"]
-    # Keep all 20 columns and sufficient precision, even for short durations.
-    lines.extend("%20.12E%20.12E" % (t, v)
-                 for t, v in zip(p["times"], p["velocities"]))
+    for t, v in zip(p["times"], p["velocities"]):
+        # Normalize negative zero and never switch the table to exponent notation.
+        v = 0.0 if abs(v) < 0.005 else v
+        time_text, velocity_text = "%20.5f" % t, "%20.2f" % v
+        if len(time_text) > 20 or len(velocity_text) > 20:
+            raise ValueError("Shock 표 값이 20칸 고정 필드 범위를 벗어났습니다.")
+        lines.append(time_text + velocity_text)
     lines.append("*END")
     return "\n".join(lines) + "\n"
 
 
 def write_shock_k(out_path, g_value=25.0, duration_ms=15.0,
-                  waveform="half-sine", direction="mx"):
+                  waveform="half-sine", direction="mx", point_count=SHOCK_POINTS):
     """Validate fully, then atomically write the Shock file without partial output."""
-    profile = build_shock_profile(g_value, duration_ms, waveform, direction)
+    profile = build_shock_profile(g_value, duration_ms, waveform, direction, point_count)
     content = render_shock_keyword(profile)
     out_path = os.path.abspath(os.fspath(out_path))
     temporary = None
@@ -4439,6 +4467,59 @@ def card(parent, title, font_h):
     return outer, inner
 
 
+class DarkScrollbar:
+    """Canvas scrollbar: no platform-native white trough or arrow buttons."""
+
+    def __init__(self, parent, command, width=12):
+        self.command = command
+        self.first, self.last = 0.0, 1.0
+        self.offset = 0.0
+        self.cv = tk.Canvas(parent, width=width, bg=PALETTE["bg"],
+                            highlightthickness=0, bd=0, takefocus=True)
+        self.cv.bind("<Configure>", lambda event: self.draw())
+        self.cv.bind("<Button-1>", self.press)
+        self.cv.bind("<B1-Motion>", self.drag)
+        self.cv.bind("<Up>", lambda event: command("scroll", -1, "units"))
+        self.cv.bind("<Down>", lambda event: command("scroll", 1, "units"))
+        self.cv.bind("<Prior>", lambda event: command("scroll", -1, "pages"))
+        self.cv.bind("<Next>", lambda event: command("scroll", 1, "pages"))
+
+    def geometry(self):
+        height = max(1, self.cv.winfo_height())
+        span = self.last - self.first
+        size = min(height, max(24, span * height))
+        top = 0 if span >= 1 else self.first / (1 - span) * (height - size)
+        return height, size, top
+
+    def set(self, first, last):
+        self.first, self.last = float(first), float(last)
+        self.draw()
+
+    def draw(self):
+        self.cv.delete("all")
+        if self.last - self.first >= 1:
+            return
+        _, size, top = self.geometry()
+        self.cv.create_rectangle(2, top, max(3, self.cv.winfo_width() - 2), top + size,
+                                 fill=PALETTE["faint"], outline="")
+
+    def press(self, event):
+        self.cv.focus_set()
+        _, size, top = self.geometry()
+        self.offset = event.y - top if top <= event.y <= top + size else size / 2
+        self.drag(event)
+
+    def drag(self, event):
+        height, size, _ = self.geometry()
+        if height <= size:
+            return
+        fraction = (event.y - self.offset) / (height - size) * (1 - self.last + self.first)
+        self.command("moveto", max(0, min(1 - self.last + self.first, fraction)))
+
+    def pack(self, **kwargs):
+        self.cv.pack(**kwargs)
+
+
 class ShockTab:
     """Independent Shock form; the save button stays visible on small windows."""
 
@@ -4451,6 +4532,7 @@ class ShockTab:
         self.profile = None
         self.g_var = tk.StringVar(parent, value="25")
         self.ms_var = tk.StringVar(parent, value="15")
+        self.points_var = tk.StringVar(parent, value=str(SHOCK_POINTS))
         self.wave_var = tk.StringVar(parent, value="half-sine")
         self.direction_var = tk.StringVar(parent, value="mx")
         self.name_var = tk.StringVar(parent)
@@ -4469,7 +4551,7 @@ class ShockTab:
         body = tk.Frame(parent, bg=P["bg"])
         body.pack(fill="both", expand=True)
         scroller = tk.Canvas(body, bg=P["bg"], highlightthickness=0, bd=0)
-        sb = tk.Scrollbar(body, command=scroller.yview, width=12)
+        sb = DarkScrollbar(body, command=scroller.yview, width=12)
         sb.pack(side="right", fill="y")
         scroller.pack(side="left", fill="both", expand=True)
         scroller.configure(yscrollcommand=sb.set)
@@ -4486,7 +4568,8 @@ class ShockTab:
         row = tk.Frame(form, bg=P["card"])
         row.pack(fill="x")
         for column, (label, variable) in enumerate((("Peak 가속도 (g)", self.g_var),
-                                                    ("펄스 시간 T (ms)", self.ms_var))):
+                                                    ("펄스 시간 T (ms)", self.ms_var),
+                                                    ("전체 데이터점 개수", self.points_var))):
             cell = tk.Frame(row, bg=P["card"])
             cell.grid(row=0, column=column, sticky="ew", padx=(0, 18))
             row.grid_columnconfigure(column, weight=1, uniform="shock-fields")
@@ -4501,7 +4584,8 @@ class ShockTab:
         self._choices(form, "가속도 파형", self.wave_var, SHOCK_WAVEFORMS)
         self._choices(form, "가진 방향", self.direction_var,
                       [(item[0], item[1]) for item in SHOCK_DIRECTIONS])
-        tk.Label(form, text="초기속도 0 → 가속도 적분 → T 이후 최종 속도 유지 (3T까지)",
+        tk.Label(form, text="표: 0 → −V (선형) → +V (가속도 적분) → 0 (선형)\n"
+                 "점 수는 양 끝점 포함 · 시간 입력 0.01 ms 단위 · 실제 방향은 Curve SFO 적용",
                  bg=P["card"], fg=P["dim"], font=self.small, anchor="w"
                  ).pack(fill="x", pady=(12, 0))
 
@@ -4547,7 +4631,7 @@ class ShockTab:
             for child in widget.winfo_children():
                 bind_wheel(child)
         bind_wheel(scroller)
-        for variable in (self.g_var, self.ms_var, self.wave_var, self.direction_var):
+        for variable in (self.g_var, self.ms_var, self.points_var, self.wave_var, self.direction_var):
             variable.trace_add("write", self.refresh)
         self.refresh()
 
@@ -4567,22 +4651,21 @@ class ShockTab:
     def refresh(self, *_args):
         try:
             p = build_shock_profile(self.g_var.get(), self.ms_var.get(),
-                                    self.wave_var.get(), self.direction_var.get())
+                                    self.wave_var.get(), self.direction_var.get(), self.points_var.get())
         except ValueError as exc:
             self.profile = None
             self.name_var.set("—")
             self.summary_var.set(str(exc))
-            self.status_var.set("가속도와 펄스 시간을 확인하세요.")
+            self.status_var.set("가속도·펄스 시간·데이터점 개수를 확인하세요.")
             self.save_button.config(enabled=False)
             self.draw()
             return
         self.profile = p
         self.name_var.set(p["filename"])
-        self.summary_var.set("종료: %g ms (%g s)  ·  표: %d점  ·  Δt: %g ms\n"
-                             "최종 속도: %+.6f mm/s  ·  DOF: %d  ·  Curve SFO: %+d" %
+        self.summary_var.set("종료: %g ms (%.5f s)  ·  표: %d점\n"
+                             "표의 T/2T 속도: −%.2f / +%.2f mm/s  ·  최종: 0.00  ·  SFO: %+d" %
                              (p["duration_ms"] * 3, p["end_s"], len(p["times"]),
-                              p["duration_ms"] / SHOCK_INTERVALS,
-                              p["sfo"] * p["velocities"][-1], p["dof"], p["sfo"]))
+                              p["v_peak"], p["v_peak"], p["sfo"]))
         self.save_button.config(enabled=True)
         self.status_var.set("조건을 확인하고 .k 파일을 저장하세요.")
         self.draw()
@@ -4597,18 +4680,20 @@ class ShockTab:
         width = max(200, cv.winfo_width())
         left, right = 92, width - 24
         total = p["end_s"]
-        series = (("Acceleration (g)", p["accelerations_g"], P["ok"]),
-                  ("Velocity (mm/s)", p["velocities"], P["accent"]))
+        series = (("Acceleration (g), before SFO", p["accelerations_g"], P["ok"]),
+                  ("Velocity (mm/s), before SFO", p["velocities"], P["accent"]))
         for panel, (label, values, color) in enumerate(series):
             top, bottom = 27 + panel * 120, 95 + panel * 120
-            limit = max(values)
+            limit = max(abs(value) for value in values)
             cv.create_text(left, top - 14, text=label, anchor="w", fill=P["dim"], font=self.small)
-            y_zero = bottom if p["sfo"] > 0 else top
-            y_peak = top if p["sfo"] > 0 else bottom
+            y_zero = (top + bottom) / 2
+            y_peak = top
             cv.create_line(left, y_zero, right, y_zero, fill=P["line"])
             cv.create_line(left, top, left, bottom, fill=P["line"])
             cv.create_text(left - 8, y_zero, text="0", anchor="e", fill=P["dim"], font=self.small)
-            cv.create_text(left - 8, y_peak, text="%+.5g" % (p["sfo"] * limit),
+            cv.create_text(left - 8, y_peak, text="%.2f" % limit,
+                           anchor="e", fill=color, font=self.small)
+            cv.create_text(left - 8, bottom, text="−%.2f" % limit,
                            anchor="e", fill=color, font=self.small)
             for multiple in range(4):
                 x = left + (right - left) * multiple / 3.0
@@ -4616,9 +4701,11 @@ class ShockTab:
                 cv.create_text(x, bottom + 13, text="%g" % (p["duration_ms"] * multiple),
                                fill=P["dim"], font=self.small)
             points = list(zip(p["times"], values))
-            if panel == 0 and p["waveform"] == "rectangular":
-                points = [(0.0, p["g"]), (p["duration_s"], p["g"]),
-                          (p["duration_s"], 0.0), (total, 0.0)]
+            if panel == 0:
+                t = p["duration_s"]
+                comp = p["compensation_g"]
+                middle = [(time, value) for time, value in points if t <= time <= 2*t]
+                points = [(0.0, comp), (t, comp)] + middle + [(2*t, comp), (total, comp)]
             coords = []
             for t, value in points:
                 coords.extend((left + (t / total) * (right - left),
@@ -4643,7 +4730,8 @@ class ShockTab:
         if not path:
             return
         try:
-            result = write_shock_k(path, p["g"], p["duration_ms"], p["waveform"], p["direction"])
+            result = write_shock_k(path, p["g"], p["duration_ms"], p["waveform"],
+                                   p["direction"], p["point_count"])
         except (OSError, ValueError) as exc:
             self.status_var.set("저장 실패: %s" % exc)
             messagebox.showerror("Shock 파일 저장 실패", str(exc), parent=self.parent)
@@ -4655,7 +4743,7 @@ def run_gui():
     global tk
     try:
         import tkinter as tk
-        from tkinter import filedialog, ttk
+        from tkinter import filedialog
     except ImportError:
         print("tkinter를 찾을 수 없어 GUI를 열 수 없습니다.")
         print("  Windows/macOS 공식 파이썬에는 기본 포함되어 있습니다.")
@@ -4714,19 +4802,38 @@ def run_gui():
                    else "느린 경로  " + ("pandas 없음" if HAVE_NUMPY else "numpy 없음"))
              ).pack()
 
-    # v2.7: keep the converter controls/callbacks in their own unchanged page.
-    style = ttk.Style(root)
-    style.configure("INP2K.TNotebook", background=P["bg"], borderwidth=0)
-    style.configure("INP2K.TNotebook.Tab", font=F_LB, padding=(18, 8))
-    notebook = ttk.Notebook(wrap, style="INP2K.TNotebook")
+    # Custom dark tabs do not inherit the Windows native white notebook theme.
+    notebook = tk.Frame(wrap, bg=P["bg"])
     notebook.pack(fill="both", expand=True, pady=(16, 0))
-    converter_tab = tk.Frame(notebook, bg=P["bg"])
-    shock_tab = tk.Frame(notebook, bg=P["bg"])
-    notebook.add(converter_tab, text="INP → K 변환")
-    notebook.add(shock_tab, text="Shock")
+    tab_bar = tk.Frame(notebook, bg=P["bg"])
+    tab_bar.pack(fill="x", pady=(0, 6))
+    page_area = tk.Frame(notebook, bg=P["bg"])
+    page_area.pack(fill="both", expand=True)
+    converter_tab = tk.Frame(page_area, bg=P["bg"])
+    shock_tab = tk.Frame(page_area, bg=P["bg"])
+    pages = (converter_tab, shock_tab)
+    tabs = []
+
+    def select_tool(index):
+        for i, page in enumerate(pages):
+            page.pack_forget()
+            tabs[i].configure(bg=P["accent_dim"] if i == index else P["card"],
+                              fg=P["text"] if i == index else P["dim"])
+        pages[index].pack(fill="both", expand=True)
+
+    for index, label in enumerate(("INP → K 변환", "Shock")):
+        button = tk.Button(tab_bar, text=label, command=lambda i=index: select_tool(i),
+                           bg=P["card"], fg=P["dim"], font=F_LB,
+                           activebackground=P["accent_dim"], activeforeground=P["text"],
+                           relief="flat", bd=0, highlightthickness=1,
+                           highlightbackground=P["line"], highlightcolor=P["accent"],
+                           padx=22, pady=9, cursor="hand2")
+        button.pack(side="left", padx=(0, 6))
+        tabs.append(button)
     notebook.shock = ShockTab(shock_tab, ui, initial_dir=lambda:
         os.path.dirname(os.path.abspath(state["out"] or state["path"]))
         if state["out"] or state["path"] else None)
+    select_tool(0)
     wrap = converter_tab
 
     # ---------- 가속 안내 ----------
@@ -5040,9 +5147,7 @@ def run_gui():
     txt = tk.Text(f4, font=F_BODY, wrap="word", bg=P["card"], fg=P["text"],
                   relief="flat", bd=0, highlightthickness=0, height=13,
                   insertbackground=P["text"], spacing1=1, spacing3=1)
-    sb = tk.Scrollbar(f4, command=txt.yview, relief="flat", bd=0,
-                      troughcolor=P["card"], bg=P["card2"],
-                      activebackground=P["faint"], width=10)
+    sb = DarkScrollbar(f4, command=txt.yview, width=12)
     txt.configure(yscrollcommand=sb.set)
     sb.pack(side="right", fill="y")
     txt.pack(fill="both", expand=True)
@@ -5312,6 +5417,7 @@ def main():
     ap.add_argument("--shock-ms", type=float, default=15.0, help="Shock 펄스 시간 (ms), 기본 15")
     ap.add_argument("--shock-waveform", choices=[v for v, _ in SHOCK_WAVEFORMS], default="half-sine")
     ap.add_argument("--shock-direction", choices=[v[0] for v in SHOCK_DIRECTIONS], default="mx")
+    ap.add_argument("--shock-points", type=int, default=SHOCK_POINTS, help="Shock 전체 데이터점 수 (끝점 포함)")
     args = ap.parse_args()
 
     if args.shock:
@@ -5321,15 +5427,15 @@ def main():
             ap.error("Shock 출력 단위는 mm·s·mm/s입니다. --unit mmts를 사용하세요.")
         try:
             profile = build_shock_profile(args.shock_g, args.shock_ms,
-                                          args.shock_waveform, args.shock_direction)
+                                          args.shock_waveform, args.shock_direction, args.shock_points)
             result = write_shock_k(args.out or profile["filename"], args.shock_g,
-                                   args.shock_ms, args.shock_waveform, args.shock_direction)
+                                   args.shock_ms, args.shock_waveform, args.shock_direction, args.shock_points)
         except (ValueError, OSError) as exc:
             ap.error(str(exc))
         print("  저장: %s" % result["out"])
         print("  0..%g s / %d점 / 최종 속도 %+.6f mm/s / Curve SFO=%+d" %
               (result["end_s"], len(result["times"]),
-               result["sfo"] * result["velocities"][-1], result["sfo"]))
+               0.0, result["sfo"]))
         print("  NSET_BC(100001) 필요: 기존 가진축 SPC 해제, LCID 701 중복 확인.")
         return 0
     if args.check:
