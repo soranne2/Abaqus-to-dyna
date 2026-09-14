@@ -3,7 +3,12 @@
 """
 Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.10 — 방향 적용 그래프 / DEATH=0 / 전체 점 수
+현재 버전: v2.11 — MAT_ADD_EROSION 매칭 / NSET_BC_PY 노드 편집
+- 같은 폴더의 .key/.k에서 erosion 카드를 선택하고 출력 재료 MID에 연결합니다.
+- 파일의 DEFINE_CURVE / LCREGD 참조를 공유하고 기존 재료 커브 충돌을 해소합니다.
+- 변환 후 저장 전 GUI에서 NSET_BC 노드를 제외하여 NSET_BC_PY(100002)를 생성합니다.
+
+이전 버전: v2.10 — 방향 적용 그래프 / DEATH=0 / 전체 점 수
 - 그래프와 속도 요약에 SFO를 적용하여 실제 가진 방향을 표시합니다.
 - Shock Motion의 DEATH를 0.0으로 출력합니다.
 - 입력 N은 전체 표 점 수입니다. 중앙 구간 N-2점 + 바깥 끝점 2개.
@@ -237,7 +242,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.10"
+VERSION = "2.11"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -265,6 +270,8 @@ NEG_ELFORM_NAME_RE = re.compile(r"(?<![A-Z])(?:PAD|TA|ADHESIVE)S?(?![A-Z])")
 # v2.5: nodes of a coupling/MPC whose reference node is a lone mounting node.
 MOUNT_SET_ID = 100001
 MOUNT_SET_NAME = "NSET_BC"
+BC_PY_SET_ID = 100002
+BC_PY_SET_NAME = "NSET_BC_PY"
 
 
 def neg_elform_name(title):
@@ -1681,6 +1688,8 @@ class Converter:
             return (group,) + old
         self.set_output.sort(key=ordering)
         reserved = {200001, 200002, 900001} if self.opt.get("auto_sets", True) else set()
+        if self.opt.get("bc_py") or self.opt.get("edit_bc_py"):
+            reserved.add(BC_PY_SET_ID)
         reserved |= {int(s["fixed_sid"]) for s in self.set_output if s.get("fixed_sid")}
         remap = {}
         next_id = 0
@@ -2455,7 +2464,7 @@ class Converter:
         self.prepare_contexts(instances)
         self.detect_mounting()
         need_info = bool(m.surfaces or (self.opt["contact"] and m.rigid_bodies))
-        need_coord = False
+        need_coord = bool(self.opt.get("bc_py") or self.opt.get("edit_bc_py"))
         if self.opt.get("auto_sets", True):
             need_coord = True
         if self.opt["beamNode"]:
@@ -3606,6 +3615,254 @@ class EidIndex:
 # ============================================================
 # 출력
 # ============================================================
+# ============================================================
+# v2.11: optional additions, applied after conversion and before atomic output.
+# Card layout reference (including legacy IDAM): Ansys LS-DYNA Keyword Manual
+# and github.com/ansys/pydyna/.../auto/mat/mat_add_erosion.py.
+# External curve IDs/references remain unchanged; only converter-owned curves
+# are renumbered, so opaque/legacy erosion criteria keep their original meaning.
+# ============================================================
+def keyword_number(value):
+    text = str(value).strip().replace("D", "E").replace("d", "e")
+    if "e" not in text.lower():
+        text = re.sub(r"(?<=\d)([+-]\d+)$", r"e\1", text)
+    value = float(text or "0")
+    if not math.isfinite(value):
+        raise ValueError("유한한 숫자가 아닙니다: %s" % text)
+    return value
+
+
+def keyword_fields(line, width=10):
+    """Keep blanks in comma/fixed cards; also accept whitespace numeric cards."""
+    data = line.split("$", 1)[0].rstrip()
+    if "," in data:
+        return [v.strip() for v in data.split(",")], "comma"
+    fields = [data[i:i+width].strip() for i in range(0, len(data), width)]
+    try:
+        for value in fields:
+            keyword_number(value)
+        return fields, "fixed"
+    except ValueError:
+        fields = data.split()
+        for value in fields:
+            keyword_number(value)
+        return fields, "space"
+
+
+def keyword_id(value, label, allow_zero=False):
+    number = keyword_number(value)
+    if number != int(number) or number < (0 if allow_zero else 1) or number > 999999999:
+        raise ValueError("%s: 지원하는 정수 ID 범위가 아닙니다 (%s)." % (label, value))
+    return int(number)
+
+
+def replace_keyword_first(line, value, width=10):
+    fields, style = keyword_fields(line, width)
+    if style == "fixed":
+        return str(value).rjust(width) + line[width:]
+    if style == "comma":
+        return str(value) + line[line.index(","):]
+    # The first token is the only field changed, including inline comments.
+    return re.sub(r"^(\s*)\S+", lambda m: m.group(1) + str(value), line, count=1)
+
+
+def read_erosion_library(path):
+    """Read a self-contained erosion/curve file without altering card data.
+
+    Supports standard/long (+) cards, TITLE, comma and fixed numeric formats.
+    Unknown keyword dependencies are rejected instead of silently dropped.
+    """
+    with open(path, "rb") as stream:
+        raw = stream.read()
+    try:
+        source = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            source = raw.decode("cp949")
+        except UnicodeDecodeError:
+            source = raw.decode("latin-1")
+    blocks, current = [], None
+    long_default = False
+    for line in source.splitlines():
+        if line.lstrip().startswith("*"):
+            token = line.split("$", 1)[0].strip().upper()
+            if token.startswith("*KEYWORD"):
+                long_default = "LONG" in token
+            key = re.sub(r"[ _]+", "_", token.rstrip("+"))
+            current = dict(keyword=key, width=20 if token.endswith("+") or long_default else 10,
+                           lines=[line])
+            blocks.append(current)
+        elif current is not None:
+            current["lines"].append(line)
+    templates, curves, unsupported = [], {}, []
+    for block in blocks:
+        key, lines, width = block["keyword"], block["lines"], block["width"]
+        if key in ("*END", "*TITLE") or key.startswith("*KEYWORD"):
+            continue
+        if key not in ("*MAT_ADD_EROSION", "*MAT_ADD_EROSION_TITLE",
+                       "*DEFINE_CURVE", "*DEFINE_CURVE_TITLE"):
+            unsupported.append(key)
+            continue
+        rows = [i for i in range(1, len(lines))
+                if lines[i].strip() and not lines[i].lstrip().startswith("$")]
+        title = ""
+        if key.endswith("_TITLE"):
+            if not rows:
+                raise ValueError("%s: TITLE이 없습니다." % key)
+            title = lines[rows.pop(0)].strip()
+        if not rows:
+            raise ValueError("%s: 데이터 카드가 없습니다." % key)
+        first = keyword_fields(lines[rows[0]], width)[0]
+        ident = keyword_id(first[0], key, allow_zero=key.startswith("*MAT"))
+        block.update(title=title, ident=ident, rows=rows)
+        # Normalize the keyword spelling but preserve all data/comments.
+        block["lines"][0] = key + ("+" if width == 20 else "")
+        if key.startswith("*MAT"):
+            if len(rows) < 2:
+                raise ValueError("MID %d: erosion 기본 카드 1, 2가 필요합니다." % ident)
+            for row in rows:
+                keyword_fields(lines[row], width)
+            templates.append(block)
+        else:
+            if ident in curves:
+                raise ValueError("파일 안에서 DEFINE_CURVE ID %d가 중복됩니다." % ident)
+            if len(rows) < 3:
+                raise ValueError("LCID %d: 커브 좌표가 최소 2개 필요합니다." % ident)
+            # DEFINE_CURVE data pairs use 20 columns in standard format.
+            for row in rows[1:]:
+                fields, _style = keyword_fields(lines[row], 20)
+                if len(fields) < 2:
+                    raise ValueError("LCID %d: 커브 x,y 쌍이 필요합니다." % ident)
+                keyword_number(fields[0])
+                keyword_number(fields[1])
+            curves[ident] = block
+    return dict(path=os.path.abspath(path), templates=templates, curves=curves,
+                unsupported=ordered_unique(unsupported))
+
+
+def erosion_files(directory=None, exclude=()):
+    """Discover candidates next to this .py, never relative to the working dir."""
+    directory = directory or os.path.dirname(os.path.abspath(__file__))
+    excluded = {os.path.normcase(os.path.abspath(p)) for p in exclude if p}
+    return [os.path.join(directory, name) for name in sorted(os.listdir(directory))
+            if os.path.splitext(name)[1].lower() in (".k", ".key")
+            and os.path.isfile(os.path.join(directory, name))
+            and os.path.normcase(os.path.abspath(os.path.join(directory, name))) not in excluded]
+
+
+def erosion_curve_references(block):
+    """Validate known curve fields; preserve all other legacy fields verbatim."""
+    rows, width = block["rows"], block["width"]
+    cards = [keyword_fields(block["lines"][r], width)[0] for r in rows]
+    def value(row, col):
+        return keyword_number(cards[row][col]) if row < len(cards) and col < len(cards[row]) else 0
+    refs = []
+    def add(row, col, name, negative_only=False):
+        number = value(row, col)
+        if number and (not negative_only or number < 0):
+            refs.append((name, keyword_id(abs(number), name)))
+    for col, name in ((1, "SIGP1"), (2, "SIGVM"), (3, "MXEPS")):
+        add(1, col, name, True)
+    add(2, 7, "LCREGD")
+    idam = value(2, 0)
+    if idam > 0:  # legacy GISSMO
+        add(2, 2, "LCSDG")
+        for col, name in ((3, "ECRIT"), (4, "DMGEXP"), (6, "FADEXP")):
+            add(2, col, name, True)
+        add(3, 3, "LCSRS")
+    elif idam == 0:
+        for col, name in ((0, "LCFLD"), (5, "LCEPS12"), (6, "LCEPS13"), (7, "LCEPSMX")):
+            add(3, col, name)
+    return refs
+
+
+def prepare_erosion(cv, library, mapping):
+    """Return cards and collision remap without mutating the converted model.
+
+    mapping: output MID -> zero-based template index (explicit GUI selection).
+    All curves from the chosen file are shared, emitted exactly once.
+    """
+    if not mapping:
+        return [], {}
+    if library["unsupported"]:
+        raise ValueError("erosion 파일에 지원하지 않는 키워드가 있습니다: "
+                         + ", ".join(library["unsupported"]))
+    mids = {m["mid"] for m in cv.mats}
+    cards = []
+    for mid, index in mapping.items():
+        if mid not in mids or not isinstance(index, int) or not 0 <= index < len(library["templates"]):
+            raise ValueError("유효하지 않은 재료/erosion 매칭입니다: MID %s" % mid)
+        block = library["templates"][index]
+        missing = [(name, cid) for name, cid in erosion_curve_references(block)
+                   if cid not in library["curves"]]
+        if missing:
+            raise ValueError("MID %s: 파일에 참조 커브가 없습니다: %s" %
+                             (mid, ", ".join("%s=%d" % v for v in missing)))
+        lines = list(block["lines"])
+        row = block["rows"][0]
+        lines[row] = replace_keyword_first(lines[row], mid, block["width"])
+        cards.extend(lines)
+    for block in library["curves"].values():
+        cards.extend(block["lines"])
+    occupied = set(library["curves"]) | {c["lcid"] for c in cv.curves} | {701, 702}
+    remap, next_id = {}, 1
+    for curve in cv.curves:
+        old = curve["lcid"]
+        if old in library["curves"]:
+            while next_id in occupied:
+                next_id += 1
+            remap[old] = next_id
+            occupied.add(next_id)
+    return cards, remap
+
+
+def bc_py_members(cv, excluded):
+    base = next((s for s in cv.nsets if s["sid"] == MOUNT_SET_ID
+                 and name_key(s["name"]) == MOUNT_SET_NAME), None)
+    if base is None:
+        raise ValueError("NSET_BC(100001)가 없어 NSET_BC_PY를 만들 수 없습니다.")
+    if any(s["sid"] == BC_PY_SET_ID or name_key(s["name"]) == BC_PY_SET_NAME
+           for s in cv.set_output):
+        raise ValueError("NSET_BC_PY 이름 또는 SET ID 100002가 이미 사용 중입니다.")
+    excluded = set(excluded)
+    unknown = excluded - set(base["ids"])
+    if unknown:
+        raise ValueError("NSET_BC에 없는 제외 노드 ID: %s" % sorted(unknown))
+    kept = [n for n in base["ids"] if n not in excluded]
+    if not kept:
+        raise ValueError("NSET_BC_PY에는 최소 1개 노드가 남아 있어야 합니다.")
+    return kept
+
+
+def apply_conversion_additions(cv, options):
+    """Validate every addition before applying; preserve the original BC set."""
+    library, mapping = options.get("erosion_library"), options.get("erosion_mapping", {})
+    if mapping and not library:
+        raise ValueError("erosion 매칭에 사용할 .key/.k 파일이 필요합니다.")
+    cards, remap = prepare_erosion(cv, library, mapping) if mapping else ([], {})
+    kept = bc_py_members(cv, options.get("bc_py_excluded", [])) if options.get("bc_py") else None
+    for curve in cv.curves:
+        curve["lcid"] = remap.get(curve["lcid"], curve["lcid"])
+    for mat in cv.mats:
+        for field in ("lcss", "lcid"):
+            if field in mat:
+                mat[field] = remap.get(mat[field], mat[field])
+    cv.erosion_lines = cards
+    if cards:
+        cv.log.ok("MAT_ADD_EROSION %d개 · 공통 DEFINE_CURVE %d개 · 기존 커브 ID 변경 %s"
+                  % (len(mapping), len(library["curves"]), remap or "없음"))
+    if kept is not None:
+        record = dict(sid=BC_PY_SET_ID, fixed_sid=BC_PY_SET_ID,
+                      name=BC_PY_SET_NAME, kind="node", ids=kept, _sort_key=(4, BC_PY_SET_ID))
+        cv.set_output.append(record)
+        cv.nsets.append(record)
+        cv._sets_by_sid[BC_PY_SET_ID] = record
+        cv.global_nsets[BC_PY_SET_NAME] = BC_PY_SET_ID
+        cv._node_sid[BC_PY_SET_NAME] = BC_PY_SET_ID
+        cv.log.ok("NSET_BC_PY (100002): 포함 %d개 / 제외 %d개 (NSET_BC 유지)"
+                  % (len(kept), len(set(options.get("bc_py_excluded", [])))))
+
+
 def write_k(cv, opt, out_path, src_name, progress=None):
     # Also covers callers that modify the converted model before exporting it.
     cv.finalize_nrb_ids()
@@ -3714,6 +3971,9 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         put("$#                a1                  o1")
         for x, y in c["pts"]:
             put(f20(x) + f20(y))
+
+    if getattr(cv, "erosion_lines", None):
+        W.write(("\n".join(cv.erosion_lines).rstrip() + "\n").encode("utf-8"))
 
     mesh_bytes = sum(f.tell() for f in cv.tmp.values())
     copied_bytes = 0
@@ -4054,6 +4314,16 @@ def _convert_file_impl(inp_path, out_path, opt, log, progress=None):
         pulse.start()
     try:
         cv.run()
+        additions = dict(opt)
+        if opt.get("configure_additions"):
+            stop_heartbeat.set()
+            pulse.join()
+            emit("select", 88.0, "재료 매칭 / NSET_BC_PY 선택")
+            selected = opt["configure_additions"](cv)
+            if selected is None:
+                raise ValueError("추가 설정을 취소했습니다. 출력 파일을 저장하지 않았습니다.")
+            additions.update(selected)
+        apply_conversion_additions(cv, additions)
         t_conv = time.time() - t1
         emit("write", 90.0, "결과 파일 저장")
         t2 = time.time()
@@ -4811,6 +5081,338 @@ class ShockTab:
             self.status_var.set("%d개 파일 저장 완료 · %s" % (len(result["written"]), result["directory"]))
 
 
+class ConversionAdditionsDialog:
+    """Main-thread, modal editor for the finalized converter's output IDs."""
+    def __init__(self, parent, cv, options):
+        from tkinter import ttk, messagebox
+        self.cv, self.options, self.result = cv, options, None
+        self.messagebox = messagebox
+        self.library, self.mapping, self.excluded = None, {}, set()
+        self.base = next((s for s in cv.nsets if s["sid"] == MOUNT_SET_ID
+                          and name_key(s["name"]) == MOUNT_SET_NAME), None)
+        self.ids = list(self.base["ids"]) if self.base else []
+        self.xy, self.drag_start, self.rectangle = {}, None, None
+        P = PALETTE
+        win = self.win = tk.Toplevel(parent)
+        win.title("저장 전 설정 · Erosion / NSET_BC_PY")
+        win.configure(bg=P["bg"])
+        win.transient(parent)
+        width, height = min(1120, win.winfo_screenwidth()-60), min(800, win.winfo_screenheight()-100)
+        win.geometry("%dx%d" % (width, height))
+        win.minsize(min(780, width), min(540, height))
+        win.protocol("WM_DELETE_WINDOW", self.cancel)
+        win.bind("<Escape>", lambda e: self.cancel())
+        footer = tk.Frame(win, bg=P["bg"], padx=18, pady=12)
+        footer.pack(side="bottom", fill="x")
+        self.status = tk.StringVar(value="선택 내용을 확인한 뒤 저장하세요.")
+        tk.Label(footer, textvariable=self.status, bg=P["bg"], fg=P["dim"],
+                 anchor="w").pack(side="left", fill="x", expand=True)
+        self.button(footer, "취소", self.cancel).pack(side="right", padx=5)
+        self.button(footer, "적용 후 저장", self.accept).pack(side="right", padx=5)
+        nav = tk.Frame(win, bg=P["bg"], padx=18, pady=10)
+        nav.pack(fill="x")
+        area = tk.Frame(win, bg=P["bg"], padx=18, pady=8)
+        area.pack(fill="both", expand=True)
+        self.pages = [tk.Frame(area, bg=P["bg"]) for _ in range(2)]
+        self.nav_buttons = []
+        for i, label in enumerate(("재료별 MAT_ADD_EROSION", "NSET_BC_PY · 100002")):
+            b = self.button(nav, label, lambda i=i: self.page(i))
+            b.pack(side="left", padx=(0, 8))
+            self.nav_buttons.append(b)
+
+        page = self.pages[0]
+        tk.Label(page, text="출력 재료를 선택하고 erosion 카드를 연결하세요. MID만 출력 재료에 맞춰 변경합니다.",
+                 bg=P["bg"], fg=P["text"], anchor="w").pack(fill="x", pady=(0, 8))
+        paths = erosion_files(exclude=(options.get("output_path"),))
+        self.paths = {os.path.basename(p): p for p in paths}
+        row = tk.Frame(page, bg=P["bg"])
+        row.pack(fill="x")
+        self.file_var = tk.StringVar(value="(파일 선택)")
+        files = ttk.Combobox(row, textvariable=self.file_var, state="readonly",
+                             values=["(파일 선택)"] + list(self.paths))
+        files.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        files.bind("<<ComboboxSelected>>", self.load_file)
+        self.button(row, "새로고침", lambda: self.refresh_files(files)).pack(side="left")
+        self.library_info = tk.StringVar(value=".py와 같은 폴더에 .key 또는 .k 파일을 넣어 주세요.")
+        tk.Label(page, textvariable=self.library_info, bg=P["bg"], fg=P["dim"],
+                 anchor="w", wraplength=950, justify="left").pack(fill="x", pady=8)
+        style = ttk.Style(win)
+        style.configure("INP2K.Treeview", background=P["card"], foreground=P["text"],
+                        fieldbackground=P["card"], rowheight=28)
+        style.map("INP2K.Treeview", background=[("selected", P["accent_dim"])],
+                  foreground=[("selected", P["text"])])
+        table = tk.Frame(page, bg=P["bg"])
+        table.pack(fill="both", expand=True)
+        self.materials = ttk.Treeview(table, style="INP2K.Treeview", columns=("mid", "name", "erosion"),
+                                     show="headings", selectmode="extended")
+        for col, text, width in (("mid", "출력 MID", 90), ("name", "재료 이름", 270),
+                                  ("erosion", "매칭된 erosion 카드", 450)):
+            self.materials.heading(col, text=text)
+            self.materials.column(col, width=width, minwidth=60)
+        scroll = ttk.Scrollbar(table, command=self.materials.yview)
+        self.materials.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.materials.pack(fill="both", expand=True)
+        for mat in cv.mats:
+            self.materials.insert("", "end", iid=str(mat["mid"]), values=(mat["mid"], mat["name"], "미적용"))
+        choose = tk.Frame(page, bg=P["bg"])
+        choose.pack(fill="x", pady=10)
+        self.template_var = tk.StringVar(value="미적용")
+        self.templates = ttk.Combobox(choose, textvariable=self.template_var, state="readonly", values=["미적용"])
+        self.templates.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.button(choose, "선택 재료에 연결", self.assign).pack(side="left")
+        self.button(choose, "이름 일치 자동 매칭", self.auto_match).pack(side="left", padx=6)
+        tk.Label(page, text="여러 재료에 같은 카드를 연결할 수 있습니다. 파일의 모든 DEFINE_CURVE는 한 번만 출력되며,\n"
+                 "LCREGD를 포함한 커브 참조는 원본 ID를 함께 사용합니다. 재료별 LCREGD 값은 덮어쓰지 않습니다.",
+                 bg=P["bg"], fg=P["dim"], justify="left", anchor="w").pack(fill="x", pady=(0, 6))
+
+        page = self.pages[1]
+        self.make_bc = tk.BooleanVar(value=bool(options.get("edit_bc_py") and self.base))
+        check = tk.Checkbutton(page, text="NSET_BC_PY(100002) 생성", variable=self.make_bc,
+                               bg=P["bg"], fg=P["text"], selectcolor=P["card"],
+                               activebackground=P["bg"], activeforeground=P["text"])
+        check.pack(anchor="w")
+        if not self.base:
+            check.configure(state="disabled")
+        tk.Label(page, text=("파란색: 포함 / 빨간색: 제외 · 클릭: 전환 · 드래그: 영역 제외 · Shift+드래그: 복원\n"
+                            "표시 ID는 출력 .k의 노드 ID입니다. 좌표가 겹치면 다른 투영도나 오른쪽 목록에서 선택하세요."
+                            if self.base else "NSET_BC(100001)가 생성되지 않았습니다. 원본의 마운팅 COUPLING/MPC를 확인하세요."),
+                 bg=P["bg"], fg=P["dim"], anchor="w", justify="left").pack(fill="x", pady=8)
+        toolbar = tk.Frame(page, bg=P["bg"])
+        toolbar.pack(fill="x", pady=(0, 8))
+        self.view = tk.StringVar(value="XZ")
+        views = ttk.Combobox(toolbar, state="readonly", textvariable=self.view,
+                             values=("XY", "XZ", "YZ", "ISO"), width=8)
+        views.pack(side="left")
+        views.bind("<<ComboboxSelected>>", lambda e: self.draw())
+        self.button(toolbar, "모두 복원", self.reset_nodes).pack(side="left", padx=8)
+        self.node_info = tk.StringVar()
+        tk.Label(toolbar, textvariable=self.node_info, bg=P["bg"], fg=P["text"]).pack(side="left")
+        body = tk.Frame(page, bg=P["bg"])
+        body.pack(fill="both", expand=True)
+        side = tk.Frame(body, bg=P["bg"])
+        side.pack(side="right", fill="y", padx=(12, 0))
+        actions = tk.Frame(side, bg=P["bg"])
+        actions.pack(side="bottom", fill="x", pady=8)
+        self.button(actions, "선택 제외", lambda: self.change_list(True)).pack(side="left", padx=2)
+        self.button(actions, "선택 복원", lambda: self.change_list(False)).pack(side="left", padx=2)
+        tk.Label(side, text="상태 / 출력 ID / X, Y, Z", bg=P["bg"], fg=P["dim"]).pack(anchor="w")
+        listwrap = tk.Frame(side, bg=P["bg"])
+        listwrap.pack(fill="both", expand=True)
+        self.node_list = tk.Listbox(listwrap, selectmode="extended", exportselection=False,
+                                   width=37, bg=P["card"], fg=P["text"],
+                                   selectbackground=P["accent_dim"], relief="flat", highlightthickness=0)
+        listscroll = ttk.Scrollbar(listwrap, command=self.node_list.yview)
+        self.node_list.configure(yscrollcommand=listscroll.set)
+        listscroll.pack(side="right", fill="y")
+        self.node_list.pack(fill="both", expand=True)
+        self.node_list.bind("<Double-Button-1>", self.toggle_list)
+        self.canvas = tk.Canvas(body, bg=P["card"], highlightthickness=1, highlightbackground=P["line"])
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda e: self.draw())
+        self.canvas.bind("<ButtonPress-1>", self.press)
+        self.canvas.bind("<B1-Motion>", self.drag)
+        self.canvas.bind("<ButtonRelease-1>", self.release)
+        self.update_nodes()
+        self.page(0 if options.get("edit_erosion") else 1)
+        preferred = next((name for name in self.paths if "erosion" in name.lower()), None)
+        if preferred and options.get("edit_erosion"):
+            self.file_var.set(preferred)
+            self.load_file()
+        win.update_idletasks()
+        win.grab_set()
+
+    def button(self, parent, text, command):
+        P = PALETTE
+        return tk.Button(parent, text=text, command=command, bg=P["card2"], fg=P["text"],
+                         activebackground=P["accent_dim"], activeforeground=P["text"],
+                         relief="flat", padx=12, pady=7, cursor="hand2")
+
+    def page(self, index):
+        for i, page in enumerate(self.pages):
+            page.pack_forget()
+            self.nav_buttons[i].configure(bg=PALETTE["accent_dim"] if i == index else PALETTE["card2"])
+        self.pages[index].pack(fill="both", expand=True)
+
+    def refresh_files(self, combo):
+        paths = erosion_files(exclude=(self.options.get("output_path"),))
+        self.paths = {os.path.basename(p): p for p in paths}
+        combo.configure(values=["(파일 선택)"] + list(self.paths))
+        if self.file_var.get() not in self.paths:
+            self.file_var.set("(파일 선택)")
+        self.load_file()
+
+    def load_file(self, _event=None):
+        self.library, self.mapping = None, {}
+        self.template_labels = ["미적용"]
+        try:
+            path = self.paths.get(self.file_var.get())
+            if path:
+                library = read_erosion_library(path)
+                if not library["templates"]:
+                    raise ValueError("이 파일에 MAT_ADD_EROSION이 없습니다.")
+                if library["unsupported"]:
+                    raise ValueError("지원하지 않는 키워드: " + ", ".join(library["unsupported"]))
+                self.library = library
+                for i, block in enumerate(library["templates"]):
+                    refs = [str(cid) for name, cid in erosion_curve_references(block) if name == "LCREGD"]
+                    self.template_labels.append("%d. %s [원본 MID %d / LCREGD %s]" %
+                        (i+1, block["title"] or "Erosion", block["ident"], ",".join(refs) or "0"))
+                self.library_info.set("erosion %d개 / 공통 커브 %d개 · %s" %
+                    (len(library["templates"]), len(library["curves"]), os.path.basename(path)))
+            else:
+                self.library_info.set(".py와 같은 폴더의 .key/.k 파일을 선택하세요.")
+        except (OSError, ValueError) as exc:
+            self.library = None
+            self.library_info.set(str(exc))
+        self.templates.configure(values=self.template_labels)
+        self.template_var.set("미적용")
+        self.update_materials()
+
+    def update_materials(self):
+        for mat in self.cv.mats:
+            index = self.mapping.get(mat["mid"])
+            label = self.template_labels[index+1] if index is not None else "미적용"
+            self.materials.item(str(mat["mid"]), values=(mat["mid"], mat["name"], label))
+        self.status.set("Erosion 매칭 %d개 · 선택 후 ‘적용 후 저장’을 누르세요." % len(self.mapping))
+
+    def assign(self):
+        selected = self.materials.selection()
+        if not selected:
+            self.status.set("먼저 표에서 연결할 재료를 선택하세요. Ctrl/Shift로 여러 개 선택할 수 있습니다.")
+            return
+        index = self.templates.current()-1
+        for item in selected:
+            mid = int(item)
+            if index < 0:
+                self.mapping.pop(mid, None)
+            else:
+                self.mapping[mid] = index
+        self.update_materials()
+
+    def auto_match(self):
+        if self.library:
+            for mat in self.cv.mats:
+                matches = [i for i, block in enumerate(self.library["templates"])
+                           if name_key(block["title"]) == name_key(mat["name"])]
+                if len(matches) == 1:
+                    self.mapping[mat["mid"]] = matches[0]
+        self.update_materials()
+
+    def update_nodes(self):
+        selected, top = self.node_list.curselection(), self.node_list.yview()[0]
+        self.node_list.delete(0, "end")
+        for n in self.ids:
+            xyz = self.cv.node_coord.get(n)
+            coord = ", ".join("%.5g" % v for v in xyz) if xyz is not None else "좌표 없음"
+            self.node_list.insert("end", "%s %d | %s" % ("×" if n in self.excluded else "●", n, coord))
+            self.node_list.itemconfigure("end", fg=PALETTE["err"] if n in self.excluded else PALETTE["text"])
+        for i in selected:
+            self.node_list.selection_set(i)
+        self.node_list.yview_moveto(top)
+        self.node_info.set("원본 %d / 포함 %d / 제외 %d" % (len(self.ids), len(self.ids)-len(self.excluded), len(self.excluded)))
+        self.draw()
+
+    def reset_nodes(self):
+        self.excluded.clear()
+        self.update_nodes()
+
+    def change_list(self, remove):
+        nodes = [self.ids[i] for i in self.node_list.curselection()]
+        self.excluded.update(nodes) if remove else self.excluded.difference_update(nodes)
+        self.update_nodes()
+
+    def toggle_list(self, event):
+        if self.ids:
+            n = self.ids[self.node_list.nearest(event.y)]
+            self.excluded.symmetric_difference_update({n})
+            self.update_nodes()
+
+    def draw(self):
+        canvas, P = self.canvas, PALETTE
+        canvas.delete("all")
+        w, h = canvas.winfo_width(), canvas.winfo_height()
+        if w < 10 or h < 10:
+            return
+        projected = {}
+        view = self.view.get()
+        for n in self.ids:
+            point = self.cv.node_coord.get(n)
+            if point is None:
+                continue
+            x, y, z = point
+            projected[n] = ((x, y) if view == "XY" else (x, z) if view == "XZ" else
+                            (y, z) if view == "YZ" else ((x-y)/math.sqrt(2), (2*z-x-y)/math.sqrt(6)))
+        self.xy = {}
+        if not projected:
+            canvas.create_text(w/2, h/2, text="표시할 NSET_BC 좌표가 없습니다.", fill=P["dim"])
+            return
+        xs, ys = zip(*projected.values())
+        xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
+        scale = min(max(1, w-100)/max(xmax-xmin, 1e-9), max(1, h-100)/max(ymax-ymin, 1e-9))
+        canvas.create_text(12, 14, anchor="w", text=view + " · NSET_BC / NSET_BC_PY", fill=P["dim"])
+        canvas.create_text(12, h-16, anchor="w", text="가로/세로: %s · 좌표 단위: 입력 모델과 동일" %
+                           ("등각 투영" if view == "ISO" else "/".join(view)), fill=P["dim"])
+        for n, (x, y) in projected.items():
+            px, py = w/2+(x-(xmin+xmax)/2)*scale, h/2-(y-(ymin+ymax)/2)*scale
+            self.xy[n] = (px, py)
+            color = P["err"] if n in self.excluded else P["accent"]
+            canvas.create_oval(px-5, py-5, px+5, py+5, fill=color, outline=P["text"])
+            if len(projected) <= 150:
+                canvas.create_text(px+8, py-9, anchor="w", text=str(n), fill=color)
+
+    def press(self, event):
+        self.drag_start = (event.x, event.y)
+
+    def drag(self, event):
+        if self.drag_start:
+            self.canvas.delete("selection_box")
+            self.canvas.create_rectangle(*self.drag_start, event.x, event.y,
+                                         outline=PALETTE["warn"], dash=(4, 3), tags="selection_box")
+
+    def release(self, event):
+        if self.drag_start is None:
+            return
+        x0, y0 = self.drag_start
+        self.drag_start = None
+        self.canvas.delete("selection_box")
+        if math.hypot(event.x-x0, event.y-y0) < 5:
+            near = sorted(((math.hypot(x-event.x, y-event.y), n) for n, (x, y) in self.xy.items()))
+            hits = [n for distance, n in near if distance <= 9]
+            if len(hits) == 1:
+                self.excluded.symmetric_difference_update({hits[0]})
+            elif hits:
+                self.node_list.selection_clear(0, "end")
+                indices = {n: i for i, n in enumerate(self.ids)}
+                for n in hits:
+                    self.node_list.selection_set(indices[n])
+                self.node_list.see(indices[hits[0]])
+                self.status.set("겹친 노드 %d개를 목록에 선택했습니다. ID/좌표를 확인하고 제외하세요." % len(hits))
+        else:
+            nodes = [n for n, (x, y) in self.xy.items()
+                     if min(x0, event.x) <= x <= max(x0, event.x) and min(y0, event.y) <= y <= max(y0, event.y)]
+            self.excluded.difference_update(nodes) if event.state & 1 else self.excluded.update(nodes)
+        self.update_nodes()
+
+    def accept(self):
+        selection = dict(erosion_library=self.library, erosion_mapping=dict(self.mapping),
+                         bc_py=self.make_bc.get(), bc_py_excluded=sorted(self.excluded))
+        try:
+            if self.mapping:
+                prepare_erosion(self.cv, self.library, self.mapping)
+            if selection["bc_py"]:
+                bc_py_members(self.cv, selection["bc_py_excluded"])
+        except ValueError as exc:
+            self.messagebox.showerror("설정 확인", str(exc), parent=self.win)
+            return
+        self.result = selection
+        self.win.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.win.destroy()
+
+
 def run_gui():
     global tk
     try:
@@ -4958,6 +5560,8 @@ def run_gui():
              anchor="w").pack(fill="x")
 
     def pick():
+        if state["busy"]:
+            return
         p = filedialog.askopenfilename(
             title="Abaqus 입력 파일 선택",
             filetypes=[("Abaqus deck", "*.inp *.dat *.blk *.inc"), ("모든 파일", "*.*")])
@@ -5182,6 +5786,13 @@ def run_gui():
         except tk.TclError:
             win.after(100, lambda: win.winfo_exists() and win.grab_set())
     RButton(r2, "상세 설정", show_details, kind="ghost", w=120, h=34, font=F_LB).pack(side="left")
+    edit_erosion = tk.BooleanVar(value=True)
+    edit_bc_py = tk.BooleanVar(value=True)
+    for variable, label in ((edit_erosion, "저장 전 Erosion 매칭"),
+                            (edit_bc_py, "NSET_BC_PY 노드 선택")):
+        tk.Checkbutton(r2, text=label, variable=variable, bg=P["card"], fg=P["text"],
+                       selectcolor=P["card2"], activebackground=P["card"],
+                       activeforeground=P["text"], font=F_SM).pack(side="left", padx=(12, 0))
 
     # ---------- 실행 ----------
     c3, f3 = card(wrap, "", F_HD)
@@ -5251,6 +5862,15 @@ def run_gui():
 
     def worker(path, out, opt):
         log = Log(sink=lambda lv, m: q.put(("log", lv, m)))
+        if opt.get("edit_erosion") or opt.get("edit_bc_py"):
+            def configure(cv):
+                event, response = threading.Event(), {}
+                q.put(("configure", cv, opt, event, response))
+                event.wait()  # UI main thread owns every Tk call.
+                if response.get("error"):
+                    raise RuntimeError(response["error"])
+                return response.get("selection")
+            opt["configure_additions"] = configure
         try:
             r = convert_file(path, out, opt, log,
                              progress=lambda ph, pct, t: q.put(("prog", ph, pct, t)))
@@ -5269,6 +5889,7 @@ def run_gui():
             opt[k] = s_.get()
         opt.update(detail)
         opt.update(tet10=True, beamNode=True, auto_sets=True, unit="mmts")
+        opt.update(edit_erosion=edit_erosion.get(), edit_bc_py=edit_bc_py.get(), output_path=out)
         txt.delete("1.0", "end")
         add_line("head", "▶  " + os.path.basename(state["path"]))
         state["busy"] = True
@@ -5283,7 +5904,7 @@ def run_gui():
                          daemon=True).start()
 
     PH = {"read": "읽는 중", "convert": "변환 중", "write": "파일 쓰는 중",
-          "done": "마무리"}
+          "done": "마무리", "select": "선택 대기"}
 
     def poll():
         deadline = time.monotonic()+.015
@@ -5294,6 +5915,17 @@ def run_gui():
                 it = q.get_nowait()
                 if it[0] == "log":
                     add_line(it[1], it[2])
+                elif it[0] == "configure":
+                    _, cv, options, event, response = it
+                    try:
+                        dialog = ConversionAdditionsDialog(root, cv, options)
+                        root.wait_window(dialog.win)
+                        response["selection"] = dialog.result
+                    except Exception:
+                        import traceback
+                        response["error"] = traceback.format_exc()
+                    finally:
+                        event.set()
                 elif it[0] == "prog":
                     _, ph, pct, t = it
                     bar.set(pct)
