@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Abaqus INP -> LS-DYNA keyword (.k) 변환기
+INP2K v2.12 | Abaqus INP -> LS-DYNA keyword (.k) 변환기
 
-현재 버전: v2.11 — MAT_ADD_EROSION 매칭 / NSET_BC_PY 노드 편집
+v2.12 주요 변경 사항
+- 기본 출력명: model.inp -> model_DYNA.k
+- 입력 파일 드래그 앤 드롭 지원 (tkinterdnd2 필요, GUI에서 활성화).
+- Erosion/NSET 설정 창을 블랙+토스블루 톤으로 통일.
+- NSET 기본 보기 XY, 각 보기의 좌표축 화살표 추가.
+
+이전 버전: v2.11 — MAT_ADD_EROSION 매칭 / NSET_BC_PY 노드 편집
 - 같은 폴더의 .key/.k에서 erosion 카드를 선택하고 출력 재료 MID에 연결합니다.
 - 파일의 DEFINE_CURVE / LCREGD 참조를 공유하고 기존 재료 커브 충돌을 해소합니다.
 - 변환 후 저장 전 GUI에서 NSET_BC 노드를 제외하여 NSET_BC_PY(100002)를 생성합니다.
@@ -242,7 +248,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.11"
+VERSION = "2.12"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -3622,6 +3628,36 @@ class EidIndex:
 # External curve IDs/references remain unchanged; only converter-owned curves
 # are renumbered, so opaque/legacy erosion criteria keep their original meaning.
 # ============================================================
+def default_dyna_path(inp_path):
+    return os.path.splitext(os.fspath(inp_path))[0] + "_DYNA.k"
+
+
+def dropped_input_path(data, interpreter):
+    """Decode the OS drop's Tcl list without damaging spaces/Korean/braces."""
+    paths = interpreter.splitlist(data)
+    if len(paths) != 1:
+        raise ValueError("입력 파일은 한 번에 하나만 드롭해 주세요.")
+    path = os.path.abspath(os.path.expanduser(paths[0]))
+    if not os.path.isfile(path):
+        raise ValueError("읽을 수 있는 입력 파일을 드롭해 주세요. 폴더는 사용할 수 없습니다.")
+    if os.path.splitext(path)[1].lower() not in (".inp", ".dat", ".blk", ".inc"):
+        raise ValueError("Abaqus 입력 파일(.inp, .dat, .blk, .inc)을 드롭해 주세요.")
+    return path
+
+
+def project_nset_point(point, view):
+    x, y, z = point
+    if view == "XY":
+        return x, y
+    if view == "XZ":
+        return x, z
+    if view == "YZ":
+        return y, z
+    if view == "ISO":
+        return (x-y)/math.sqrt(2), (2*z-x-y)/math.sqrt(6)
+    raise ValueError("알 수 없는 NSET 보기: %s" % view)
+
+
 def keyword_number(value):
     text = str(value).strip().replace("D", "E").replace("d", "e")
     if "e" not in text.lower():
@@ -5081,6 +5117,68 @@ class ShockTab:
             self.status_var.set("%d개 파일 저장 완료 · %s" % (len(result["written"]), result["directory"]))
 
 
+ADDITIONS_PALETTE = dict(PALETTE, bg="#101114", card="#17191E", card2="#202329",
+                        line="#2C3038", accent="#3182F6", accent_hi="#5599FF",
+                        accent_dim="#193B69", text="#F2F4F6", dim="#A5ADBA")
+
+
+def setup_additions_style(parent):
+    """Clam renders custom colors on Windows as well as Linux (no native white)."""
+    from tkinter import ttk
+    P = ADDITIONS_PALETTE
+    style = ttk.Style(parent)
+    style.theme_use("clam")
+    style.configure("INP2K.Treeview", background=P["card"], foreground=P["text"],
+                    fieldbackground=P["card"], rowheight=30, borderwidth=0,
+                    lightcolor=P["card"], darkcolor=P["card"], relief="flat")
+    style.map("INP2K.Treeview", background=[("selected", P["accent"])],
+              foreground=[("selected", P["text"])])
+    style.configure("INP2K.Treeview.Heading", background=P["card2"], foreground=P["dim"],
+                    relief="flat", borderwidth=0, padding=(10, 9),
+                    lightcolor=P["card2"], darkcolor=P["card2"], bordercolor=P["card2"])
+    style.map("INP2K.Treeview.Heading", background=[("active", P["accent_dim"])],
+              foreground=[("active", P["text"])])
+    style.configure("INP2K.TCombobox", background=P["card2"], fieldbackground=P["card2"],
+                    foreground=P["text"], arrowcolor=P["accent"], bordercolor=P["line"],
+                    lightcolor=P["line"], darkcolor=P["line"], padding=(10, 7),
+                    selectbackground=P["accent"], selectforeground=P["text"])
+    style.configure("INP2K.Popup.TFrame", background=P["line"], borderwidth=0, relief="flat")
+    style.map("INP2K.TCombobox", fieldbackground=[("disabled", P["card"]), ("readonly", P["card2"])],
+              foreground=[("disabled", P["faint"]), ("readonly", P["text"])],
+              background=[("active", P["accent_dim"]), ("readonly", P["card2"])],
+              arrowcolor=[("disabled", P["faint"]), ("active", P["accent_hi"])],
+              bordercolor=[("focus", P["accent"]), ("!focus", P["line"])])
+    for name in ("INP2K.Vertical.TScrollbar", "Vertical.TScrollbar"):
+        style.configure(name, background=P["line"], troughcolor=P["card"],
+                        bordercolor=P["card"], lightcolor=P["line"], darkcolor=P["line"],
+                        arrowcolor=P["dim"], borderwidth=0, arrowsize=13, relief="flat")
+        style.map(name, background=[("active", P["accent"]), ("pressed", P["accent"])])
+    for option, value in (("background", P["card2"]), ("foreground", P["text"]),
+                          ("selectBackground", P["accent"]), ("selectForeground", P["text"]),
+                          ("borderWidth", 0), ("highlightThickness", 0)):
+        parent.option_add("*TCombobox*Listbox." + option, value)
+
+
+def dark_combobox(parent, **kwargs):
+    from tkinter import ttk
+    box = ttk.Combobox(parent, style="INP2K.TCombobox", **kwargs)
+    def style_popup():
+        # The dropdown is a separate Tk Listbox, not the themed entry field.
+        P = ADDITIONS_PALETTE
+        popup = str(box.tk.call("ttk::combobox::PopdownWindow", str(box)))
+        if not int(box.tk.call("winfo", "exists", popup + ".f.l")):
+            return  # Aqua may use an OS-owned menu instead of a Listbox.
+        box.tk.call(popup, "configure", "-background", P["card2"])
+        box.tk.call(popup + ".f", "configure", "-style", "INP2K.Popup.TFrame")
+        box.tk.call(popup + ".f.l", "configure", "-background", P["card2"],
+                    "-foreground", P["text"], "-selectbackground", P["accent"],
+                    "-selectforeground", P["text"], "-borderwidth", 0,
+                    "-highlightthickness", 0)
+        box.tk.call(popup + ".f.sb", "configure", "-style", "INP2K.Vertical.TScrollbar")
+    box.configure(postcommand=style_popup)
+    return box
+
+
 class ConversionAdditionsDialog:
     """Main-thread, modal editor for the finalized converter's output IDs."""
     def __init__(self, parent, cv, options):
@@ -5092,10 +5190,11 @@ class ConversionAdditionsDialog:
                           and name_key(s["name"]) == MOUNT_SET_NAME), None)
         self.ids = list(self.base["ids"]) if self.base else []
         self.xy, self.drag_start, self.rectangle = {}, None, None
-        P = PALETTE
+        P = ADDITIONS_PALETTE
         win = self.win = tk.Toplevel(parent)
         win.title("저장 전 설정 · Erosion / NSET_BC_PY")
         win.configure(bg=P["bg"])
+        setup_additions_style(win)
         win.transient(parent)
         width, height = min(1120, win.winfo_screenwidth()-60), min(800, win.winfo_screenheight()-100)
         win.geometry("%dx%d" % (width, height))
@@ -5108,7 +5207,7 @@ class ConversionAdditionsDialog:
         tk.Label(footer, textvariable=self.status, bg=P["bg"], fg=P["dim"],
                  anchor="w").pack(side="left", fill="x", expand=True)
         self.button(footer, "취소", self.cancel).pack(side="right", padx=5)
-        self.button(footer, "적용 후 저장", self.accept).pack(side="right", padx=5)
+        self.button(footer, "적용 후 저장", self.accept, primary=True).pack(side="right", padx=5)
         nav = tk.Frame(win, bg=P["bg"], padx=18, pady=10)
         nav.pack(fill="x")
         area = tk.Frame(win, bg=P["bg"], padx=18, pady=8)
@@ -5128,7 +5227,7 @@ class ConversionAdditionsDialog:
         row = tk.Frame(page, bg=P["bg"])
         row.pack(fill="x")
         self.file_var = tk.StringVar(value="(파일 선택)")
-        files = ttk.Combobox(row, textvariable=self.file_var, state="readonly",
+        files = dark_combobox(row, textvariable=self.file_var, state="readonly",
                              values=["(파일 선택)"] + list(self.paths))
         files.pack(side="left", fill="x", expand=True, padx=(0, 8))
         files.bind("<<ComboboxSelected>>", self.load_file)
@@ -5136,11 +5235,6 @@ class ConversionAdditionsDialog:
         self.library_info = tk.StringVar(value=".py와 같은 폴더에 .key 또는 .k 파일을 넣어 주세요.")
         tk.Label(page, textvariable=self.library_info, bg=P["bg"], fg=P["dim"],
                  anchor="w", wraplength=950, justify="left").pack(fill="x", pady=8)
-        style = ttk.Style(win)
-        style.configure("INP2K.Treeview", background=P["card"], foreground=P["text"],
-                        fieldbackground=P["card"], rowheight=28)
-        style.map("INP2K.Treeview", background=[("selected", P["accent_dim"])],
-                  foreground=[("selected", P["text"])])
         table = tk.Frame(page, bg=P["bg"])
         table.pack(fill="both", expand=True)
         self.materials = ttk.Treeview(table, style="INP2K.Treeview", columns=("mid", "name", "erosion"),
@@ -5149,7 +5243,7 @@ class ConversionAdditionsDialog:
                                   ("erosion", "매칭된 erosion 카드", 450)):
             self.materials.heading(col, text=text)
             self.materials.column(col, width=width, minwidth=60)
-        scroll = ttk.Scrollbar(table, command=self.materials.yview)
+        scroll = ttk.Scrollbar(table, style="INP2K.Vertical.TScrollbar", command=self.materials.yview)
         self.materials.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.materials.pack(fill="both", expand=True)
@@ -5158,9 +5252,9 @@ class ConversionAdditionsDialog:
         choose = tk.Frame(page, bg=P["bg"])
         choose.pack(fill="x", pady=10)
         self.template_var = tk.StringVar(value="미적용")
-        self.templates = ttk.Combobox(choose, textvariable=self.template_var, state="readonly", values=["미적용"])
+        self.templates = dark_combobox(choose, textvariable=self.template_var, state="readonly", values=["미적용"])
         self.templates.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.button(choose, "선택 재료에 연결", self.assign).pack(side="left")
+        self.button(choose, "선택 재료에 연결", self.assign, primary=True).pack(side="left")
         self.button(choose, "이름 일치 자동 매칭", self.auto_match).pack(side="left", padx=6)
         tk.Label(page, text="여러 재료에 같은 카드를 연결할 수 있습니다. 파일의 모든 DEFINE_CURVE는 한 번만 출력되며,\n"
                  "LCREGD를 포함한 커브 참조는 원본 ID를 함께 사용합니다. 재료별 LCREGD 값은 덮어쓰지 않습니다.",
@@ -5169,8 +5263,10 @@ class ConversionAdditionsDialog:
         page = self.pages[1]
         self.make_bc = tk.BooleanVar(value=bool(options.get("edit_bc_py") and self.base))
         check = tk.Checkbutton(page, text="NSET_BC_PY(100002) 생성", variable=self.make_bc,
-                               bg=P["bg"], fg=P["text"], selectcolor=P["card"],
-                               activebackground=P["bg"], activeforeground=P["text"])
+                               bg=P["card2"], fg=P["text"], selectcolor=P["accent_dim"],
+                               activebackground=P["accent_dim"], activeforeground=P["text"],
+                               indicatoron=False, bd=0, highlightthickness=0, padx=14, pady=8,
+                               disabledforeground=P["faint"], cursor="hand2")
         check.pack(anchor="w")
         if not self.base:
             check.configure(state="disabled")
@@ -5180,8 +5276,8 @@ class ConversionAdditionsDialog:
                  bg=P["bg"], fg=P["dim"], anchor="w", justify="left").pack(fill="x", pady=8)
         toolbar = tk.Frame(page, bg=P["bg"])
         toolbar.pack(fill="x", pady=(0, 8))
-        self.view = tk.StringVar(value="XZ")
-        views = ttk.Combobox(toolbar, state="readonly", textvariable=self.view,
+        self.view = tk.StringVar(value="XY")
+        views = dark_combobox(toolbar, state="readonly", textvariable=self.view,
                              values=("XY", "XZ", "YZ", "ISO"), width=8)
         views.pack(side="left")
         views.bind("<<ComboboxSelected>>", lambda e: self.draw())
@@ -5201,8 +5297,9 @@ class ConversionAdditionsDialog:
         listwrap.pack(fill="both", expand=True)
         self.node_list = tk.Listbox(listwrap, selectmode="extended", exportselection=False,
                                    width=37, bg=P["card"], fg=P["text"],
-                                   selectbackground=P["accent_dim"], relief="flat", highlightthickness=0)
-        listscroll = ttk.Scrollbar(listwrap, command=self.node_list.yview)
+                                   selectbackground=P["accent"], selectforeground=P["text"],
+                                   relief="flat", bd=0, highlightthickness=0)
+        listscroll = ttk.Scrollbar(listwrap, style="INP2K.Vertical.TScrollbar", command=self.node_list.yview)
         self.node_list.configure(yscrollcommand=listscroll.set)
         listscroll.pack(side="right", fill="y")
         self.node_list.pack(fill="both", expand=True)
@@ -5222,16 +5319,18 @@ class ConversionAdditionsDialog:
         win.update_idletasks()
         win.grab_set()
 
-    def button(self, parent, text, command):
-        P = PALETTE
-        return tk.Button(parent, text=text, command=command, bg=P["card2"], fg=P["text"],
-                         activebackground=P["accent_dim"], activeforeground=P["text"],
-                         relief="flat", padx=12, pady=7, cursor="hand2")
+    def button(self, parent, text, command, primary=False):
+        P = ADDITIONS_PALETTE
+        return tk.Button(parent, text=text, command=command,
+                         bg=P["accent"] if primary else P["card2"], fg=P["text"],
+                         activebackground=P["accent_hi"] if primary else P["accent_dim"],
+                         activeforeground=P["text"], bd=0, highlightthickness=0,
+                         relief="flat", padx=14, pady=8, cursor="hand2")
 
     def page(self, index):
         for i, page in enumerate(self.pages):
             page.pack_forget()
-            self.nav_buttons[i].configure(bg=PALETTE["accent_dim"] if i == index else PALETTE["card2"])
+            self.nav_buttons[i].configure(bg=ADDITIONS_PALETTE["accent_dim"] if i == index else ADDITIONS_PALETTE["card2"])
         self.pages[index].pack(fill="both", expand=True)
 
     def refresh_files(self, combo):
@@ -5306,7 +5405,7 @@ class ConversionAdditionsDialog:
             xyz = self.cv.node_coord.get(n)
             coord = ", ".join("%.5g" % v for v in xyz) if xyz is not None else "좌표 없음"
             self.node_list.insert("end", "%s %d | %s" % ("×" if n in self.excluded else "●", n, coord))
-            self.node_list.itemconfigure("end", fg=PALETTE["err"] if n in self.excluded else PALETTE["text"])
+            self.node_list.itemconfigure("end", fg=ADDITIONS_PALETTE["err"] if n in self.excluded else ADDITIONS_PALETTE["text"])
         for i in selected:
             self.node_list.selection_set(i)
         self.node_list.yview_moveto(top)
@@ -5329,7 +5428,7 @@ class ConversionAdditionsDialog:
             self.update_nodes()
 
     def draw(self):
-        canvas, P = self.canvas, PALETTE
+        canvas, P = self.canvas, ADDITIONS_PALETTE
         canvas.delete("all")
         w, h = canvas.winfo_width(), canvas.winfo_height()
         if w < 10 or h < 10:
@@ -5340,26 +5439,58 @@ class ConversionAdditionsDialog:
             point = self.cv.node_coord.get(n)
             if point is None:
                 continue
-            x, y, z = point
-            projected[n] = ((x, y) if view == "XY" else (x, z) if view == "XZ" else
-                            (y, z) if view == "YZ" else ((x-y)/math.sqrt(2), (2*z-x-y)/math.sqrt(6)))
+            projected[n] = project_nset_point(point, view)
         self.xy = {}
         if not projected:
             canvas.create_text(w/2, h/2, text="표시할 NSET_BC 좌표가 없습니다.", fill=P["dim"])
+            self.draw_axes(w, h)
             return
         xs, ys = zip(*projected.values())
         xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
-        scale = min(max(1, w-100)/max(xmax-xmin, 1e-9), max(1, h-100)/max(ymax-ymin, 1e-9))
+        # Reserve a footer for the triad so it never covers selectable nodes.
+        plot_top, plot_bottom = 40, max(42, h-145)
+        center_y = (plot_top+plot_bottom)/2
+        scale = min(max(1, w-100)/max(xmax-xmin, 1e-9),
+                    max(1, plot_bottom-plot_top)/max(ymax-ymin, 1e-9))
         canvas.create_text(12, 14, anchor="w", text=view + " · NSET_BC / NSET_BC_PY", fill=P["dim"])
-        canvas.create_text(12, h-16, anchor="w", text="가로/세로: %s · 좌표 단위: 입력 모델과 동일" %
-                           ("등각 투영" if view == "ISO" else "/".join(view)), fill=P["dim"])
         for n, (x, y) in projected.items():
-            px, py = w/2+(x-(xmin+xmax)/2)*scale, h/2-(y-(ymin+ymax)/2)*scale
+            px, py = w/2+(x-(xmin+xmax)/2)*scale, center_y-(y-(ymin+ymax)/2)*scale
             self.xy[n] = (px, py)
             color = P["err"] if n in self.excluded else P["accent"]
             canvas.create_oval(px-5, py-5, px+5, py+5, fill=color, outline=P["text"])
             if len(projected) <= 150:
                 canvas.create_text(px+8, py-9, anchor="w", text=str(n), fill=color)
+        self.draw_axes(w, h)
+
+    def draw_axes(self, width, height):
+        canvas, P = self.canvas, ADDITIONS_PALETTE
+        view = self.view.get()
+        ox, oy, length = 64, height-57, 40
+        canvas.create_line(12, height-121, width-12, height-121, fill=P["line"])
+        canvas.create_text(12, height-107, text="GLOBAL · " + view, anchor="w", fill=P["dim"])
+        # Same projection as the nodes, with screen y inverted exactly once.
+        for label, point in (("X", (1, 0, 0)), ("Y", (0, 1, 0)), ("Z", (0, 0, 1))):
+            dx, dy = project_nset_point(point, view)
+            if math.hypot(dx, dy) < 1e-12:
+                continue
+            ex, ey = ox+length*dx, oy-length*dy
+            canvas.create_line(ox, oy, ex, ey, fill=P["accent"], width=2,
+                               arrow="last", arrowshape=(9, 11, 4))
+            norm = math.hypot(dx, dy)
+            canvas.create_text(ex+11*dx/norm, ey-11*dy/norm, text="+"+label, fill=P["text"])
+        canvas.create_oval(ox-3, oy-3, ox+3, oy+3, fill=P["accent_hi"], outline="")
+        if view != "ISO":
+            label, outward = {"XY": ("Z", True), "XZ": ("Y", False), "YZ": ("X", True)}[view]
+            cx, cy = 150, height-58
+            canvas.create_oval(cx-6, cy-6, cx+6, cy+6, outline=P["accent"], width=2)
+            if outward:
+                canvas.create_oval(cx-2, cy-2, cx+2, cy+2, fill=P["accent"], outline="")
+            else:
+                canvas.create_line(cx-4, cy-4, cx+4, cy+4, fill=P["accent"], width=2)
+                canvas.create_line(cx-4, cy+4, cx+4, cy-4, fill=P["accent"], width=2)
+            canvas.create_text(cx+13, cy, anchor="w", text="+%s · 화면 %s" %
+                               (label, "밖" if outward else "안"), fill=P["dim"])
+        canvas.create_text(width-12, height-13, anchor="e", text="좌표 단위: 입력 모델", fill=P["dim"])
 
     def press(self, event):
         self.drag_start = (event.x, event.y)
@@ -5368,7 +5499,7 @@ class ConversionAdditionsDialog:
         if self.drag_start:
             self.canvas.delete("selection_box")
             self.canvas.create_rectangle(*self.drag_start, event.x, event.y,
-                                         outline=PALETTE["warn"], dash=(4, 3), tags="selection_box")
+                                         outline=ADDITIONS_PALETTE["accent_hi"], dash=(4, 3), tags="selection_box")
 
     def release(self, event):
         if self.drag_start is None:
@@ -5554,10 +5685,34 @@ def run_gui():
     # ---------- 파일 ----------
     c1, f1 = card(wrap, "입력 파일", F_HD)
     c1.pack(fill="x", pady=(14, 0))
-    pathvar = tk.StringVar(value="선택된 파일이 없습니다")
+    pathvar = tk.StringVar(value="Abaqus 입력 파일을 선택하세요")
     outvar = tk.StringVar(value="")
-    tk.Label(f1, textvariable=pathvar, bg=P["card"], fg=P["text"], font=F_BODY,
-             anchor="w").pack(fill="x")
+    drop_zone = tk.Frame(f1, bg=P["card2"], highlightthickness=1,
+                         highlightbackground=P["line"], padx=14, pady=10)
+    drop_zone.pack(fill="x")
+    path_label = tk.Label(drop_zone, textvariable=pathvar, bg=P["card2"],
+                          fg=P["text"], font=F_BODY, anchor="w")
+    path_label.pack(fill="x")
+    drop_row = tk.Frame(drop_zone, bg=P["card2"])
+    drop_row.pack(fill="x", pady=(5, 0))
+    drop_hint = tk.StringVar(value="파일 드롭 기능 확인 중…")
+    drop_label = tk.Label(drop_row, textvariable=drop_hint, bg=P["card2"],
+                          fg=P["dim"], font=F_SM, anchor="w")
+    drop_label.pack(side="left", fill="x", expand=True)
+
+    def load_input(path):
+        if state["busy"]:
+            return False
+        p = os.path.abspath(os.path.expanduser(path))
+        size = os.path.getsize(p)
+        if not os.path.isfile(p):
+            raise ValueError("입력 파일을 선택해 주세요.")
+        state["path"] = p
+        pathvar.set("%s   ·   %.1f MB" % (os.path.basename(p), size / 1048576.0))
+        state["out"] = default_dyna_path(p)
+        outvar.set(state["out"])
+        btn_run.config(enabled=True)
+        return True
 
     def pick():
         if state["busy"]:
@@ -5567,15 +5722,77 @@ def run_gui():
             filetypes=[("Abaqus deck", "*.inp *.dat *.blk *.inc"), ("모든 파일", "*.*")])
         if not p:
             return
-        state["path"] = p
-        pathvar.set("%s   ·   %.1f MB" % (os.path.basename(p),
-                                          os.path.getsize(p) / 1048576.0))
-        state["out"] = os.path.splitext(p)[0] + ".k"
-        outvar.set(state["out"])
-        btn_run.config(enabled=True)
+        try:
+            load_input(p)
+        except (OSError, ValueError) as exc:
+            from tkinter import messagebox
+            messagebox.showerror("입력 파일", str(exc), parent=root)
+
+    def register_drop():
+        from tkinterdnd2 import DND_FILES, COPY, REFUSE_DROP, TkinterDnD
+        # Public require() supports an existing Tk root; older releases expose
+        # the same loader as _require. No second/hidden root is created.
+        require = getattr(TkinterDnD, "require", None) or TkinterDnD._require
+        if not getattr(root, "_inp2k_dnd_ready", False):
+            require(root)
+            root._inp2k_dnd_ready = True
+
+        def enter(event):
+            drop_zone.configure(highlightbackground=P["line"] if state["busy"] else "#3182F6")
+            return REFUSE_DROP if state["busy"] else COPY
+
+        def leave(event):
+            drop_zone.configure(highlightbackground=P["line"])
+
+        def dropped(event):
+            leave(event)
+            if state["busy"]:
+                return REFUSE_DROP
+            try:
+                load_input(dropped_input_path(event.data, root.tk))
+            except (OSError, ValueError, tk.TclError) as exc:
+                from tkinter import messagebox
+                messagebox.showerror("파일 드롭", str(exc), parent=root)
+                return REFUSE_DROP
+            return COPY
+
+        for widget in (drop_zone, path_label, drop_row, drop_label):
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<DropEnter>>", enter)
+            widget.dnd_bind("<<DropPosition>>", enter)
+            widget.dnd_bind("<<DropLeave>>", leave)
+            widget.dnd_bind("<<Drop>>", dropped)
+        drop_hint.set("이 영역에 파일을 드롭하세요 · .inp / .dat / .blk / .inc")
+        btn_drop.cv.pack_forget()
+
+    def install_drop():
+        if state["busy"] or state.get("drop_installing"):
+            return
+        state["drop_installing"] = True
+        btn_drop.config(text="설치 중…", enabled=False)
+        drop_hint.set("드롭 기능을 준비하고 있습니다…")
+        def job():
+            import subprocess
+            try:
+                result = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "tkinterdnd2"],
+                    capture_output=True, text=True, timeout=180,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                q.put(("drop_install", result.returncode,
+                       ((result.stdout or "") + (result.stderr or ""))[-1000:]))
+            except Exception as exc:
+                q.put(("drop_install", 1, str(exc)))
+        threading.Thread(target=job, daemon=True).start()
+
+    btn_drop = RButton(drop_row, "드롭 활성화", install_drop, kind="ghost", w=110, h=28, font=F_SM)
+    btn_drop.pack(side="right", padx=(8, 0))
 
     def pick_out():
+        if state["busy"]:
+            return
+        current = outvar.get().strip() or (default_dyna_path(state["path"]) if state["path"] else "")
         p = filedialog.asksaveasfilename(defaultextension=".k",
+                                         initialdir=os.path.dirname(current) or None,
+                                         initialfile=os.path.basename(current),
                                          filetypes=[("LS-DYNA keyword", "*.k *.key")])
         if p:
             state["out"] = p
@@ -5882,7 +6099,7 @@ def run_gui():
     def start():
         if state["busy"] or not state["path"]:
             return
-        out = outvar.get().strip() or (os.path.splitext(state["path"])[0] + ".k")
+        out = outvar.get().strip() or default_dyna_path(state["path"])
         state["out"] = out
         opt = dict(DEFAULT_OPT)
         for k, s_ in sw.items():
@@ -5945,6 +6162,20 @@ def run_gui():
                             text=("설치했습니다. 프로그램을 껐다 켜면 가속이 적용됩니다."
                                   if code == 0 else "설치 실패 — 로그를 확인하세요."))
                     add_line("ok" if code == 0 else "err", msg.strip()[-600:])
+                elif it[0] == "drop_install":
+                    state["drop_installing"] = False
+                    code, details = it[1], it[2]
+                    try:
+                        if code:
+                            raise RuntimeError(details)
+                        import importlib
+                        importlib.invalidate_caches()
+                        register_drop()
+                        add_line("ok", "파일 드롭을 활성화했습니다. 입력 영역에 파일을 드롭하세요.")
+                    except Exception as exc:
+                        btn_drop.config(text="활성화 재시도", enabled=True)
+                        drop_hint.set("드롭 준비 실패 · 파일 선택 버튼은 바로 사용할 수 있습니다.")
+                        add_line("err", "드롭 활성화 실패: %s" % exc)
                 elif it[0] == "done":
                     state["busy"] = False
                     btn_run.config(text="변환 실행", enabled=True)
@@ -5988,6 +6219,10 @@ def run_gui():
             pass
         root.after(100, poll)
 
+    try:
+        register_drop()
+    except Exception:
+        drop_hint.set("드롭을 사용하려면 ‘드롭 활성화’를 누르세요. 파일 선택도 가능합니다.")
     poll()
     root.mainloop()
     return 0
@@ -6152,7 +6387,7 @@ def main():
                ctrl=False, tet10=args.tet10,
                shell=args.shell, unit=args.unit, mu=args.mu,
                neg_elform_names=args.neg_elform_names)
-    out = args.out or (os.path.splitext(args.input)[0] + ".k")
+    out = args.out or default_dyna_path(args.input)
 
     def sink(lv, m):
         tag = {"info": "  ", "ok": "  ", "warn": "! ", "err": "X "}[lv]
