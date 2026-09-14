@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-INP2K v2.13 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
+INP2K v2.14 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
 
-v2.13 주요 변경 사항
+v2.14 주요 변경 사항
+- Solid(육면체) ELFORM: auto, 1, 2, -1, -2, -18, 18, 62.
+- Shell ELFORM: auto, 1, 2, 3, 4, 6, 7, 8, 10, 11, 16, -16, 17, 18, 20, 21, 30.
+  3/4/17은 삼각형 전용이며 사각형을 포함한 프로퍼티는 auto로 유지합니다.
+  Solid 18은 implicit 전용입니다. 재료/해석법별 적합성과 Hourglass는 사용자가 확인하세요.
+- PAD/TA/ADHESIVE 이름 규칙의 ELFORM을 별도 선택합니다(기존 JSON은 -1 유지).
+- 개별/전체 접촉 각각 39개 변수: 기본 카드 및 선택 카드 A/B/C.
+  추가 30개 변수는 모두 공란이며, C 카드의 예약 필드도 공백을 유지합니다.
+  A/B/C는 비-TIE 접촉에만 적용하며, B의 ISYM은 eroding 필수 카드와 별개입니다.
+- 상세 설정 스크롤, --solid / --name-elform CLI 추가. 기존 JSON 자동 읽기 유지.
+  선택지/필드 위치 참조: https://github.com/ansys/pydyna/tree/main/src/ansys/dyna/core/keywords/keyword_classes/auto
+
+이전 버전: v2.13 주요 변경 사항
 - 상세 설정의 숫자 항목을 비우면 K 파일에서도 해당 필드를 공백으로 출력합니다.
 - 전체 접촉은 개별 접촉 설정을 상속하지 않습니다. 공란은 LS-DYNA 기본 처리에 맡깁니다.
 - Hourglass 공란과 JSON의 공란/null을 유지하며, 이전 JSON에서 생략된 숫자 항목도 공란으로 읽습니다.
@@ -255,7 +267,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.13"
+VERSION = "2.14"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -2643,9 +2655,9 @@ class Converter:
                 and neg_elform_name(title or sec["elset"])):
             # Name rule overrides the global solid ELFORM choice (hexa only).
             if {c["sub"] for c in classes} <= {"hex8", "hex20"}:
-                S["elform"] = -1
-                self.log.info('프로퍼티 "%s": PAD/TA/ADHESIVE 이름 규칙으로 ELFORM=-1'
-                              % (title or sec["elset"]))
+                S["elform"] = int(self.opt.get("name_elform", "-1"))
+                self.log.info('프로퍼티 "%s": PAD/TA/ADHESIVE 이름 규칙으로 ELFORM=%s'
+                              % (title or sec["elset"], S["elform"]))
             else:
                 self.log.warn('프로퍼티 "%s": PAD/TA/ADHESIVE 이름이지만 육면체 외 요소가 있어 '
                               'ELFORM=%s 유지' % (title or sec["elset"], S["elform"]))
@@ -2671,6 +2683,10 @@ class Converter:
                 S["elform"] = 2 if cls["red"] else 16
             else:
                 S["elform"] = int(opt["shell"])
+                if S["elform"] in (3, 4, 17) and cls["sub"] in ("quad4", "quad8"):
+                    self.log.warn('쉘 "%s": ELFORM %s는 삼각형 전용이므로 auto로 유지합니다.'
+                                  % (sec["elset"], S["elform"]))
+                    S["elform"] = 2 if cls["red"] else 16
             th = 0.0
             if sec["data"] and sec["data"][0]:
                 try:
@@ -4122,47 +4138,39 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         # Keep source values for API callers that supply no detail setting.
         return c.get(k, {"vdc": 20, "sst": 0, "mst": 0}.get(k))
 
-    def contact10(value):
-        return " " * 10 if value is None else f10(value)
+    def contact_card(c, fields):
+        put("$#" + (fields[0] or "").rjust(8)
+            + "".join((k or "").rjust(10) for k in fields[1:]))
+        values = []
+        for k in fields:
+            value = contact_opt(c, k) if k else None
+            values.append(" " * 10 if value is None else
+                          i10(value) if k in CONTACT_INTEGER_FIELDS else f10(value))
+        put("".join(values))
 
     for original in getattr(cv, "contacts", []):
         c = dict(original)
-        for k in ("fs", "fd", "vdc", "sst", "mst"):
-            c[k] = contact_opt(c, k)
         put("*CONTACT_" + c["kind"])
         put("$#     cid                                                               heading")
         put(i10(c["cid"]) + c["title"][:70])
         put("$#    ssid      msid     sstyp     mstyp    sboxid    mboxid       spr       mpr")
         put(i10(c["ssid"]) + i10(c["msid"]) + i10(c["sstyp"]) + i10(c["mstyp"])
             + i10(0) * 2 + i10(1) * 2)
-        put("$#      fs        fd        dc        vc       vdc    penchk        bt        dt")
         tied = c["kind"].startswith("TIED_")
-        if tied:
-            put(contact10(c["fs"]) + contact10(c["fd"]) + " " * 20
-                + contact10(c["vdc"]) + i10(0) + " " * 20)
-        else:
-            put(contact10(c["fs"]) + contact10(c["fd"]) + f10(0) * 2 + contact10(c["vdc"]) + i10(0) + f10(0) + f10(1e20))
-        put("$#     sfs       sfm       sst       mst      sfst      sfmt       fsf       vsf")
-        if tied:
-            put(" " * 20 + contact10(c["sst"]) + contact10(c["mst"]) + " " * 40)
-        else:
-            put(f10(1) * 2 + contact10(c["sst"]) + contact10(c["mst"]) + f10(1) * 4)
+        for _, fields in CONTACT_CARDS[:2]:
+            contact_card(c, fields)
         if c["kind"].startswith("ERODING_"):
             # Required eroding card precedes optional contact card A.
             # Layout: ansys/pydyna auto/contact/contact_eroding_single_surface.py.
             put("$#    isym    erosop      iadj")
             put(i10(0) * 3)
-        if not tied and any(contact_opt(c, k) is not None
-                            for k in ("soft", "sbopt", "depth", "bsort")):
-            put("$#    soft    sofscl    lcidab    maxpar     sbopt     depth     bsort    frcfrq")
-            put("".join(" " * 10 if value is None else
-                        (i10(value) if integer else f10(value))
-                        for value, integer in (
-                            (contact_opt(c, "soft"), True),
-                            (.1, False), (0, True), (1.025, False),
-                            (contact_opt(c, "sbopt"), True),
-                            (contact_opt(c, "depth"), True),
-                            (contact_opt(c, "bsort"), True), (1, True))))
+        if not tied:
+            optional = CONTACT_CARDS[2:]
+            last = max((index for index, (_, fields) in enumerate(optional)
+                        if any(contact_opt(c, k) is not None for k in fields if k)), default=-1)
+            # Positional cards: C requires A and B, even when those are blank.
+            for _, fields in optional[:last + 1]:
+                contact_card(c, fields)
 
     put("*END")
     size = W.tell()
@@ -4179,7 +4187,7 @@ def write_k(cv, opt, out_path, src_name, progress=None):
 # 전체 파이프라인
 # ============================================================
 DEFAULT_OPT = dict(sets=True, mat=True, bc=True, ctrl=False, tet10=True, neg_elform_names=False,
-                   beamNode=True, contact=True, mu=0.2, shell="auto", unit="mmts", auto_sets=True, solid="auto", all_contact="ERODING_SINGLE_SURFACE")
+                   beamNode=True, contact=True, mu=0.2, shell="auto", unit="mmts", auto_sets=True, solid="auto", name_elform="-1", all_contact="ERODING_SINGLE_SURFACE")
 
 
 BOOL_DETAIL_KEYS = ("neg_elform_names",)
@@ -4191,19 +4199,34 @@ def bool_text(value):
 # SST/MST < 0: LS-DYNA uses |value| as the contact thickness itself.
 NEGATIVE_DETAIL_KEYS = ("contact_bsort", "contact_sst", "contact_mst",
                         "all_contact_bsort", "all_contact_sst", "all_contact_mst")
-CONTACT_FIELDS = ("fs", "fd", "vdc", "sst", "mst", "soft", "sbopt", "depth", "bsort")
-DETAIL_CHOICE_KEYS = ("solid", "shell", "all_contact")
+SOLID_ELFORMS = ("auto", "1", "2", "-1", "-2", "-18", "18", "62")
+SHELL_ELFORMS = ("auto", "1", "2", "3", "4", "6", "7", "8", "10", "11",
+                 "16", "-16", "17", "18", "20", "21", "30")
+CONTACT_CARDS = (
+    ("기본 · 마찰", ("fs", "fd", "dc", "vc", "vdc", "penchk", "bt", "dt")),
+    ("기본 · 강성/두께", ("sfs", "sfm", "sst", "mst", "sfst", "sfmt", "fsf", "vsf")),
+    ("A", ("soft", "sofscl", "lcidab", "maxpar", "sbopt", "depth", "bsort", "frcfrq")),
+    ("B", ("penmax", "thkopt", "shlthk", "snlog", "isym", "i2d3d", "sldthk", "sldstf")),
+    ("C", ("igap", "ignore", "dprfac", "dtstif", "edgek", None, "flangl", "cid_rcf")),
+)
+CONTACT_FIELDS = tuple(k for _, fields in CONTACT_CARDS for k in fields if k)
+CONTACT_INTEGER_FIELDS = frozenset(("penchk", "soft", "lcidab", "sbopt", "depth", "bsort",
+    "frcfrq", "thkopt", "shlthk", "snlog", "isym", "i2d3d", "igap", "ignore", "cid_rcf"))
+NEGATIVE_DETAIL_KEYS += tuple(prefix + k for prefix in ("contact_", "all_contact_")
+                              for k in ("igap", "dprfac", "dtstif"))
+DETAIL_CHOICE_KEYS = ("solid", "shell", "name_elform", "all_contact")
 
 
 def detail_defaults():
     result = dict(solid="auto", shell="auto", all_contact="ERODING_SINGLE_SURFACE",
-                  neg_elform_names=False)
+                  neg_elform_names=False, name_elform="-1")
     # Numeric blanks are explicit empty keyword fields. Visible initial values remain.
     for k, value in dict(fs="", fd="", vdc=20, sst=0, mst=0,
                          soft="", sbopt="", depth="", bsort="").items():
         result["contact_"+k] = value
     # v2.13: whole-model contact is independent; blank stays blank.
     for k in CONTACT_FIELDS:
+        result.setdefault("contact_"+k, "")
         result["all_contact_"+k] = ""
     for kind, vals in HOURGLASS_DEFAULTS.items():
         defaults = dict(zip(("ihq", "qm", "qb", "qw"), vals))
@@ -4281,13 +4304,15 @@ def parse_detail_settings(raw):
                 raise ValueError("전체 접촉 종류를 확인하세요.")
             result[key] = text
             continue
-        if key in ("shell", "solid"):
-            choices = ("auto", "2", "16") if key == "shell" else ("auto", "1", "2")
+        if key in ("shell", "solid", "name_elform"):
+            choices = SHELL_ELFORMS if key == "shell" else (SOLID_ELFORMS[1:] if key == "name_elform" else SOLID_ELFORMS)
             if text not in choices:
                 raise ValueError(key + ": 지원하지 않는 ELFORM")
             result[key] = text
             continue
-        integer = key.rsplit("_", 1)[-1] in ("ihq", "ibq", "soft", "sbopt", "depth", "bsort")
+        field = key[len("all_contact_"):] if key.startswith("all_contact_") else key[len("contact_"):]
+        integer = (field in CONTACT_INTEGER_FIELDS if "contact_" in key
+                   else key.rsplit("_", 1)[-1] in ("ihq", "ibq"))
         try:
             value = float(text)
             if not math.isfinite(value) or (integer and value != int(value)):
@@ -5911,10 +5936,12 @@ def run_gui():
         groups = [
             ("Formulation", [("all_contact", "전체 접촉", "ERODING_SINGLE_SURFACE"),
                              ("solid", "Solid ELFORM (육면체 전용)", "auto"),
-                             ("shell", "Shell ELFORM", "auto")]),
-            ("Contact", [("contact_"+k, k.upper(), detail_defaults()["contact_"+k])
-                         for k in CONTACT_FIELDS]),
-            ("Whole contact", [("all_contact_"+k, k.upper(), "") for k in CONTACT_FIELDS]),
+                             ("shell", "Shell ELFORM", "auto"),
+                             ("name_elform", "PAD · TA · ADHESIVE ELFORM (이름 규칙 ON 시)", "-1")]),
+            ("Contact", [("contact_"+k, group+" / "+k.upper(), detail_defaults()["contact_"+k])
+                         for group, keys in CONTACT_CARDS for k in keys if k]),
+            ("Whole contact", [("all_contact_"+k, group+" / "+k.upper(), "")
+                               for group, keys in CONTACT_CARDS for k in keys if k]),
         ]
         for kind in ("shell", "solid"):
             defaults = dict(zip(("ihq", "qm", "qb", "qw"), HOURGLASS_DEFAULTS[kind]))
@@ -5923,15 +5950,27 @@ def run_gui():
                            for k in ("ihq", "qm", "ibq", "q1", "q2", "qb", "qw")]))
         titles = ("요소 · 전체 접촉", "개별 접촉 계수", "전체 접촉 계수", "쉘 Hourglass", "솔리드 Hourglass")
         notes = (
-            "전체 접촉은 ELSET_ALL(900001)에 적용합니다.\n순수 C3D10은 ELFORM 16 유지 · Solid 지정은 육면체 전용",
-            "숫자 공란: K 파일에 공백 출력 · SST·MST 음수 입력 가능(두께 절댓값)\nSOFT · SBOPT · DEPTH · BSORT는 비-TIE 접촉에 적용",
-            "ELSET_ALL / GENERAL_CONTACT에 적용하며 개별 접촉과 독립적입니다.\n숫자 공란은 공백 출력 · SST·MST 음수 입력 가능(두께 절댓값)",
+            "Solid 지정/이름 규칙은 육면체 전용 · C3D10은 기존 처리 유지\nSolid 18: implicit 전용 · Shell 3/4/17: 삼각형 전용 · 재료/HG 호환성 확인",
+            "숫자 공란: K 파일에 공백 출력 · 추가 변수 기본값은 공란\nA/B/C는 비-TIE 전용 · B/ISYM은 eroding 필수 카드 ISYM과 별개",
+            "ELSET_ALL / GENERAL_CONTACT에 적용하며 개별 접촉과 독립적입니다.\n공란은 공백 출력 · 선택 카드 A/B/C는 필요한 마지막 카드까지만 출력",
             "쉘 PART가 공유하는 HGID 1의 설정입니다. 숫자 공란은 공백으로 출력합니다.",
             "솔리드 PART가 공유하는 HGID 2의 설정입니다. 숫자 공란은 공백으로 출력합니다.")
         for index, (title, fields) in enumerate(groups):
             tab = tk.Frame(page_host, bg=P["card"])
             tab.grid(row=0, column=0, sticky="nsew")
             pages.append(tab)
+            # Keep the footer visible; each page scrolls independently.
+            scroller = tk.Canvas(tab, bg=P["card"], height=350, highlightthickness=0, bd=0)
+            scrollbar = DarkScrollbar(tab, command=scroller.yview, width=12)
+            scrollbar.pack(side="right", fill="y")
+            scroller.pack(side="left", fill="both", expand=True)
+            scroller.configure(yscrollcommand=scrollbar.set)
+            tab = tk.Frame(scroller, bg=P["card"])
+            window = scroller.create_window(0, 0, window=tab, anchor="nw")
+            tab.bind("<Configure>", lambda event, cv=scroller:
+                     cv.configure(scrollregion=cv.bbox("all")))
+            scroller.bind("<Configure>", lambda event, cv=scroller, item=window:
+                          cv.itemconfigure(item, width=event.width))
             button = RButton(nav, titles[index], lambda i=index: select_page(i),
                              kind="ghost", w=150, h=36, font=F_BODY)
             button.pack(side="left", padx=(0, 8))
@@ -5954,10 +5993,11 @@ def run_gui():
                          anchor="w").pack(fill="x", pady=(0, 5))
                 var = tk.StringVar(value=detail_text(detail.get(key, "")))
                 variables[key] = var
-                if key in ("all_contact", "solid", "shell"):
+                if key in DETAIL_CHOICE_KEYS:
                     choices = (("AUTOMATIC_SINGLE_SURFACE", "ERODING_SINGLE_SURFACE")
                                if key == "all_contact" else
-                               ("auto", "1", "2") if key == "solid" else ("auto", "2", "16"))
+                               SOLID_ELFORMS if key == "solid" else
+                               SOLID_ELFORMS[1:] if key == "name_elform" else SHELL_ELFORMS)
                     entry = tk.OptionMenu(cell, var, *choices)
                     entry.configure(font=F_BODY, bg=P["card2"], fg=P["text"],
                         activebackground=P["accent_dim"], activeforeground=P["text"],
@@ -5976,15 +6016,28 @@ def run_gui():
                         highlightbackground=P["line"], highlightcolor=P["accent"])
                     entry.pack(fill="x", ipady=7)
             if index == 0:
-                # v2.5: PAD / TA / ADHESIVE property names -> solid ELFORM -1
+                # Keep the legacy boolean JSON key; select the value separately.
                 var = tk.StringVar(value=bool_text(detail.get("neg_elform_names")))
                 variables["neg_elform_names"] = var
-                tk.Checkbutton(tab, text="PAD · TA · ADHESIVE → ELFORM -1",
+                tk.Checkbutton(tab, text="PAD · TA · ADHESIVE 이름 규칙 사용 (위 선택값 적용)",
                     variable=var, onvalue="1", offvalue="0", font=F_BODY,
                     bg=P["card"], fg=P["text"], activebackground=P["card"],
                     activeforeground=P["text"], selectcolor=P["card2"],
                     highlightthickness=0, bd=0, anchor="w", cursor="hand2"
                     ).pack(fill="x", pady=(2, 6))
+            def wheel(event, cv=scroller):
+                if cv.yview() == (0.0, 1.0):
+                    return
+                step = -1 if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else 1
+                cv.yview_scroll(step * 3, "units")
+                return "break"
+            def bind_wheel(widget, callback=wheel):
+                for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    widget.bind(sequence, callback)
+                for child in widget.winfo_children():
+                    if not isinstance(child, tk.Menu):
+                        bind_wheel(child, callback)
+            bind_wheel(scroller)
         select_page(0)
         def save_json():
             try:
@@ -6391,11 +6444,14 @@ def main():
     ap.add_argument("--no-contact", action="store_true", help="접촉·구속 변환 안 함")
     ap.add_argument("--no-ctrl", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--tet10", action="store_true", help="C3D10 전용 프로퍼티에서 2차 사면체 유지 (혼합 프로퍼티는 코너 축약)")
-    ap.add_argument("--shell", default=None, choices=["auto", "2", "16"])
+    ap.add_argument("--shell", default=None, choices=SHELL_ELFORMS)
+    ap.add_argument("--solid", default=None, choices=SOLID_ELFORMS, help="육면체 Solid ELFORM")
+    ap.add_argument("--name-elform", default=None, choices=SOLID_ELFORMS[1:],
+                    help="PAD/TA/ADHESIVE 이름 규칙 ELFORM (규칙 사용 시 적용)")
     ap.add_argument("--unit", default="mmts", choices=list(UNIT_DEFAULT))
     ap.add_argument("--mu", type=float, default=None, help="개별 접촉 FS/FD 명시 지정 (설정 JSON보다 우선)")
     ap.add_argument("--neg-elform-names", action="store_true", default=None,
-                    help="PAD/TA/ADHESIVE 이름의 육면체 솔리드 프로퍼티를 ELFORM -1로")
+                    help="PAD/TA/ADHESIVE 이름 규칙 사용 (기본 -1, --name-elform으로 변경)")
     ap.add_argument("--check", action="store_true",
                     help="환경 진단 및 자체 시험 (실행이 안 될 때)")
     ap.add_argument("--shock", action="store_true", help="INP 없이 Shock 속도 .k 파일 생성 (s, mm/s)")
@@ -6439,6 +6495,10 @@ def main():
                ctrl=False, tet10=args.tet10, unit=args.unit)
     if args.shell is not None:
         opt["shell"] = args.shell
+    if args.solid is not None:
+        opt["solid"] = args.solid
+    if args.name_elform is not None:
+        opt["name_elform"] = args.name_elform
     if args.mu is not None:
         opt.update(mu=args.mu, contact_fs=args.mu, contact_fd=args.mu)
     if args.neg_elform_names is not None:
