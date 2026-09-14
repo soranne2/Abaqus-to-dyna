@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-INP2K v2.12 | Abaqus INP -> LS-DYNA keyword (.k) 변환기
+INP2K v2.13 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
 
-v2.12 주요 변경 사항
+v2.13 주요 변경 사항
+- 상세 설정의 숫자 항목을 비우면 K 파일에서도 해당 필드를 공백으로 출력합니다.
+- 전체 접촉은 개별 접촉 설정을 상속하지 않습니다. 공란은 LS-DYNA 기본 처리에 맡깁니다.
+- Hourglass 공란과 JSON의 공란/null을 유지하며, 이전 JSON에서 생략된 숫자 항목도 공란으로 읽습니다.
+- GUI/INP CLI 실행 시 이 py와 같은 폴더의 inp2k-settings.json을 자동으로 읽습니다.
+  자동 불러오기 후 GUI에서 수정하거나 CLI에 명시한 값이 우선합니다.
+
+이전 버전: v2.12 주요 변경 사항
 - 기본 출력명: model.inp -> model_DYNA.k
 - 입력 파일 드래그 앤 드롭 지원 (tkinterdnd2 필요, GUI에서 활성화).
 - Erosion/NSET 설정 창을 블랙+토스블루 톤으로 통일.
@@ -248,7 +255,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.12"
+VERSION = "2.13"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -2015,15 +2022,16 @@ class Converter:
                             for values in [HOURGLASS_DEFAULTS[kind]]]
         for hg in self.hourglasses:
             for field in ("ihq", "qm", "ibq", "q1", "q2", "qb", "qw"):
-                value = self.opt.get("hg_" + hg["rule"] + "_" + field)
-                if value is not None:
-                    hg[field] = value
+                key = "hg_" + hg["rule"] + "_" + field
+                if key in self.opt:
+                    # None is an explicit blank, not a request for our old default.
+                    hg[field] = self.opt[key]
         n = 0
         for p in self.parts:
             p["hgid"] = {"shell": 1, "solid": 2}.get(sections[p["secid"]].get("kind"), 0)
             n += bool(p["hgid"])
         self.log.ok("공통 *HOURGLASS 2개 생성: 쉘 HGID=1, 솔리드 HGID=2 · PART %d개 연결" % n)
-        self.log.info("Hourglass는 준정적·저속 해석용 초기값이며, 실제 작동 여부는 요소 적분 공식에 따릅니다.")
+        self.log.info("Hourglass 숫자 공란은 공백으로 출력합니다. 실제 작동 여부는 요소 적분 공식에 따릅니다.")
 
     # ---------- v2.5 마운팅 노드 ----------
     def source_set_bindings(self, src):
@@ -4105,16 +4113,22 @@ def write_k(cv, opt, out_path, src_name, progress=None):
             put(i10(nid) + i10(dof) + f10(coef))
 
     def contact_opt(c, k):
-        """Whole-model contact: its own value first, then the per-contact value."""
-        if c.get("whole") and opt.get("all_contact_" + k) is not None:
-            return opt["all_contact_" + k]
-        return opt.get("contact_" + k)
+        """Whole-contact settings are independent; explicit blanks stay blank."""
+        if c.get("whole"):
+            return opt.get("all_contact_" + k)
+        key = "contact_" + k
+        if key in opt:
+            return opt[key]
+        # Keep source values for API callers that supply no detail setting.
+        return c.get(k, {"vdc": 20, "sst": 0, "mst": 0}.get(k))
+
+    def contact10(value):
+        return " " * 10 if value is None else f10(value)
 
     for original in getattr(cv, "contacts", []):
         c = dict(original)
         for k in ("fs", "fd", "vdc", "sst", "mst"):
-            if contact_opt(c, k) is not None:
-                c[k] = contact_opt(c, k)
+            c[k] = contact_opt(c, k)
         put("*CONTACT_" + c["kind"])
         put("$#     cid                                                               heading")
         put(i10(c["cid"]) + c["title"][:70])
@@ -4124,15 +4138,15 @@ def write_k(cv, opt, out_path, src_name, progress=None):
         put("$#      fs        fd        dc        vc       vdc    penchk        bt        dt")
         tied = c["kind"].startswith("TIED_")
         if tied:
-            put(f10(c["fs"]) + f10(c["fd"]) + " " * 20
-                + f10(c.get("vdc", 20)) + i10(0) + " " * 20)
+            put(contact10(c["fs"]) + contact10(c["fd"]) + " " * 20
+                + contact10(c["vdc"]) + i10(0) + " " * 20)
         else:
-            put(f10(c["fs"]) + f10(c["fd"]) + f10(0) * 2 + f10(c.get("vdc", 20)) + i10(0) + f10(0) + f10(1e20))
+            put(contact10(c["fs"]) + contact10(c["fd"]) + f10(0) * 2 + contact10(c["vdc"]) + i10(0) + f10(0) + f10(1e20))
         put("$#     sfs       sfm       sst       mst      sfst      sfmt       fsf       vsf")
         if tied:
-            put(" " * 20 + f10(c.get("sst", 0)) + f10(c.get("mst", 0)) + " " * 40)
+            put(" " * 20 + contact10(c["sst"]) + contact10(c["mst"]) + " " * 40)
         else:
-            put(f10(1) * 2 + f10(c.get("sst", 0)) + f10(c.get("mst", 0)) + f10(1) * 4)
+            put(f10(1) * 2 + contact10(c["sst"]) + contact10(c["mst"]) + f10(1) * 4)
         if c["kind"].startswith("ERODING_"):
             # Required eroding card precedes optional contact card A.
             # Layout: ansys/pydyna auto/contact/contact_eroding_single_surface.py.
@@ -4144,10 +4158,10 @@ def write_k(cv, opt, out_path, src_name, progress=None):
             put("".join(" " * 10 if value is None else
                         (i10(value) if integer else f10(value))
                         for value, integer in (
-                            (contact_opt(c, "soft") if contact_opt(c, "soft") is not None else 0, True),
+                            (contact_opt(c, "soft"), True),
                             (.1, False), (0, True), (1.025, False),
-                            (contact_opt(c, "sbopt") if contact_opt(c, "sbopt") is not None else 2, True),
-                            (contact_opt(c, "depth") if contact_opt(c, "depth") is not None else 2, True),
+                            (contact_opt(c, "sbopt"), True),
+                            (contact_opt(c, "depth"), True),
                             (contact_opt(c, "bsort"), True), (1, True))))
 
     put("*END")
@@ -4178,16 +4192,17 @@ def bool_text(value):
 NEGATIVE_DETAIL_KEYS = ("contact_bsort", "contact_sst", "contact_mst",
                         "all_contact_bsort", "all_contact_sst", "all_contact_mst")
 CONTACT_FIELDS = ("fs", "fd", "vdc", "sst", "mst", "soft", "sbopt", "depth", "bsort")
+DETAIL_CHOICE_KEYS = ("solid", "shell", "all_contact")
 
 
 def detail_defaults():
     result = dict(solid="auto", shell="auto", all_contact="ERODING_SINGLE_SURFACE",
                   neg_elform_names=False)
-    # Blank FS/FD preserves each source interaction's friction coefficient.
+    # Numeric blanks are explicit empty keyword fields. Visible initial values remain.
     for k, value in dict(fs="", fd="", vdc=20, sst=0, mst=0,
                          soft="", sbopt="", depth="", bsort="").items():
         result["contact_"+k] = value
-    # v2.6: whole-model contact; blank follows the per-contact value.
+    # v2.13: whole-model contact is independent; blank stays blank.
     for k in CONTACT_FIELDS:
         result["all_contact_"+k] = ""
     for kind, vals in HOURGLASS_DEFAULTS.items():
@@ -4211,11 +4226,32 @@ def load_detail_settings(path):
         data = json.load(stream)
     if not isinstance(data, dict) or data.get("format") != "inp2k-settings" or data.get("schema_version") != 1:
         raise ValueError("INP2K 설정 JSON 형식/버전이 아닙니다.")
-    return parse_detail_settings(data.get("settings"))
+    values = parse_detail_settings(data.get("settings"))
+    # v2.12 omitted empty fields when saving. Do not refill those old blanks.
+    for key in detail_defaults():
+        if key not in BOOL_DETAIL_KEYS + DETAIL_CHOICE_KEYS:
+            values.setdefault(key, None)
+    return values
+
+
+def load_startup_detail_settings(directory=None):
+    """Load the preset beside this script once; later UI/CLI edits take priority."""
+    values = parse_detail_settings(detail_defaults())
+    directory = directory or os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(directory, "inp2k-settings.json")
+    if not os.path.exists(path):
+        return values, None
+    values.update(load_detail_settings(path))
+    return values, path
+
+
+def detail_text(value):
+    """Tk entries must show JSON null/explicit blank as an empty string."""
+    return "" if value is None else str(value)
 
 
 def parse_detail_settings(raw):
-    """Validate before any output is opened. Blank fields preserve old behavior."""
+    """Validate before output; retain numeric blanks as None, including JSON null."""
     if not isinstance(raw, dict):
         raise ValueError("설정은 JSON 객체여야 합니다.")
     allowed = set(detail_defaults())
@@ -4235,8 +4271,10 @@ def parse_detail_settings(raw):
             else:
                 raise ValueError(key + ": true/false 값을 입력하세요.")
             continue
-        text = str(text).strip()
+        text = detail_text(text).strip()
         if not text:
+            if key not in DETAIL_CHOICE_KEYS:
+                result[key] = None
             continue
         if key == "all_contact":
             if text not in ("AUTOMATIC_SINGLE_SURFACE", "ERODING_SINGLE_SURFACE"):
@@ -5829,7 +5867,12 @@ def run_gui():
 
     r2 = tk.Frame(f2, bg=P["card"])
     r2.pack(fill="x", pady=(14, 0))
-    detail = parse_detail_settings(detail_defaults())
+    try:
+        detail, settings_path = load_startup_detail_settings()
+        settings_notice = ("ok", "기본 설정 자동 불러옴: " + settings_path) if settings_path else None
+    except (OSError, ValueError, UnicodeError) as exc:
+        detail = parse_detail_settings(detail_defaults())
+        settings_notice = ("warn", "inp2k-settings.json 자동 불러오기 실패: %s · 기본 설정을 사용합니다." % exc)
 
     def show_details():
         if state["busy"]:
@@ -5852,7 +5895,7 @@ def run_gui():
         # page card instead of clipping the buttons.
         buttons = tk.Frame(shell, bg=P["bg"])
         buttons.pack(side="bottom", fill="x")
-        tk.Label(shell, text="공란은 기존값 유지 · 불러온 설정은 [적용] 후 변환에 반영됩니다.",
+        tk.Label(shell, text="숫자 공란은 K 파일에서도 공백 · 불러온 설정은 [적용] 후 반영됩니다.",
                  bg=P["bg"], fg=P["dim"], font=F_SM, anchor="w").pack(side="bottom", fill="x", pady=(12, 12))
         book, page_host = card(shell, "", F_HD)
         book.pack(fill="both", expand=True)
@@ -5869,7 +5912,7 @@ def run_gui():
             ("Formulation", [("all_contact", "전체 접촉", "ERODING_SINGLE_SURFACE"),
                              ("solid", "Solid ELFORM (육면체 전용)", "auto"),
                              ("shell", "Shell ELFORM", "auto")]),
-            ("Contact", [("contact_"+k, k.upper() + (" (공란: 원본, 없으면 0.2)" if k in ("fs", "fd") else ""), detail_defaults()["contact_"+k])
+            ("Contact", [("contact_"+k, k.upper(), detail_defaults()["contact_"+k])
                          for k in CONTACT_FIELDS]),
             ("Whole contact", [("all_contact_"+k, k.upper(), "") for k in CONTACT_FIELDS]),
         ]
@@ -5881,10 +5924,10 @@ def run_gui():
         titles = ("요소 · 전체 접촉", "개별 접촉 계수", "전체 접촉 계수", "쉘 Hourglass", "솔리드 Hourglass")
         notes = (
             "전체 접촉은 ELSET_ALL(900001)에 적용합니다.\n순수 C3D10은 ELFORM 16 유지 · Solid 지정은 육면체 전용",
-            "FS·FD 공란: 원본 유지, 원본 값이 없으면 0.2 · SST·MST 음수 입력 가능(두께 절댓값)\nSOFT · SBOPT · DEPTH · BSORT는 비-TIE 접촉에 적용",
-            "ELSET_ALL 전체 접촉에만 적용합니다. 공란은 개별 접촉 계수 값을 따릅니다.\nSST·MST 음수 입력 가능(두께 절댓값)",
-            "쉘 PART가 공유하는 HGID 1의 설정입니다. 공란은 기존 처리를 유지합니다.",
-            "솔리드 PART가 공유하는 HGID 2의 설정입니다. 공란은 기존 처리를 유지합니다.")
+            "숫자 공란: K 파일에 공백 출력 · SST·MST 음수 입력 가능(두께 절댓값)\nSOFT · SBOPT · DEPTH · BSORT는 비-TIE 접촉에 적용",
+            "ELSET_ALL / GENERAL_CONTACT에 적용하며 개별 접촉과 독립적입니다.\n숫자 공란은 공백 출력 · SST·MST 음수 입력 가능(두께 절댓값)",
+            "쉘 PART가 공유하는 HGID 1의 설정입니다. 숫자 공란은 공백으로 출력합니다.",
+            "솔리드 PART가 공유하는 HGID 2의 설정입니다. 숫자 공란은 공백으로 출력합니다.")
         for index, (title, fields) in enumerate(groups):
             tab = tk.Frame(page_host, bg=P["card"])
             tab.grid(row=0, column=0, sticky="nsew")
@@ -5909,7 +5952,7 @@ def run_gui():
                 short_label = label.split(" (")[0] if "contact_" in key else label
                 tk.Label(cell, text=short_label, font=F_SM, bg=P["card"], fg=P["dim"],
                          anchor="w").pack(fill="x", pady=(0, 5))
-                var = tk.StringVar(value=str(detail.get(key, "")))
+                var = tk.StringVar(value=detail_text(detail.get(key, "")))
                 variables[key] = var
                 if key in ("all_contact", "solid", "shell"):
                     choices = (("AUTOMATIC_SINGLE_SURFACE", "ERODING_SINGLE_SURFACE")
@@ -5965,7 +6008,7 @@ def run_gui():
                 if key in BOOL_DETAIL_KEYS:
                     var.set(bool_text(values.get(key, False)))
                     continue
-                var.set(values.get(key, detail_defaults()[key] if key in ("shell", "solid", "all_contact") else ""))
+                var.set(detail_text(values.get(key, detail_defaults()[key] if key in DETAIL_CHOICE_KEYS else "")))
         def reset():
             for key, value in detail_defaults().items():
                 variables[key].set(bool_text(value) if key in BOOL_DETAIL_KEYS else value)
@@ -6109,6 +6152,8 @@ def run_gui():
         opt.update(edit_erosion=edit_erosion.get(), edit_bc_py=edit_bc_py.get(), output_path=out)
         txt.delete("1.0", "end")
         add_line("head", "▶  " + os.path.basename(state["path"]))
+        if settings_notice:
+            add_line(*settings_notice)
         state["busy"] = True
         btn_finish.config(enabled=False)
         state["t0"] = time.time()
@@ -6223,6 +6268,8 @@ def run_gui():
         register_drop()
     except Exception:
         drop_hint.set("드롭을 사용하려면 ‘드롭 활성화’를 누르세요. 파일 선택도 가능합니다.")
+    if settings_notice:
+        add_line(*settings_notice)
     poll()
     root.mainloop()
     return 0
@@ -6344,10 +6391,10 @@ def main():
     ap.add_argument("--no-contact", action="store_true", help="접촉·구속 변환 안 함")
     ap.add_argument("--no-ctrl", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--tet10", action="store_true", help="C3D10 전용 프로퍼티에서 2차 사면체 유지 (혼합 프로퍼티는 코너 축약)")
-    ap.add_argument("--shell", default="auto", choices=["auto", "2", "16"])
+    ap.add_argument("--shell", default=None, choices=["auto", "2", "16"])
     ap.add_argument("--unit", default="mmts", choices=list(UNIT_DEFAULT))
-    ap.add_argument("--mu", type=float, default=0.2, help="기본 마찰계수")
-    ap.add_argument("--neg-elform-names", action="store_true",
+    ap.add_argument("--mu", type=float, default=None, help="개별 접촉 FS/FD 명시 지정 (설정 JSON보다 우선)")
+    ap.add_argument("--neg-elform-names", action="store_true", default=None,
                     help="PAD/TA/ADHESIVE 이름의 육면체 솔리드 프로퍼티를 ELFORM -1로")
     ap.add_argument("--check", action="store_true",
                     help="환경 진단 및 자체 시험 (실행이 안 될 때)")
@@ -6383,10 +6430,19 @@ def main():
         return run_gui() or 0
 
     opt = dict(DEFAULT_OPT)
+    try:
+        startup_detail, settings_path = load_startup_detail_settings()
+    except (OSError, ValueError, UnicodeError) as exc:
+        ap.error("inp2k-settings.json 자동 불러오기 실패: %s" % exc)
+    opt.update(startup_detail)
     opt.update(sets=not args.no_sets, contact=not args.no_contact, auto_sets=not args.no_auto_sets,
-               ctrl=False, tet10=args.tet10,
-               shell=args.shell, unit=args.unit, mu=args.mu,
-               neg_elform_names=args.neg_elform_names)
+               ctrl=False, tet10=args.tet10, unit=args.unit)
+    if args.shell is not None:
+        opt["shell"] = args.shell
+    if args.mu is not None:
+        opt.update(mu=args.mu, contact_fs=args.mu, contact_fd=args.mu)
+    if args.neg_elform_names is not None:
+        opt["neg_elform_names"] = args.neg_elform_names
     out = args.out or default_dyna_path(args.input)
 
     def sink(lv, m):
@@ -6394,6 +6450,8 @@ def main():
         print(tag + m)
 
     log = Log(sink=sink)
+    if settings_path:
+        log.info("기본 설정 자동 불러옴: " + settings_path)
     last = [0.0]
 
     PHN = {"read": "읽는 중", "convert": "변환 중", "write": "쓰는 중", "done": "완료"}
