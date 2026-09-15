@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-INP2K v2.16 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
+INP2K v2.17 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
 
-v2.16 주요 변경 사항
+v2.17 주요 변경 사항
+- Shock KEY의 INTFOR 파일명 카드에 맞춰 DATABASE_BINARY_INTFOR_FILE로 수정합니다.
+  기존 INTFOR 키워드에 파일명 줄이 들어가 숫자 카드 위치가 밀리던 형식 오류를 수정합니다.
+- INTFOR 데이터 순서: 파일명(intfor) → DT 등 출력 설정 → IOOPT=1.
+  INCLUDE 상단 배치, 종료시간/1000 간격, 기존 Shock 프로파일과 Erosion 처리는 유지합니다.
+
+이전 버전: v2.16 주요 변경 사항
 - Shock KEY의 모델/방향별 프로파일 INCLUDE를 *KEYWORD 바로 아래로 이동합니다.
 - DATABASE_BINARY_INTFOR의 IOOPT를 문서상 기본 동작인 1로 명시합니다.
   DATABASE_BINARY_D3PLOT에도 IOOPT=1을 명시하며 일반 DATABASE의 IOOPT=1을 유지합니다.
@@ -284,7 +290,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.16"
+VERSION = "2.17"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -4740,7 +4746,9 @@ def render_shock_master_key(profile, model_include):
     Layouts: Ansys PyDYNA auto/control and auto/database (github.com/ansys/pydyna).
     Only required CONTROL cards are emitted. Blanks retain solver defaults,
     including TSSFAC (solver-selected default), PIDOS and NLQ.
-    INTFOR's optional database filename card is explicitly supplied as 'intfor'.
+    INTFOR's filename card requires the _FILE keyword option. Emit the matching
+    DATABASE_BINARY_INTFOR_FILE layout: filename, timing card, IOOPT card.
+    Reference: https://github.com/ansys/pydyna/blob/main/src/ansys/dyna/core/keywords/keyword_classes/auto/database/database_binary_intfor_file.py
     """
     model = shock_model_include(model_include)
     end = profile["end_s"]
@@ -4794,7 +4802,7 @@ def render_shock_master_key(profile, model_include):
             # IOOPT=1 is the documented default; do not rely on 0 being accepted.
             lines.extend(("$#   ioopt      rate    cutoff    window      type      pset",
                           i10(1) + " " * 30 + i10(0) * 2))
-    lines.extend(("*DATABASE_BINARY_INTFOR", "$# filename", "intfor",
+    lines.extend(("*DATABASE_BINARY_INTFOR_FILE", "$# filename", "intfor",
                   "$#      dt      lcdt      beam     npltc    psetid",
                   real10(end / 1000.0) + " " * 10 + i10(0) + " " * 20,
                   "$#   ioopt", i10(1)))
