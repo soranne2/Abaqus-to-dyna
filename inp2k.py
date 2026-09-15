@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-INP2K v2.15 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
+INP2K v2.16 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
 
-v2.15 주요 변경 사항
+v2.16 주요 변경 사항
+- Shock KEY의 모델/방향별 프로파일 INCLUDE를 *KEYWORD 바로 아래로 이동합니다.
+- DATABASE_BINARY_INTFOR의 IOOPT를 문서상 기본 동작인 1로 명시합니다.
+  DATABASE_BINARY_D3PLOT에도 IOOPT=1을 명시하며 일반 DATABASE의 IOOPT=1을 유지합니다.
+- 기존 프로파일, 출력 시간 간격과 MAT_ADD_EROSION의 재료/커브 연결은 유지합니다.
+
+이전 버전: v2.15 주요 변경 사항
 - Shock 탭에서 프로파일 .k와 별도로 해석용 .key 생성 여부 / KEY 6방향 저장을 선택합니다.
 - INCLUDE 모델은 INP 변환 출력 경로를 자동 반영하거나 직접 입력/선택합니다.
 - KEY 이름: 7100_SHOCK_{모델명}_{25g15ms}_{mX}.key (양수 방향은 7200 / pX).
@@ -278,7 +284,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.15"
+VERSION = "2.16"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -4740,7 +4746,8 @@ def render_shock_master_key(profile, model_include):
     end = profile["end_s"]
     if not math.isfinite(end) or end <= 0:
         raise ValueError("Shock 종료 시간은 0보다 큰 유한한 값이어야 합니다.")
-    lines = ["*KEYWORD", "$ Shock master deck; unspecified fields use LS-DYNA defaults."]
+    lines = ["*KEYWORD", "*INCLUDE", model, "*INCLUDE", profile["filename"],
+             "$ Shock master deck; unspecified fields use LS-DYNA defaults."]
 
     def real10(value):
         # Shock times use a 1e-5 s grid; END/1000 needs eight decimal places.
@@ -4783,11 +4790,15 @@ def render_shock_master_key(profile, model_include):
     for option, divisor in (("D3PLOT", 100.0), ("D3THDT", 1000.0)):
         row("DATABASE_BINARY_" + option, ("dt", "lcdt", "beam", "npltc", "psetid"),
             (end / divisor, None, 0, None, None))
+        if option == "D3PLOT":
+            # IOOPT=1 is the documented default; do not rely on 0 being accepted.
+            lines.extend(("$#   ioopt      rate    cutoff    window      type      pset",
+                          i10(1) + " " * 30 + i10(0) * 2))
     lines.extend(("*DATABASE_BINARY_INTFOR", "$# filename", "intfor",
                   "$#      dt      lcdt      beam     npltc    psetid",
                   real10(end / 1000.0) + " " * 10 + i10(0) + " " * 20,
-                  "$#   ioopt", i10(0)))
-    lines.extend(("*INCLUDE", model, "*INCLUDE", profile["filename"], "*END"))
+                  "$#   ioopt", i10(1)))
+    lines.append("*END")
     return "\n".join(lines) + "\n"
 
 
