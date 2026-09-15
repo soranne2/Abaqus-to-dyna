@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-INP2K v2.17 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
+INP2K v2.18 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
 
-v2.17 주요 변경 사항
+v2.18 주요 변경 사항
+- Shock 상세 설정: CONTROL_OUTPUT 42개 항목, CONTROL 변수와 DATABASE 출력 분할 수 편집.
+- 변환/ Shock 상세 설정을 같은 inp2k-settings.json에 저장·불러오기·시작 시 자동 적용.
+  추가 숫자 항목 기본값은 공란, ENDTIM 공란은 프로파일 종료시간(3T) 자동 적용.
+- 프로파일 6방향 저장 체크 하나로 KEY 방향도 통일합니다. KEY 생성 여부는 별도 선택.
+- KEY의 $# 필드 주석은 영어 대문자, INCLUDE와 CONTROL 사이에 구분선을 추가합니다.
+- INTFOR_FILE의 파일명/DT/IOOPT=1 순서, 기존 프로파일과 Erosion 처리를 유지합니다.
+
+이전 버전: v2.17 주요 변경 사항
 - Shock KEY의 INTFOR 파일명 카드에 맞춰 DATABASE_BINARY_INTFOR_FILE로 수정합니다.
   기존 INTFOR 키워드에 파일명 줄이 들어가 숫자 카드 위치가 밀리던 형식 오류를 수정합니다.
 - INTFOR 데이터 순서: 파일명(intfor) → DT 등 출력 설정 → IOOPT=1.
@@ -290,7 +298,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.17"
+VERSION = "2.18"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -4258,13 +4266,17 @@ def detail_defaults():
     return result
 
 
-def save_detail_settings(path, values):
+def save_detail_settings(path, values, shock_values=None):
     values = parse_detail_settings(values)
-    # Validate before touching an existing preset.
-    with open(path, "w", encoding="utf-8") as stream:
-        json.dump(dict(format="inp2k-settings", schema_version=1, settings=values),
-                  stream, ensure_ascii=False, indent=2, allow_nan=False)
-        stream.write("\n")
+    # Converter-only callers preserve the existing Shock section. GUI dialogs
+    # pass both current drafts explicitly, so neither section is silently lost.
+    if shock_values is None and os.path.exists(path):
+        shock_values = load_shock_detail_settings(path)
+    shock_values = parse_shock_detail_settings({} if shock_values is None else shock_values)
+    payload = json.dumps(dict(format="inp2k-settings", schema_version=1,
+                              settings=values, shock=shock_values),
+                         ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    write_shock_text(os.path.abspath(path), payload)
 
 
 def load_detail_settings(path):
@@ -4350,6 +4362,149 @@ def parse_detail_settings(raw):
             raise ValueError(key.upper() + ": 유효한 " + ("정수" if integer else "숫자") + "를 입력하세요.")
         result[key] = int(value) if integer else value
     return result
+
+
+# CONTROL field order/types follow the Ansys PyDYNA keyword definitions:
+# https://github.com/ansys/pydyna/tree/main/src/ansys/dyna/core/keywords/keyword_classes/auto/control
+# Each tuple is (field name, type, initial value). Optional new cards start blank;
+# None field names reserve positions and are never exposed as editable values.
+SHOCK_CONTROL_CARDS = (
+    ("TERMINATION", (
+        (("endtim", float, None), ("endcyc", int, 0), ("dtmin", float, 0.0),
+         ("endeng", float, 0.0), ("endmas", float, 1e8), ("nosol", int, 0)),)),
+    ("TIMESTEP", (
+        (("dtinit", float, 0.0), ("tssfac", float, None), ("isdo", int, 0),
+         ("tslimt", float, 0.0), ("dt2ms", float, 0.0), ("lctm", int, 0),
+         ("erode", int, 0), ("ms1st", int, 0)),
+        (("dt2msf", float, None), ("dt2mslc", int, None), ("imscl", int, None),
+         (None, int, None), (None, int, None), ("rmscl", float, None),
+         ("emscl", float, None), ("ihdo", int, None)),
+        (("rmavg", float, None), ("igado", int, None), ("dtusr", float, None),
+         ("dtdynv", int, None)))),
+    ("OUTPUT", (
+        (("npopt", int, 0), ("neecho", int, 0), ("nrefup", int, 0), ("iaccop", int, 0),
+         ("opifs", float, 0.0), ("ipnint", int, 0), ("ikedit", int, 100), ("iflush", int, 5000)),
+        (("iprtf", int, None), ("ierode", int, None), ("tet10s8", int, None), ("msgmax", int, None),
+         ("ipcurv", int, None), ("gmdt", float, None), ("ip1dblt", int, None), ("eocs", int, None)),
+        (("tolev", int, None), ("newleg", int, None), ("frfreq", int, None), ("minfo", int, None),
+         ("solsig", int, None), ("msgflg", int, None), ("cdetol", float, None), ("igeom", int, None)),
+        (("phschng", int, None), ("demden", int, None), ("icrfile", int, None), ("spc2bnd", int, None),
+         ("penout", int, None), ("shlsig", int, None), ("hisnout", int, None), ("engout", int, None)),
+        (("insf", int, None), ("isolsf", int, None), ("ibsf", int, None), ("issf", int, None),
+         ("mlkbag", int, None), ("kineng", int, None), ("isfcnt", int, None)),
+        (("ielogkey", int, None), ("ielogini", int, None), ("ielogsol", int, None)))),
+    ("ENERGY", (
+        (("hgen", int, 1), ("rwen", int, 2), ("slnten", int, 1), ("rylen", int, 1),
+         ("irgen", int, 2), ("maten", int, 1), ("drlen", int, 1), ("disen", int, 1)),)),
+    ("ACCURACY", (
+        (("osu", int, 0), ("inn", int, 1), ("pidos", int, None), ("iacc", int, 0),
+         ("exacc", float, 0.0), ("srtflg", int, 0)),)),
+    ("CPU", ((("cputim", float, 0.0), ("iglst", int, 0)),)),
+    ("SOLUTION", (
+        (("soln", int, 0), ("nlq", int, None), ("isnan", int, 0), ("lcint", int, 100),
+         ("lcacc", int, 0), ("ncdcf", int, 1), ("nocopy", int, 0), ("crvp", int, 0)),)),
+)
+SHOCK_DATABASE_COUNTS = (
+    ("D3PLOT", 100), ("D3THDT", 1000), ("INTFOR", 1000),
+    ("DEFORC", 1000), ("ELOUT", 1000), ("GLSTAT", 1000), ("MATSUM", 1000),
+    ("NODOUT", 1000), ("RCFORC", 1000), ("RWFORC", 1000), ("NCFORC", 1000),
+    ("SECFORC", 1000), ("SLEOUT", 1000),
+)
+
+
+def shock_detail_defaults():
+    values = {group.lower() + "_" + field: default
+              for group, cards in SHOCK_CONTROL_CARDS for fields in cards
+              for field, kind, default in fields if field}
+    values.update({"database_" + option.lower() + "_count": count
+                   for option, count in SHOCK_DATABASE_COUNTS})
+    values["mpp_io_nodump"] = True
+    return values
+
+
+def parse_shock_detail_settings(raw):
+    """Missing keys use initial values; explicit CONTROL blanks stay blank."""
+    if not isinstance(raw, dict):
+        raise ValueError("Shock 설정은 JSON 객체여야 합니다.")
+    values = shock_detail_defaults()
+    if set(raw) - set(values):
+        raise ValueError("알 수 없는 Shock 설정: " + ", ".join(sorted(set(raw) - set(values))))
+    kinds = {group.lower() + "_" + field: kind
+             for group, cards in SHOCK_CONTROL_CARDS for fields in cards
+             for field, kind, default in fields if field}
+    for key, value in raw.items():
+        text = detail_text(value).strip()
+        if key == "mpp_io_nodump":
+            if text.lower() not in ("true", "false", "1", "0", "on", "off", "yes", "no", ""):
+                raise ValueError("MPP_IO_NODUMP: true/false 값을 입력하세요.")
+            values[key] = text.lower() in ("true", "1", "on", "yes")
+            continue
+        is_count = key.startswith("database_")
+        if not text:
+            if not is_count:
+                values[key] = None
+            continue
+        try:
+            number = float(text)
+            kind = int if is_count else kinds[key]
+            if isinstance(value, bool) or not math.isfinite(number):
+                raise ValueError()
+            if kind is int and (number != int(number) or len(str(int(number))) > 10):
+                raise ValueError()
+            if (is_count or key == "termination_endtim") and number <= 0:
+                raise ValueError()
+            values[key] = kind(number)
+        except (ValueError, OverflowError):
+            raise ValueError(key.upper() + ": 유효한 " +
+                             ("양의 정수" if is_count else "정수" if kinds.get(key) is int else "숫자") +
+                             "를 입력하세요.")
+    return values
+
+
+def load_shock_detail_settings(path):
+    with open(path, encoding="utf-8-sig") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict) or data.get("format") != "inp2k-settings" or data.get("schema_version") != 1:
+        raise ValueError("INP2K 설정 JSON 형식/버전이 아닙니다.")
+    return parse_shock_detail_settings(data.get("shock", {}))
+
+
+def load_startup_settings(directory=None):
+    detail, path = load_startup_detail_settings(directory)
+    shock = load_shock_detail_settings(path) if path else shock_detail_defaults()
+    return detail, shock, path
+
+
+class SettingsDraft:
+    """Both dialogs edit a private draft. Only Apply changes the live settings."""
+    def __init__(self, detail, shock):
+        self._detail, self._shock = detail, shock
+        self.detail, self.shock = dict(detail), dict(shock)
+
+    def load(self, path):
+        detail = parse_detail_settings(detail_defaults())
+        detail.update(load_detail_settings(path))
+        shock = load_shock_detail_settings(path)
+        self.detail, self.shock = detail, shock
+
+    def save(self, path):
+        save_detail_settings(path, self.detail, self.shock)
+
+    def commit(self):
+        detail = parse_detail_settings(self.detail)
+        shock = parse_shock_detail_settings(self.shock)
+        self._detail.clear()
+        self._detail.update(detail)
+        self._shock.clear()
+        self._shock.update(shock)
+
+
+def shock_endtime(profile, settings):
+    end = settings.get("termination_endtim")
+    end = profile["end_s"] if end is None else end
+    if not math.isfinite(end) or end <= 0:
+        raise ValueError("Shock 종료 시간은 0보다 큰 유한한 값이어야 합니다.")
+    return end
 
 
 def convert_file(inp_path, out_path, opt, log, progress=None):
@@ -4652,7 +4807,7 @@ def write_shock_k(out_path, g_value=25.0, duration_ms=15.0,
 def write_shock_files(output_dir, g_value=25.0, duration_ms=15.0,
                        waveform="half-sine", direction="mx", point_count=SHOCK_POINTS,
                        all_directions=False, overwrite=False, create_key=False,
-                       key_all_directions=False, model_include=""):
+                       model_include="", shock_settings=None):
     """Preflight every target; return per-file results for any write failures."""
     directory = os.path.expanduser(os.fspath(output_dir).strip())
     if not directory:
@@ -4660,18 +4815,18 @@ def write_shock_files(output_dir, g_value=25.0, duration_ms=15.0,
     directory = os.path.abspath(directory)
     six = ("mx", "my", "mz", "px", "py", "pz")
     # Every generated master deck must have its matching profile on disk.
-    directions = six if all_directions or (create_key and key_all_directions) else (direction,)
+    directions = six if all_directions else (direction,)
     profiles = [build_shock_profile(g_value, duration_ms, waveform, d, point_count) for d in directions]
     for profile in profiles:
         render_shock_keyword(profile)  # Validate formatting before writing anything.
     paths = [os.path.join(directory, profile["filename"]) for profile in profiles]
     key_jobs = []
     if create_key:
+        settings = parse_shock_detail_settings({} if shock_settings is None else shock_settings)
         model_include = shock_model_include(model_include, directory)
         for profile in profiles:
-            if key_all_directions or profile["direction"] == direction:
-                key_path = os.path.join(directory, shock_key_filename(profile, model_include))
-                key_jobs.append((key_path, profile, render_shock_master_key(profile, model_include)))
+            key_path = os.path.join(directory, shock_key_filename(profile, model_include))
+            key_jobs.append((key_path, profile, render_shock_master_key(profile, model_include, settings)))
         model_path = os.path.realpath(os.path.join(directory, model_include))
         if any(os.path.normcase(os.path.realpath(path)) == os.path.normcase(model_path)
                for path in paths + [job[0] for job in key_jobs]):
@@ -4698,7 +4853,7 @@ def write_shock_files(output_dir, g_value=25.0, duration_ms=15.0,
             continue
         try:
             write_shock_text(path, content)
-            key_written.append(dict(out=path, direction=profile["direction"], end_s=profile["end_s"]))
+            key_written.append(dict(out=path, direction=profile["direction"], end_s=shock_endtime(profile, settings)))
         except OSError as exc:
             failed.append(dict(path=path, error=str(exc)))
     return dict(written=written, key_written=key_written, failed=failed, directory=directory)
@@ -4740,72 +4895,81 @@ def shock_key_filename(profile, model_include):
     return "%s_SHOCK_%s_%s_%s.key" % (7100 if profile["sfo"] < 0 else 7200, stem, condition, direction)
 
 
-def render_shock_master_key(profile, model_include):
+def render_shock_master_key(profile, model_include, shock_settings=None):
     """Master deck: one model + one unchanged Shock profile; times are seconds.
 
     Layouts: Ansys PyDYNA auto/control and auto/database (github.com/ansys/pydyna).
-    Only required CONTROL cards are emitted. Blanks retain solver defaults,
-    including TSSFAC (solver-selected default), PIDOS and NLQ.
+    Optional CONTROL cards are emitted through the last populated card, keeping
+    preceding empty cards in position. Explicit blanks retain solver defaults.
     INTFOR's filename card requires the _FILE keyword option. Emit the matching
     DATABASE_BINARY_INTFOR_FILE layout: filename, timing card, IOOPT card.
     Reference: https://github.com/ansys/pydyna/blob/main/src/ansys/dyna/core/keywords/keyword_classes/auto/database/database_binary_intfor_file.py
     """
     model = shock_model_include(model_include)
-    end = profile["end_s"]
-    if not math.isfinite(end) or end <= 0:
-        raise ValueError("Shock 종료 시간은 0보다 큰 유한한 값이어야 합니다.")
+    settings = parse_shock_detail_settings({} if shock_settings is None else shock_settings)
+    end = shock_endtime(profile, settings)
     lines = ["*KEYWORD", "*INCLUDE", model, "*INCLUDE", profile["filename"],
-             "$ Shock master deck; unspecified fields use LS-DYNA defaults."]
+             "$========================================="]
 
     def real10(value):
-        # Shock times use a 1e-5 s grid; END/1000 needs eight decimal places.
-        # The converter's general f10 rounds small numbers to three significant
-        # digits, so preserve the requested output interval here instead.
+        # Keep default intervals exact while supporting tiny user time steps.
         text = ("%.8f" % value).rstrip("0").rstrip(".")
         if "." not in text and len(text) <= 8:
             text += ".0"
-        if len(text) <= 10:
+        if len(text) <= 10 and (value == 0 or abs(float(text) / value - 1) < 1e-8):
             return text.rjust(10)
-        for precision in range(8, 0, -1):
-            text = format(value, ".%dg" % precision)
-            if len(text) <= 10:
-                return text.rjust(10)
+        candidates = []
+        for precision in range(9, 0, -1):
+            for style in ("g", "e"):
+                text = format(value, ".%d%s" % (precision, style))
+                if "e" in text:
+                    mantissa, exponent = text.split("e")
+                    text = mantissa.rstrip("0").rstrip(".") if "." in mantissa else mantissa
+                    text += "e" + str(int(exponent))
+                if len(text) <= 10 and math.isfinite(float(text)):
+                    candidates.append(text)
+        if candidates:
+            return min(candidates, key=lambda t: abs(float(t) - value)).rjust(10)
         raise ValueError("KEY 숫자가 10칸 출력 범위를 벗어났습니다.")
 
     def row(keyword, fields, values):
-        lines.append("*" + keyword)
+        if keyword:
+            lines.append("*" + keyword)
+        fields = tuple((field or "").upper() for field in fields)
         lines.append("$#" + fields[0].rjust(8) + "".join(k.rjust(10) for k in fields[1:]))
         lines.append("".join(" " * 10 if v is None else i10(v) if isinstance(v, int) else real10(v)
                              for v in values))
 
-    row("CONTROL_TERMINATION", ("endtim", "endcyc", "dtmin", "endeng", "endmas", "nosol"),
-        (end, 0, 0.0, 0.0, 1e8, 0))
-    row("CONTROL_TIMESTEP", ("dtinit", "tssfac", "isdo", "tslimt", "dt2ms", "lctm", "erode", "ms1st"),
-        (0.0, None, 0, 0.0, 0.0, 0, 0, 0))
-    row("CONTROL_OUTPUT", ("npopt", "neecho", "nrefup", "iaccop", "opifs", "ipnint", "ikedit", "iflush"),
-        (0, 0, 0, 0, 0.0, 0, 100, 5000))
-    row("CONTROL_ENERGY", ("hgen", "rwen", "slnten", "rylen", "irgen", "maten", "drlen", "disen"),
-        (1, 2, 1, 1, 2, 1, 1, 1))
-    row("CONTROL_ACCURACY", ("osu", "inn", "pidos", "iacc", "exacc", "srtflg"),
-        (0, 1, None, 0, 0.0, 0))
-    row("CONTROL_CPU", ("cputim", "iglst"), (0.0, 0))
-    row("CONTROL_SOLUTION", ("soln", "nlq", "isnan", "lcint", "lcacc", "ncdcf", "nocopy", "crvp"),
-        (0, None, 0, 100, 0, 1, 0, 0))
-    lines.append("*CONTROL_MPP_IO_NODUMP")
-    for option in ("DEFORC", "ELOUT", "GLSTAT", "MATSUM", "NODOUT", "RCFORC",
-                   "RWFORC", "NCFORC", "SECFORC", "SLEOUT"):
-        row("DATABASE_" + option, ("dt", "binary", "lcur", "ioopt"), (end / 1000.0, 0, 0, 1))
-    for option, divisor in (("D3PLOT", 100.0), ("D3THDT", 1000.0)):
+    settings["termination_endtim"] = end
+    for group, cards in SHOCK_CONTROL_CARDS:
+        values = [[settings[group.lower() + "_" + field] if field else None
+                   for field, kind, default in fields] for fields in cards]
+        last = max([0] + [index for index, data in enumerate(values) if any(v is not None for v in data)])
+        for index in range(last + 1):
+            row("CONTROL_" + group if index == 0 else None,
+                tuple(field for field, kind, default in cards[index]), values[index])
+    if settings["mpp_io_nodump"]:
+        lines.append("*CONTROL_MPP_IO_NODUMP")
+
+    def interval(option):
+        dt = end / settings["database_" + option.lower() + "_count"]
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError(option + ": 출력 간격이 0보다 커야 합니다.")
+        return dt
+
+    for option, _default in SHOCK_DATABASE_COUNTS[3:]:
+        row("DATABASE_" + option, ("dt", "binary", "lcur", "ioopt"), (interval(option), 0, 0, 1))
+    for option in ("D3PLOT", "D3THDT"):
         row("DATABASE_BINARY_" + option, ("dt", "lcdt", "beam", "npltc", "psetid"),
-            (end / divisor, None, 0, None, None))
+            (interval(option), None, 0, None, None))
         if option == "D3PLOT":
             # IOOPT=1 is the documented default; do not rely on 0 being accepted.
-            lines.extend(("$#   ioopt      rate    cutoff    window      type      pset",
+            lines.extend(("$#   IOOPT      RATE    CUTOFF    WINDOW      TYPE      PSET",
                           i10(1) + " " * 30 + i10(0) * 2))
-    lines.extend(("*DATABASE_BINARY_INTFOR_FILE", "$# filename", "intfor",
-                  "$#      dt      lcdt      beam     npltc    psetid",
-                  real10(end / 1000.0) + " " * 10 + i10(0) + " " * 20,
-                  "$#   ioopt", i10(1)))
+    lines.extend(("*DATABASE_BINARY_INTFOR_FILE", "$# FILENAME", "intfor",
+                  "$#      DT      LCDT      BEAM     NPLTC    PSETID",
+                  real10(interval("INTFOR")) + " " * 10 + i10(0) + " " * 20,
+                  "$#   IOOPT", i10(1)))
     lines.append("*END")
     return "\n".join(lines) + "\n"
 
@@ -5099,11 +5263,15 @@ class DarkScrollbar:
 class ShockTab:
     """Independent Shock form; the save button stays visible on small windows."""
 
-    def __init__(self, parent, ui_font, initial_dir=None, initial_model=None):
+    def __init__(self, parent, ui_font, initial_dir=None, initial_model=None,
+                 detail_settings=None, shock_settings=None):
         P = PALETTE
         self.parent = parent
         self.initial_dir = initial_dir
         self.initial_model = initial_model
+        self.detail_settings = (parse_detail_settings(detail_defaults())
+                                if detail_settings is None else detail_settings)
+        self.shock_settings = shock_detail_defaults() if shock_settings is None else shock_settings
         self.font = (ui_font, 10)
         self.small = (ui_font, 9)
         self.profile = None
@@ -5116,7 +5284,6 @@ class ShockTab:
                                            or os.path.dirname(os.path.abspath(__file__)))
         self.all_var = tk.BooleanVar(parent, value=False)
         self.key_var = tk.BooleanVar(parent, value=False)
-        self.key_all_var = tk.BooleanVar(parent, value=False)
         self.model_auto_var = tk.BooleanVar(parent, value=True)
         self.model_var = tk.StringVar(parent, value=(initial_model() if initial_model else "") or "")
         self.output_valid = False
@@ -5206,8 +5373,9 @@ class ShockTab:
         key_box = tk.Frame(output, bg=P["card"], highlightthickness=1,
                            highlightbackground=P["line"], padx=12, pady=10)
         key_box.pack(fill="x", pady=(6, 12))
+        RButton(key_box, "Shock 상세 설정", self.show_details, kind="ghost", w=150,
+                h=34, font=self.font).pack(anchor="e", pady=(0, 8))
         for label, var, attr in (("해석용 KEY 파일도 생성", self.key_var, "key_check"),
-                                ("KEY: 6방향 모두 저장", self.key_all_var, "key_all_check"),
                                 ("INP 변환 출력 모델 자동 연결", self.model_auto_var, "model_auto_check")):
             cb = tk.Checkbutton(key_box, text=label, variable=var, bg=P["card"], fg=P["text"],
                 activebackground=P["card"], activeforeground=P["text"], selectcolor=P["card2"],
@@ -5227,8 +5395,8 @@ class ShockTab:
                                     w=100, h=34, font=self.font)
         self.model_button.pack(side="left")
         tk.Label(key_box, text="직접 입력: 자동 연결 체크 해제 후 이름/경로 입력 (상대 경로는 KEY 출력 폴더 기준)\n"
-                 "KEY 전체 방향을 선택하면 INCLUDE에 필요한 프로파일 6개도 함께 저장합니다.\n"
-                 "KEY 종료시간=3T · 일반/D3THDT/INTFOR=종료시간÷1000 · D3PLOT=종료시간÷100",
+                 "프로파일 6방향 모두 저장을 켜면, KEY 생성 시 KEY도 6방향으로 저장합니다.\n"
+                 "CONTROL 변수와 DATABASE 출력 분할 수는 Shock 상세 설정에서 변경하세요.",
                  bg=P["card"], fg=P["dim"], font=self.small, anchor="w", justify="left",
                  wraplength=630).pack(fill="x", pady=(8, 0))
         tk.Label(output, textvariable=self.name_var, bg=P["card"], fg=P["accent"],
@@ -5263,10 +5431,204 @@ class ShockTab:
         bind_wheel(scroller)
         self.model_auto_var.trace_add("write", self.sync_model)
         for variable in (self.g_var, self.ms_var, self.points_var, self.wave_var, self.direction_var,
-                         self.all_var, self.key_var, self.key_all_var, self.model_var,
+                         self.all_var, self.key_var, self.model_var,
                          self.model_auto_var, self.output_dir_var):
             variable.trace_add("write", self.refresh)
         self.refresh()
+
+    def show_details(self):
+        from tkinter import messagebox
+        P = PALETTE
+        draft = SettingsDraft(self.detail_settings, self.shock_settings)
+        win = tk.Toplevel(self.parent)
+        win.withdraw()
+        win.title("Shock 상세 설정 · v" + VERSION)
+        win.configure(bg=P["bg"])
+        win.transient(self.parent.winfo_toplevel())
+        shell = tk.Frame(win, bg=P["bg"], padx=20, pady=18)
+        shell.pack(fill="both", expand=True)
+        tk.Label(shell, text="Shock 상세 설정", bg=P["bg"], fg=P["text"],
+                 font=(self.font[0], 17, "bold"), anchor="w").pack(fill="x")
+        tk.Label(shell, text="CONTROL 공란은 기본값 사용 · ENDTIM 공란은 프로파일 끝(3T) · 시간 단위: s\n"
+                 "JSON 저장/불러오기는 변환 설정과 Shock 설정을 함께 처리하며 [적용] 후 반영됩니다.",
+                 bg=P["bg"], fg=P["dim"], font=self.small, anchor="w", justify="left"
+                 ).pack(fill="x", pady=(8, 12))
+        nav = tk.Frame(shell, bg=P["bg"])
+        nav.pack(fill="x", pady=(0, 10))
+        # Reserve the footer before the scrollable field area.
+        buttons = tk.Frame(shell, bg=P["bg"])
+        buttons.pack(side="bottom", fill="x", pady=(12, 0))
+        preview = tk.StringVar(win)
+        tk.Label(shell, textvariable=preview, bg=P["bg"], fg=P["accent"], font=self.small,
+                 anchor="w", justify="left", wraplength=740).pack(side="bottom", fill="x", pady=(10, 0))
+        host = tk.Frame(shell, bg=P["card"])
+        host.pack(fill="both", expand=True)
+        host.grid_rowconfigure(0, weight=1)
+        host.grid_columnconfigure(0, weight=1)
+        pages, tabs, variables = [], [], {}
+
+        def select_page(index):
+            pages[index].tkraise()
+            for i, button in enumerate(tabs):
+                button.kind = "primary" if i == index else "ghost"
+                button._paint(False)
+
+        def add_fields(parent, fields):
+            grid = tk.Frame(parent, bg=P["card"])
+            grid.pack(fill="x", pady=(0, 12))
+            for col in range(2):
+                grid.grid_columnconfigure(col, weight=1, uniform="shock-fields")
+            for index, (key, label) in enumerate(fields):
+                cell = tk.Frame(grid, bg=P["card"])
+                cell.grid(row=index // 2, column=index % 2, sticky="ew", padx=8, pady=5)
+                tk.Label(cell, text=label, bg=P["card"], fg=P["dim"], font=self.small,
+                         anchor="w").pack(fill="x", pady=(0, 4))
+                var = tk.StringVar(win, value=detail_text(draft.shock[key]))
+                variables[key] = var
+                tk.Entry(cell, textvariable=var, font=self.font, width=16,
+                         bg=P["card2"], fg=P["text"], insertbackground=P["text"],
+                         relief="flat", bd=0, highlightthickness=1,
+                         highlightbackground=P["line"], highlightcolor=P["accent"]
+                         ).pack(fill="x", ipady=7)
+
+        for index, title in enumerate(("시간 · TIMESTEP", "CONTROL_OUTPUT", "기타 CONTROL", "DATABASE")):
+            page = tk.Frame(host, bg=P["card"])
+            page.grid(row=0, column=0, sticky="nsew")
+            pages.append(page)
+            button = RButton(nav, title, lambda i=index: select_page(i), kind="ghost",
+                             w=160, h=34, font=self.font)
+            button.pack(side="left", padx=(0, 6))
+            tabs.append(button)
+            cv = tk.Canvas(page, bg=P["card"], highlightthickness=0, height=340)
+            scrollbar = DarkScrollbar(page, command=cv.yview, width=12)
+            scrollbar.pack(side="right", fill="y")
+            cv.pack(side="left", fill="both", expand=True)
+            cv.configure(yscrollcommand=scrollbar.set)
+            body = tk.Frame(cv, bg=P["card"], padx=8, pady=10)
+            item = cv.create_window(0, 0, window=body, anchor="nw")
+            body.bind("<Configure>", lambda event, canvas=cv: canvas.configure(scrollregion=canvas.bbox("all")))
+            cv.bind("<Configure>", lambda event, canvas=cv, window=item: canvas.itemconfigure(window, width=event.width))
+            for group, cards in SHOCK_CONTROL_CARDS:
+                page_index = 0 if group in ("TERMINATION", "TIMESTEP") else 1 if group == "OUTPUT" else 2
+                if index != page_index:
+                    continue
+                for number, fields in enumerate(cards, 1):
+                    tk.Label(body, text="*CONTROL_%s · CARD %d" % (group, number),
+                             bg=P["card"], fg=P["text"], font=self.font, anchor="w"
+                             ).pack(fill="x", padx=8, pady=(6, 4))
+                    add_fields(body, [(group.lower() + "_" + field,
+                                      field.upper() + (" (s, 공란=자동)" if field == "endtim"
+                                                       else " (정수)" if kind is int else ""))
+                                     for field, kind, default in fields if field])
+            if index == 2:
+                var = tk.BooleanVar(win, value=draft.shock["mpp_io_nodump"])
+                variables["mpp_io_nodump"] = var
+                tk.Checkbutton(body, text="*CONTROL_MPP_IO_NODUMP 사용", variable=var,
+                               bg=P["card"], fg=P["text"], selectcolor=P["card2"], font=self.font,
+                               activebackground=P["card"], activeforeground=P["text"],
+                               highlightthickness=0, bd=0).pack(anchor="w", padx=8, pady=10)
+            if index == 3:
+                tk.Label(body, text="출력 분할 수 N: DT = KEY 종료시간 ÷ N (양의 정수)\n"
+                         "예: D3PLOT 100 → 100구간, 초기 상태 포함 시 101개 상태\n"
+                         "공란은 항목별 기본 분할 수 · 실제 출력 수는 해석 종료 조건에 따라 달라집니다.",
+                         bg=P["card"], fg=P["dim"], font=self.small, anchor="w", justify="left"
+                         ).pack(fill="x", padx=8, pady=(4, 12))
+                add_fields(body, [("database_" + option.lower() + "_count",
+                                   "%s 분할 수 (기본 %d)" % (option, count))
+                                  for option, count in SHOCK_DATABASE_COUNTS])
+
+            def wheel(event, canvas=cv):
+                if canvas.yview() == (0.0, 1.0):
+                    return
+                step = -1 if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else 1
+                canvas.yview_scroll(step * 3, "units")
+                return "break"
+
+            def bind_wheel(widget, callback=wheel):
+                for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    widget.bind(sequence, callback)
+                for child in widget.winfo_children():
+                    bind_wheel(child, callback)
+            bind_wheel(cv)
+
+        def read_values():
+            return parse_shock_detail_settings({key: var.get() for key, var in variables.items()})
+
+        def populate():
+            for key, var in variables.items():
+                var.set(draft.shock[key] if key == "mpp_io_nodump" else detail_text(draft.shock[key]))
+
+        def update_preview(*_args):
+            try:
+                values = read_values()
+                if self.profile is None and values["termination_endtim"] is None:
+                    preview.set("ENDTIM 자동 계산: Shock 프로파일 입력을 확인하세요.")
+                    return
+                end = shock_endtime(self.profile, values)
+                preview.set("KEY ENDTIM=%g s · D3PLOT DT=%g s · D3THDT DT=%g s · INTFOR DT=%g s" %
+                            (end, end / values["database_d3plot_count"],
+                             end / values["database_d3thdt_count"], end / values["database_intfor_count"]))
+            except ValueError as exc:
+                preview.set(str(exc))
+
+        def save_json():
+            try:
+                draft.shock = read_values()
+                path = filedialog.asksaveasfilename(parent=win, defaultextension=".json",
+                    initialdir=os.path.dirname(os.path.abspath(__file__)),
+                    initialfile="inp2k-settings.json", filetypes=[("JSON", "*.json")])
+                if path:
+                    draft.save(path)
+            except (ValueError, OSError, UnicodeError) as exc:
+                messagebox.showerror("설정 저장 실패", str(exc), parent=win)
+
+        def load_json():
+            path = filedialog.askopenfilename(parent=win, filetypes=[("JSON", "*.json")],
+                initialdir=os.path.dirname(os.path.abspath(__file__)))
+            if not path:
+                return
+            try:
+                draft.load(path)
+                populate()
+            except (ValueError, OSError, UnicodeError) as exc:
+                messagebox.showerror("설정 불러오기 실패", str(exc), parent=win)
+
+        def reset():
+            draft.shock = shock_detail_defaults()
+            populate()
+
+        def apply():
+            try:
+                draft.shock = read_values()
+                # A representative deck checks numeric widths before applying.
+                render_shock_master_key(self.profile or build_shock_profile(), "model.k", draft.shock)
+                draft.commit()
+            except ValueError as exc:
+                messagebox.showerror("설정 확인", str(exc), parent=win)
+                return
+            win.destroy()
+            self.refresh()
+
+        for label, command, width in (("JSON 저장", save_json, 100), ("불러오기", load_json, 100),
+                                       ("초기값", reset, 80)):
+            RButton(buttons, label, command, kind="ghost", w=width, h=34,
+                    font=self.font).pack(side="left", padx=(0, 6))
+        RButton(buttons, "적용", apply, kind="primary", w=90, h=34, font=self.font).pack(side="right")
+        RButton(buttons, "취소", win.destroy, kind="ghost", w=80, h=34,
+                font=self.font).pack(side="right", padx=(0, 8))
+        for var in variables.values():
+            var.trace_add("write", update_preview)
+        update_preview()
+        select_page(0)
+        win.bind("<Escape>", lambda event: win.destroy())
+        win.update_idletasks()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        width, height = min(840, sw - 40), min(760, sh - 80)
+        win.minsize(min(740, width), min(520, height))
+        win.geometry("%dx%d+%d+%d" % (width, height, max(0, (sw - width) // 2), max(0, (sh - height) // 2)))
+        win.deiconify()
+        win.lift()
+        win.grab_set()
 
     def _choices(self, parent, label, variable, choices):
         P = PALETTE
@@ -5284,8 +5646,7 @@ class ShockTab:
     def refresh(self, *_args):
         self.output_valid = False
         key_enabled = self.key_var.get()
-        for widget in (self.key_all_check, self.model_auto_check):
-            widget.configure(state="normal" if key_enabled else "disabled")
+        self.model_auto_check.configure(state="normal" if key_enabled else "disabled")
         self.model_entry.configure(state="normal" if key_enabled and not self.model_auto_var.get() else "disabled")
         self.model_button.config(enabled=key_enabled)
         try:
@@ -5301,7 +5662,7 @@ class ShockTab:
             return
         self.profile = p
         directions = (("mx", "my", "mz", "px", "py", "pz")
-                      if self.all_var.get() or (key_enabled and self.key_all_var.get()) else (p["direction"],))
+                      if self.all_var.get() else (p["direction"],))
         profiles = [build_shock_profile(p["g"], p["duration_ms"], p["waveform"], d, p["point_count"])
                     for d in directions]
         names = [item["filename"] for item in profiles]
@@ -5309,12 +5670,12 @@ class ShockTab:
         if key_enabled:
             try:
                 model = shock_model_include(self.model_var.get(), self.output_dir_var.get())
-                key_names = [shock_key_filename(item, model) for item in profiles
-                             if self.key_all_var.get() or item["direction"] == p["direction"]]
+                key_names = [shock_key_filename(item, model) for item in profiles]
+                render_shock_master_key(p, model, self.shock_settings)
             except ValueError as exc:
                 self.name_var.set(str(exc))
-                self.summary_var.set("종료: %.5f s · INCLUDE 모델을 지정하세요." % p["end_s"])
-                self.status_var.set("INCLUDE 모델 자동 연결 또는 직접 입력을 확인하세요.")
+                self.summary_var.set("프로파일 종료: %.5f s · KEY 설정을 확인하세요." % p["end_s"])
+                self.status_var.set("INCLUDE 모델과 Shock 상세 설정을 확인하세요.")
                 self.save_button.config(enabled=False)
                 self.draw()
                 return
@@ -5324,6 +5685,11 @@ class ShockTab:
                              "적용 T/2T 속도: %+.2f / %+.2f mm/s  ·  최종: 0.00  ·  SFO: %+d" %
                              (p["duration_ms"] * 3, p["end_s"], len(p["times"]),
                               -p["sfo"] * p["v_peak"], p["sfo"] * p["v_peak"], p["sfo"]))
+        if key_enabled:
+            end = shock_endtime(p, self.shock_settings)
+            count = self.shock_settings["database_d3plot_count"]
+            self.summary_var.set(self.summary_var.get() +
+                "\nKEY ENDTIM: %g s · D3PLOT: %d구간 / DT=%g s" % (end, count, end / count))
         self.save_button.config(enabled=True)
         self.output_valid = True
         self.status_var.set("출력 폴더를 확인하고 출력 실행을 누르세요.")
@@ -5406,8 +5772,8 @@ class ShockTab:
             result = write_shock_files(self.output_dir_var.get(), p["g"], p["duration_ms"],
                                        p["waveform"], p["direction"], p["point_count"],
                                        self.all_var.get(), self.overwrite_var.get(),
-                                       create_key=self.key_var.get(), key_all_directions=self.key_all_var.get(),
-                                       model_include=self.model_var.get())
+                                       create_key=self.key_var.get(), model_include=self.model_var.get(),
+                                       shock_settings=self.shock_settings)
         except (OSError, ValueError) as exc:
             self.status_var.set("저장 실패: %s" % exc)
             messagebox.showerror("Shock 출력 실패", str(exc), parent=self.parent)
@@ -5893,6 +6259,13 @@ def run_gui():
     state = dict(path=None, out=None, busy=False, t0=0.0)
     outvar = tk.StringVar(value="")
     q = queue.Queue()
+    try:
+        detail, shock_detail, settings_path = load_startup_settings()
+        settings_notice = ("ok", "기본 설정 자동 불러옴 (변환 + Shock): " + settings_path) if settings_path else None
+    except (OSError, ValueError, UnicodeError) as exc:
+        detail = parse_detail_settings(detail_defaults())
+        shock_detail = shock_detail_defaults()
+        settings_notice = ("warn", "inp2k-settings.json 자동 불러오기 실패: %s · 기본 설정을 사용합니다." % exc)
 
     wrap = tk.Frame(root, bg=P["bg"], padx=26, pady=22)
     wrap.pack(fill="both", expand=True)
@@ -5945,7 +6318,8 @@ def run_gui():
     notebook.shock = ShockTab(shock_tab, ui, initial_dir=lambda:
         os.path.dirname(os.path.abspath(state["out"] or state["path"]))
         if state["out"] or state["path"] else None,
-        initial_model=lambda: os.path.abspath(outvar.get().strip()) if outvar.get().strip() else "")
+        initial_model=lambda: os.path.abspath(outvar.get().strip()) if outvar.get().strip() else "",
+        detail_settings=detail, shock_settings=shock_detail)
     outvar.trace_add("write", notebook.shock.sync_model)
     select_tool(0)
     wrap = converter_tab
@@ -6137,16 +6511,10 @@ def run_gui():
 
     r2 = tk.Frame(f2, bg=P["card"])
     r2.pack(fill="x", pady=(14, 0))
-    try:
-        detail, settings_path = load_startup_detail_settings()
-        settings_notice = ("ok", "기본 설정 자동 불러옴: " + settings_path) if settings_path else None
-    except (OSError, ValueError, UnicodeError) as exc:
-        detail = parse_detail_settings(detail_defaults())
-        settings_notice = ("warn", "inp2k-settings.json 자동 불러오기 실패: %s · 기본 설정을 사용합니다." % exc)
-
     def show_details():
         if state["busy"]:
             return
+        draft = SettingsDraft(detail, shock_detail)
         win = tk.Toplevel(root)
         win.withdraw()                     # v2.5: size after the content is built
         win.title("상세 설정")
@@ -6157,7 +6525,7 @@ def run_gui():
         shell.pack(fill="both", expand=True)
         tk.Label(shell, text="상세 설정", bg=P["bg"], fg=P["text"],
                  font=F_H1, anchor="w").pack(fill="x")
-        tk.Label(shell, text="필요한 항목만 조정하고, 자주 쓰는 값은 JSON으로 저장하세요.",
+        tk.Label(shell, text="JSON에는 변환 + Shock 설정을 함께 저장하며, 불러온 두 설정은 [적용] 후 반영됩니다.",
                  bg=P["bg"], fg=P["dim"], font=F_BODY, anchor="w").pack(fill="x", pady=(6, 18))
         nav = tk.Frame(shell, bg=P["bg"])
         nav.pack(fill="x", pady=(0, 14))
@@ -6286,20 +6654,23 @@ def run_gui():
         select_page(0)
         def save_json():
             try:
-                values = parse_detail_settings({k: v.get() for k, v in variables.items()})
+                draft.detail = parse_detail_settings({k: v.get() for k, v in variables.items()})
                 path = filedialog.asksaveasfilename(parent=win, defaultextension=".json",
+                    initialdir=os.path.dirname(os.path.abspath(__file__)),
                     initialfile="inp2k-settings.json", filetypes=[("JSON", "*.json")])
                 if path:
-                    save_detail_settings(path, values)
-            except (ValueError, OSError) as exc:
+                    draft.save(path)
+            except (ValueError, OSError, UnicodeError) as exc:
                 messagebox.showerror("설정 저장 실패", str(exc), parent=win)
         def load_json():
-            path = filedialog.askopenfilename(parent=win, filetypes=[("JSON", "*.json")])
+            path = filedialog.askopenfilename(parent=win, filetypes=[("JSON", "*.json")],
+                initialdir=os.path.dirname(os.path.abspath(__file__)))
             if not path:
                 return
             try:
-                values = load_detail_settings(path)
-            except (ValueError, OSError) as exc:
+                draft.load(path)
+                values = draft.detail
+            except (ValueError, OSError, UnicodeError) as exc:
                 messagebox.showerror("설정 불러오기 실패", str(exc), parent=win)
                 return
             for key, var in variables.items():
@@ -6312,13 +6683,13 @@ def run_gui():
                 variables[key].set(bool_text(value) if key in BOOL_DETAIL_KEYS else value)
         def apply():
             try:
-                values = parse_detail_settings({k: v.get() for k, v in variables.items()})
+                draft.detail = parse_detail_settings({k: v.get() for k, v in variables.items()})
+                draft.commit()
             except ValueError as exc:
                 messagebox.showerror("설정 확인", str(exc), parent=win)
                 return
-            detail.clear()
-            detail.update(values)
             win.destroy()
+            notebook.shock.refresh()
         RButton(buttons, "JSON 저장", save_json, kind="ghost", w=100, h=34, font=F_LB).pack(side="left", padx=4)
         RButton(buttons, "불러오기", load_json, kind="ghost", w=100, h=34, font=F_LB).pack(side="left", padx=4)
         RButton(buttons, "초기값", reset, kind="ghost", w=80, h=34, font=F_LB).pack(side="left", padx=4)
