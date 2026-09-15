@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-INP2K v2.14 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
+INP2K v2.15 | Abaqus INP -> LS-DYNA keyword (.k) 변환기 (단일 파일)
 
-v2.14 주요 변경 사항
+v2.15 주요 변경 사항
+- Shock 탭에서 프로파일 .k와 별도로 해석용 .key 생성 여부 / KEY 6방향 저장을 선택합니다.
+- INCLUDE 모델은 INP 변환 출력 경로를 자동 반영하거나 직접 입력/선택합니다.
+- KEY 이름: 7100_SHOCK_{모델명}_{25g15ms}_{mX}.key (양수 방향은 7200 / pX).
+  모델명은 확장자 제외. half-sine 외 파형은 조건 뒤에 파형명을 추가합니다.
+- 8종 CONTROL과 13종 DATABASE를 추가합니다. 종료 시간은 기존 프로파일 끝인 3T.
+  일반 DATABASE/D3THDT/INTFOR 간격: 종료시간/1000, D3PLOT: 종료시간/100.
+  DEFORCE 요청은 실제 LS-DYNA 키워드 DATABASE_DEFORC로 출력합니다.
+- KEY 6방향 선택 시 참조할 프로파일도 6개 생성합니다. 각 KEY는 한 방향만 INCLUDE.
+- 기존 Shock 곡선/프로파일 파일 형식, INP 변환, 상세 설정/JSON 기능은 유지합니다.
+
+이전 버전: v2.14 주요 변경 사항
 - Solid(육면체) ELFORM: auto, 1, 2, -1, -2, -18, 18, 62.
 - Shell ELFORM: auto, 1, 2, 3, 4, 6, 7, 8, 10, 11, 16, -16, 17, 18, 20, 21, 30.
   3/4/17은 삼각형 전용이며 사각형을 포함한 프로퍼티는 auto로 유지합니다.
@@ -267,7 +278,7 @@ except Exception:                                    # pragma: no cover
     HAVE_PANDAS = False
 
 # v1.8: index NODE SURFACEs and global ELSET categories; retain source order.
-VERSION = "2.14"
+VERSION = "2.15"
 
 # User-requested defaults. Values use the input deck's stress unit.
 FOAM_DEFAULT_E = 1.0
@@ -4628,18 +4639,32 @@ def write_shock_k(out_path, g_value=25.0, duration_ms=15.0,
 
 def write_shock_files(output_dir, g_value=25.0, duration_ms=15.0,
                        waveform="half-sine", direction="mx", point_count=SHOCK_POINTS,
-                       all_directions=False, overwrite=False):
+                       all_directions=False, overwrite=False, create_key=False,
+                       key_all_directions=False, model_include=""):
     """Preflight every target; return per-file results for any write failures."""
     directory = os.path.expanduser(os.fspath(output_dir).strip())
     if not directory:
         raise ValueError("출력 폴더를 입력하거나 선택하세요.")
     directory = os.path.abspath(directory)
-    directions = ("mx", "my", "mz", "px", "py", "pz") if all_directions else (direction,)
+    six = ("mx", "my", "mz", "px", "py", "pz")
+    # Every generated master deck must have its matching profile on disk.
+    directions = six if all_directions or (create_key and key_all_directions) else (direction,)
     profiles = [build_shock_profile(g_value, duration_ms, waveform, d, point_count) for d in directions]
     for profile in profiles:
         render_shock_keyword(profile)  # Validate formatting before writing anything.
     paths = [os.path.join(directory, profile["filename"]) for profile in profiles]
-    conflicts = [path for path in paths if os.path.lexists(path)]
+    key_jobs = []
+    if create_key:
+        model_include = shock_model_include(model_include, directory)
+        for profile in profiles:
+            if key_all_directions or profile["direction"] == direction:
+                key_path = os.path.join(directory, shock_key_filename(profile, model_include))
+                key_jobs.append((key_path, profile, render_shock_master_key(profile, model_include)))
+        model_path = os.path.realpath(os.path.join(directory, model_include))
+        if any(os.path.normcase(os.path.realpath(path)) == os.path.normcase(model_path)
+               for path in paths + [job[0] for job in key_jobs]):
+            raise ValueError("INCLUDE 모델 경로가 Shock 출력 파일과 같습니다. 다른 모델 이름을 지정하세요.")
+    conflicts = [path for path in paths + [job[0] for job in key_jobs] if os.path.lexists(path)]
     if not overwrite and conflicts:
         raise FileExistsError("같은 이름의 파일이 있습니다. 다른 폴더를 지정하거나 덮어쓰기를 선택하세요: "
                               + ", ".join(os.path.basename(path) for path in conflicts))
@@ -4653,7 +4678,132 @@ def write_shock_files(output_dir, g_value=25.0, duration_ms=15.0,
                                         profile["direction"], point_count))
         except OSError as exc:
             failed.append(dict(path=path, error=str(exc)))
-    return dict(written=written, failed=failed, directory=directory)
+    key_written = []
+    saved_directions = {p["direction"] for p in written}
+    for path, profile, content in key_jobs:
+        if profile["direction"] not in saved_directions:
+            failed.append(dict(path=path, error="해당 방향 프로파일 저장 실패로 KEY 생성을 건너뛰었습니다."))
+            continue
+        try:
+            write_shock_text(path, content)
+            key_written.append(dict(out=path, direction=profile["direction"], end_s=profile["end_s"]))
+        except OSError as exc:
+            failed.append(dict(path=path, error=str(exc)))
+    return dict(written=written, key_written=key_written, failed=failed, directory=directory)
+
+
+def shock_model_include(value, output_dir=None):
+    """Bare/relative names refer to the KEY folder; chosen absolute paths become relative."""
+    value = os.fspath(value).strip() if value is not None else ""
+    if not value or any(c in value for c in ("\n", "\r", "\0")):
+        raise ValueError("INCLUDE 모델 파일 이름 또는 경로를 입력하세요.")
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    value = os.path.expanduser(value).replace("\\", "/")
+    name = value.rsplit("/", 1)[-1]
+    if not name or name in (".", "..") or any(c in name for c in '<>:"|?*') or value.startswith("$"):
+        raise ValueError("INCLUDE 모델 파일 이름을 확인하세요.")
+    stem, ext = os.path.splitext(name)
+    if not ext:
+        value += ".k"
+    elif ext.lower() not in (".k", ".key"):
+        raise ValueError("INCLUDE 모델은 .k 또는 .key 파일을 지정하세요.")
+    if not stem:
+        raise ValueError("INCLUDE 모델 이름이 비어 있습니다.")
+    if output_dir and os.path.isabs(value):
+        try:
+            value = os.path.relpath(value, os.path.abspath(output_dir))
+        except ValueError:
+            pass  # Windows: different drives require an absolute include path.
+    return value.replace("\\", "/")
+
+
+def shock_key_filename(profile, model_include):
+    model = shock_model_include(model_include).rsplit("/", 1)[-1]
+    stem = os.path.splitext(model)[0]
+    condition = "%sg%sms" % (format(profile["g"], ".12g"), format(profile["duration_ms"], ".12g"))
+    if profile["waveform"] != "half-sine":
+        condition += "_" + profile["waveform"]
+    direction = profile["direction"][0] + profile["direction"][1].upper()
+    return "%s_SHOCK_%s_%s_%s.key" % (7100 if profile["sfo"] < 0 else 7200, stem, condition, direction)
+
+
+def render_shock_master_key(profile, model_include):
+    """Master deck: one model + one unchanged Shock profile; times are seconds.
+
+    Layouts: Ansys PyDYNA auto/control and auto/database (github.com/ansys/pydyna).
+    Only required CONTROL cards are emitted. Blanks retain solver defaults,
+    including TSSFAC (solver-selected default), PIDOS and NLQ.
+    INTFOR's optional database filename card is explicitly supplied as 'intfor'.
+    """
+    model = shock_model_include(model_include)
+    end = profile["end_s"]
+    if not math.isfinite(end) or end <= 0:
+        raise ValueError("Shock 종료 시간은 0보다 큰 유한한 값이어야 합니다.")
+    lines = ["*KEYWORD", "$ Shock master deck; unspecified fields use LS-DYNA defaults."]
+
+    def real10(value):
+        # Shock times use a 1e-5 s grid; END/1000 needs eight decimal places.
+        # The converter's general f10 rounds small numbers to three significant
+        # digits, so preserve the requested output interval here instead.
+        text = ("%.8f" % value).rstrip("0").rstrip(".")
+        if "." not in text and len(text) <= 8:
+            text += ".0"
+        if len(text) <= 10:
+            return text.rjust(10)
+        for precision in range(8, 0, -1):
+            text = format(value, ".%dg" % precision)
+            if len(text) <= 10:
+                return text.rjust(10)
+        raise ValueError("KEY 숫자가 10칸 출력 범위를 벗어났습니다.")
+
+    def row(keyword, fields, values):
+        lines.append("*" + keyword)
+        lines.append("$#" + fields[0].rjust(8) + "".join(k.rjust(10) for k in fields[1:]))
+        lines.append("".join(" " * 10 if v is None else i10(v) if isinstance(v, int) else real10(v)
+                             for v in values))
+
+    row("CONTROL_TERMINATION", ("endtim", "endcyc", "dtmin", "endeng", "endmas", "nosol"),
+        (end, 0, 0.0, 0.0, 1e8, 0))
+    row("CONTROL_TIMESTEP", ("dtinit", "tssfac", "isdo", "tslimt", "dt2ms", "lctm", "erode", "ms1st"),
+        (0.0, None, 0, 0.0, 0.0, 0, 0, 0))
+    row("CONTROL_OUTPUT", ("npopt", "neecho", "nrefup", "iaccop", "opifs", "ipnint", "ikedit", "iflush"),
+        (0, 0, 0, 0, 0.0, 0, 100, 5000))
+    row("CONTROL_ENERGY", ("hgen", "rwen", "slnten", "rylen", "irgen", "maten", "drlen", "disen"),
+        (1, 2, 1, 1, 2, 1, 1, 1))
+    row("CONTROL_ACCURACY", ("osu", "inn", "pidos", "iacc", "exacc", "srtflg"),
+        (0, 1, None, 0, 0.0, 0))
+    row("CONTROL_CPU", ("cputim", "iglst"), (0.0, 0))
+    row("CONTROL_SOLUTION", ("soln", "nlq", "isnan", "lcint", "lcacc", "ncdcf", "nocopy", "crvp"),
+        (0, None, 0, 100, 0, 1, 0, 0))
+    lines.append("*CONTROL_MPP_IO_NODUMP")
+    for option in ("DEFORC", "ELOUT", "GLSTAT", "MATSUM", "NODOUT", "RCFORC",
+                   "RWFORC", "NCFORC", "SECFORC", "SLEOUT"):
+        row("DATABASE_" + option, ("dt", "binary", "lcur", "ioopt"), (end / 1000.0, 0, 0, 1))
+    for option, divisor in (("D3PLOT", 100.0), ("D3THDT", 1000.0)):
+        row("DATABASE_BINARY_" + option, ("dt", "lcdt", "beam", "npltc", "psetid"),
+            (end / divisor, None, 0, None, None))
+    lines.extend(("*DATABASE_BINARY_INTFOR", "$# filename", "intfor",
+                  "$#      dt      lcdt      beam     npltc    psetid",
+                  real10(end / 1000.0) + " " * 10 + i10(0) + " " * 20,
+                  "$#   ioopt", i10(0)))
+    lines.extend(("*INCLUDE", model, "*INCLUDE", profile["filename"], "*END"))
+    return "\n".join(lines) + "\n"
+
+
+def write_shock_text(out_path, content):
+    """Atomic UTF-8 write; model INCLUDE paths may contain non-ASCII characters."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                dir=os.path.dirname(out_path), prefix=".inp2k-key-", suffix=".tmp", delete=False) as stream:
+            temporary = stream.name
+            stream.write(content)
+        os.replace(temporary, out_path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
 
 
 # ============================================================
@@ -4930,10 +5080,11 @@ class DarkScrollbar:
 class ShockTab:
     """Independent Shock form; the save button stays visible on small windows."""
 
-    def __init__(self, parent, ui_font, initial_dir=None):
+    def __init__(self, parent, ui_font, initial_dir=None, initial_model=None):
         P = PALETTE
         self.parent = parent
         self.initial_dir = initial_dir
+        self.initial_model = initial_model
         self.font = (ui_font, 10)
         self.small = (ui_font, 9)
         self.profile = None
@@ -4945,6 +5096,11 @@ class ShockTab:
         self.output_dir_var = tk.StringVar(parent, value=(initial_dir() if initial_dir else None)
                                            or os.path.dirname(os.path.abspath(__file__)))
         self.all_var = tk.BooleanVar(parent, value=False)
+        self.key_var = tk.BooleanVar(parent, value=False)
+        self.key_all_var = tk.BooleanVar(parent, value=False)
+        self.model_auto_var = tk.BooleanVar(parent, value=True)
+        self.model_var = tk.StringVar(parent, value=(initial_model() if initial_model else "") or "")
+        self.output_valid = False
         self.overwrite_var = tk.BooleanVar(parent, value=False)
         self.name_var = tk.StringVar(parent)
         self.summary_var = tk.StringVar(parent)
@@ -5022,12 +5178,40 @@ class ShockTab:
                  ).pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 8))
         RButton(path_row, "폴더 선택", self.pick_directory, kind="ghost", w=100,
                 h=34, font=self.font).pack(side="left")
-        for text, var in (("6방향 모두 저장 (mx, my, mz, px, py, pz)", self.all_var),
+        for text, var in (("프로파일 K: 6방향 모두 저장 (mx, my, mz, px, py, pz)", self.all_var),
                           ("같은 이름의 파일 덮어쓰기", self.overwrite_var)):
             tk.Checkbutton(output, text=text, variable=var, bg=P["card"], fg=P["text"],
                            activebackground=P["card"], activeforeground=P["text"],
                            selectcolor=P["card2"], font=self.font, bd=0,
                            highlightthickness=0).pack(anchor="w", pady=(0, 6))
+        key_box = tk.Frame(output, bg=P["card"], highlightthickness=1,
+                           highlightbackground=P["line"], padx=12, pady=10)
+        key_box.pack(fill="x", pady=(6, 12))
+        for label, var, attr in (("해석용 KEY 파일도 생성", self.key_var, "key_check"),
+                                ("KEY: 6방향 모두 저장", self.key_all_var, "key_all_check"),
+                                ("INP 변환 출력 모델 자동 연결", self.model_auto_var, "model_auto_check")):
+            cb = tk.Checkbutton(key_box, text=label, variable=var, bg=P["card"], fg=P["text"],
+                activebackground=P["card"], activeforeground=P["text"], selectcolor=P["card2"],
+                disabledforeground=P["dim"], font=self.font, bd=0, highlightthickness=0)
+            cb.pack(anchor="w", pady=(0, 6))
+            setattr(self, attr, cb)
+        tk.Label(key_box, text="INCLUDE 모델 파일 (.k / .key)", bg=P["card"], fg=P["dim"],
+                 font=self.small, anchor="w").pack(fill="x", pady=(4, 5))
+        model_row = tk.Frame(key_box, bg=P["card"])
+        model_row.pack(fill="x")
+        self.model_entry = tk.Entry(model_row, textvariable=self.model_var, font=self.font,
+            bg=P["card2"], fg=P["text"], disabledbackground=P["card2"], disabledforeground=P["dim"],
+            insertbackground=P["text"], relief="flat", highlightthickness=1,
+            highlightbackground=P["line"], highlightcolor=P["accent"])
+        self.model_entry.pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 8))
+        self.model_button = RButton(model_row, "모델 선택", self.pick_model, kind="ghost",
+                                    w=100, h=34, font=self.font)
+        self.model_button.pack(side="left")
+        tk.Label(key_box, text="직접 입력: 자동 연결 체크 해제 후 이름/경로 입력 (상대 경로는 KEY 출력 폴더 기준)\n"
+                 "KEY 전체 방향을 선택하면 INCLUDE에 필요한 프로파일 6개도 함께 저장합니다.\n"
+                 "KEY 종료시간=3T · 일반/D3THDT/INTFOR=종료시간÷1000 · D3PLOT=종료시간÷100",
+                 bg=P["card"], fg=P["dim"], font=self.small, anchor="w", justify="left",
+                 wraplength=630).pack(fill="x", pady=(8, 0))
         tk.Label(output, textvariable=self.name_var, bg=P["card"], fg=P["accent"],
                  font=self.font, anchor="w", wraplength=650, justify="left"
                  ).pack(fill="x")
@@ -5035,7 +5219,7 @@ class ShockTab:
                  "NSID 100001 · LCID 음수 방향 701 / 양수 방향 702 · VAD 0 · Motion SF 1.0\n"
                  "기존 모델의 NSET_BC를 사용합니다. 가진축의 기존 SPC는 해제해야 합니다.\n"
                  "한 해석에는 한 방향 파일만 INCLUDE하고, LCID 701/702 중복을 피하세요.\n"
-                 "해석 종료시간은 메인 덱에서 설정합니다. 이 파일에는 경계조건과 곡선만 생성합니다.",
+                 "프로파일 K에는 경계조건/곡선, 해석용 KEY에는 INCLUDE/CONTROL/DATABASE를 생성합니다.",
                  bg=P["card"], fg=P["dim"], font=self.small, justify="left",
                  anchor="w", wraplength=680).pack(fill="x", pady=(10, 0))
 
@@ -5058,7 +5242,10 @@ class ShockTab:
             for child in widget.winfo_children():
                 bind_wheel(child)
         bind_wheel(scroller)
-        for variable in (self.g_var, self.ms_var, self.points_var, self.wave_var, self.direction_var, self.all_var):
+        self.model_auto_var.trace_add("write", self.sync_model)
+        for variable in (self.g_var, self.ms_var, self.points_var, self.wave_var, self.direction_var,
+                         self.all_var, self.key_var, self.key_all_var, self.model_var,
+                         self.model_auto_var, self.output_dir_var):
             variable.trace_add("write", self.refresh)
         self.refresh()
 
@@ -5076,6 +5263,12 @@ class ShockTab:
                            bd=0, padx=6, cursor="hand2").pack(side="left")
 
     def refresh(self, *_args):
+        self.output_valid = False
+        key_enabled = self.key_var.get()
+        for widget in (self.key_all_check, self.model_auto_check):
+            widget.configure(state="normal" if key_enabled else "disabled")
+        self.model_entry.configure(state="normal" if key_enabled and not self.model_auto_var.get() else "disabled")
+        self.model_button.config(enabled=key_enabled)
         try:
             p = build_shock_profile(self.g_var.get(), self.ms_var.get(),
                                     self.wave_var.get(), self.direction_var.get(), self.points_var.get())
@@ -5088,17 +5281,32 @@ class ShockTab:
             self.draw()
             return
         self.profile = p
-        if self.all_var.get():
-            self.name_var.set("6개 파일 저장 · 미리보기 방향: " + p["direction"] + "\n" +
-                "\n".join(build_shock_profile(p["g"], p["duration_ms"], p["waveform"],
-                    d, p["point_count"])["filename"] for d in ("mx", "my", "mz", "px", "py", "pz")))
-        else:
-            self.name_var.set(p["filename"])
+        directions = (("mx", "my", "mz", "px", "py", "pz")
+                      if self.all_var.get() or (key_enabled and self.key_all_var.get()) else (p["direction"],))
+        profiles = [build_shock_profile(p["g"], p["duration_ms"], p["waveform"], d, p["point_count"])
+                    for d in directions]
+        names = [item["filename"] for item in profiles]
+        key_names = []
+        if key_enabled:
+            try:
+                model = shock_model_include(self.model_var.get(), self.output_dir_var.get())
+                key_names = [shock_key_filename(item, model) for item in profiles
+                             if self.key_all_var.get() or item["direction"] == p["direction"]]
+            except ValueError as exc:
+                self.name_var.set(str(exc))
+                self.summary_var.set("종료: %.5f s · INCLUDE 모델을 지정하세요." % p["end_s"])
+                self.status_var.set("INCLUDE 모델 자동 연결 또는 직접 입력을 확인하세요.")
+                self.save_button.config(enabled=False)
+                self.draw()
+                return
+        self.name_var.set("프로파일 K %d개 / 해석용 KEY %d개\n%s" %
+                          (len(names), len(key_names), "\n".join(names + key_names)))
         self.summary_var.set("종료: %g ms (%.5f s)  ·  파일 전체: %d점\n"
                              "적용 T/2T 속도: %+.2f / %+.2f mm/s  ·  최종: 0.00  ·  SFO: %+d" %
                              (p["duration_ms"] * 3, p["end_s"], len(p["times"]),
                               -p["sfo"] * p["v_peak"], p["sfo"] * p["v_peak"], p["sfo"]))
         self.save_button.config(enabled=True)
+        self.output_valid = True
         self.status_var.set("출력 폴더를 확인하고 출력 실행을 누르세요.")
         self.draw()
 
@@ -5157,27 +5365,43 @@ class ShockTab:
         if path:
             self.output_dir_var.set(path)
 
+    def sync_model(self, *_args):
+        if self.model_auto_var.get() and self.initial_model:
+            self.model_var.set(self.initial_model() or "")
+
+    def pick_model(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(parent=self.parent, title="INCLUDE 모델 선택",
+            filetypes=[("LS-DYNA model", "*.k *.key"), ("모든 파일", "*.*")])
+        if path:
+            self.model_auto_var.set(False)
+            self.model_var.set(path)
+
     def save(self):
         from tkinter import messagebox
         self.refresh()
-        if self.profile is None:
+        if self.profile is None or not self.output_valid:
             return
         p = self.profile
         try:
             result = write_shock_files(self.output_dir_var.get(), p["g"], p["duration_ms"],
                                        p["waveform"], p["direction"], p["point_count"],
-                                       self.all_var.get(), self.overwrite_var.get())
+                                       self.all_var.get(), self.overwrite_var.get(),
+                                       create_key=self.key_var.get(), key_all_directions=self.key_all_var.get(),
+                                       model_include=self.model_var.get())
         except (OSError, ValueError) as exc:
             self.status_var.set("저장 실패: %s" % exc)
             messagebox.showerror("Shock 출력 실패", str(exc), parent=self.parent)
             return
         if result["failed"]:
             details = "\n".join(os.path.basename(f["path"]) + ": " + f["error"] for f in result["failed"])
-            self.status_var.set("%d개 저장 / %d개 실패" % (len(result["written"]), len(result["failed"])))
+            self.status_var.set("%d개 저장 / %d개 실패" %
+                                (len(result["written"]) + len(result["key_written"]), len(result["failed"])))
             messagebox.showerror("Shock 일부 출력 실패", self.status_var.get() + "\n" + details,
                                  parent=self.parent)
         else:
-            self.status_var.set("%d개 파일 저장 완료 · %s" % (len(result["written"]), result["directory"]))
+            self.status_var.set("프로파일 K %d개 / 해석용 KEY %d개 저장 완료 · %s" %
+                                (len(result["written"]), len(result["key_written"]), result["directory"]))
 
 
 ADDITIONS_PALETTE = dict(PALETTE, bg="#101114", card="#17191E", card2="#202329",
@@ -5648,6 +5872,7 @@ def run_gui():
         pass
 
     state = dict(path=None, out=None, busy=False, t0=0.0)
+    outvar = tk.StringVar(value="")
     q = queue.Queue()
 
     wrap = tk.Frame(root, bg=P["bg"], padx=26, pady=22)
@@ -5700,7 +5925,9 @@ def run_gui():
         tabs.append(button)
     notebook.shock = ShockTab(shock_tab, ui, initial_dir=lambda:
         os.path.dirname(os.path.abspath(state["out"] or state["path"]))
-        if state["out"] or state["path"] else None)
+        if state["out"] or state["path"] else None,
+        initial_model=lambda: os.path.abspath(outvar.get().strip()) if outvar.get().strip() else "")
+    outvar.trace_add("write", notebook.shock.sync_model)
     select_tool(0)
     wrap = converter_tab
 
@@ -5749,7 +5976,6 @@ def run_gui():
     c1, f1 = card(wrap, "입력 파일", F_HD)
     c1.pack(fill="x", pady=(14, 0))
     pathvar = tk.StringVar(value="Abaqus 입력 파일을 선택하세요")
-    outvar = tk.StringVar(value="")
     drop_zone = tk.Frame(f1, bg=P["card2"], highlightthickness=1,
                          highlightbackground=P["line"], padx=14, pady=10)
     drop_zone.pack(fill="x")
